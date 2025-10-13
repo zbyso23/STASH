@@ -1,0 +1,16 @@
+{
+  "stash_version": 1,
+  "created": "2025-10-13T13:53:53Z",
+  "frames": [
+    {
+      "file": "test/aleph",
+      "codec": "gzip",
+      "hash": "69d3f18cf17a28ba774ee1e3f1c1c9233f4fa9e0a9d7a9b9d6127bb0f03d1c7f"
+    },
+    {
+      "file": "test/elm.json",
+      "codec": "zlib",
+      "hash": "b9884a108c77f61c220f6c8a9c09c7dd6a1739adb3250d4671b6cfe2a3f612b7"
+    }
+  ]
+}
