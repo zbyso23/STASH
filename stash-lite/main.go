@@ -1,51 +1,42 @@
 package main
 
 import (
-    "fmt"
-    "os"
-    "path/filepath"
-    "strings"
-    "stash-lite/stash"
+	"fmt"
+	"os"
+	"path/filepath"
+	"stashapp/stash"
 )
 
-func main() {
-    if len(os.Args) < 3 {
-        fmt.Println("Usage: stash-lite pack <folder>")
-        os.Exit(1)
-    }
-
-    cmd := os.Args[1]
-    target := os.Args[2]
-
-    if cmd == "pack" {
-        packFolder(target)
-    } else {
-        fmt.Println("Unknown command")
-    }
+// usage prints a short usage string to stderr.
+func usage() {
+	exe := filepath.Base(os.Args[0])
+	fmt.Fprintf(os.Stderr, "Usage: %s pack|unpack <input_dir> <output_dir>\n", exe)
+	fmt.Fprintf(os.Stderr, "\n")
+	fmt.Fprintf(os.Stderr, "  pack   — create a STASH archive from files in <input_dir> and write frames and manifest.json into <output_dir>\n")
+	fmt.Fprintf(os.Stderr, "  unpack — extract a STASH archive in <input_dir> to raw files in <output_dir> using manifest.json\n")
 }
 
-func packFolder(root string) {
-    out, _ := os.Create("archive.stash")
-    defer out.Close()
-
-    var frames []stash.FrameInfo
-
-    filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-        if info.IsDir() { return nil }
-
-        ext := strings.ToLower(filepath.Ext(path))
-        zw, codec, _ := stash.CompressForExt(ext, out)
-        hash, _ := stash.WriteFrame(path, zw, 1)
-        zw.Close()
-
-        frames = append(frames, stash.FrameInfo{
-            File: path,
-            Codec: codec,
-            Hash: hash,
-        })
-        fmt.Println("Packed:", path)
-        return nil
-    })
-
-    stash.WriteManifest(frames, "manifest.json")
+func main() {
+	if len(os.Args) < 4 {
+		usage()
+		os.Exit(1)
+	}
+	cmd := os.Args[1]
+	inputDir := os.Args[2]
+	outputDir := os.Args[3]
+	switch cmd {
+	case "pack":
+		if err := stash.CompressFolder(inputDir, outputDir); err != nil {
+			fmt.Fprintf(os.Stderr, "Error during pack: %v\n", err)
+			os.Exit(1)
+		}
+	case "unpack":
+		if err := stash.DecompressFolder(inputDir, outputDir); err != nil {
+			fmt.Fprintf(os.Stderr, "Error during unpack: %v\n", err)
+			os.Exit(1)
+		}
+	default:
+		usage()
+		os.Exit(1)
+	}
 }
