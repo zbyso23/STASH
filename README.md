@@ -273,7 +273,60 @@ LZMA	🐢 slower	🔹 high	archival
 BROTLI	🧠 slow	🔹 very high	text-heavy
 STORE	–	none	already compressed data
 
-## 🔒 Integrity
+## 🔒 Optional Crypto Extension (non-normative)
+
+STASH deliberately keeps encryption out of its core specification.  
+Implementations **MAY** introduce optional cryptographic protection for frame payloads  
+or manifest signing, but these mechanisms are **implementation-specific** and must not  
+alter the canonical layout of STASH frames or manifests.
+
+The guiding principle: **integrity first, secrecy optional.**
+
+---
+
+### 🧩 Recommended Integration Pattern
+
+- Encrypt only the **payload** portion of a frame;  
+  the header and trailer remain intact so frames stay self-describing.  
+- Store algorithm identifiers and parameters (IV, salt, key ID) either  
+  in local metadata or as additional manifest fields.  
+- Compute SHA-256 (or stronger) **over the ciphertext**, ensuring integrity  
+  without revealing plaintext contents.
+- Decryption must always yield the same uncompressed data that was originally stored  
+  before compression and encryption.
+
+---
+
+### 🧠 Example Manifest Entries (post-quantum ciphers)
+
+```json
+{"ts":1739550005,
+ "op":"ADD",
+ "frame":"9fb1a6...",
+ "path":"secure/data.bin",
+ "codec":"zstd",
+ "crypto":{
+   "algorithm":"kyber-aes-gcm",
+   "iv":"b64:0mN2uF9f...",
+   "key_id":"urn:stash:key:001"
+ }}
+```
+
+These examples reference post-quantum hybrid schemes
+(e.g., **Kyber + AES-GCM, NTRU + ChaCha20-Poly1305**).
+Implementations may substitute any PQC algorithm set that meets local policy.
+
+#### 🧾 Notes
+
+The use of encryption is optional; archives remain fully valid and readable
+without crypto extensions.
+
+Future official revisions MAY standardize field names or supported algorithms
+once stable and auditable PQC practice emerges.
+
+Always document key management and decryption workflow separately from STASH data itself.
+
+## 🛡️ Integrity
 
 Each `.sf` frame ends with a 32-byte SHA-256 hash that covers everything except the final hash field.
 
