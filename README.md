@@ -363,6 +363,24 @@ This enables:
 
 Hashes in the manifest or optional `manifest.lut` are used for fast lookup and verification, but are **derivable** — no external database needed.
 
+### 🛠️ Self-Describing Resilience
+
+Every STASH frame starts with a 2-byte syncword: `0x53 0x46` (`'SF'`).  
+This makes frames trivially detectable even in raw disk editors, forensic scanners, or recovery tools.
+
+Even without access to the manifest, any valid frame can be:
+
+- **Located** via its magic header (`SF`)
+- **Parsed** via fixed offsets (`version`, `codec_id`, `timestamp`, etc.)
+- **Understood** thanks to the embedded manifest JSONL record in the trailer
+- **Reconstructed** into a new manifest via full-frame scanning
+
+This ensures that even in worst-case scenarios — lost index, corrupted directory, partial disk failure —  
+**the archive can be scanned, interpreted, and rebuilt manually** with nothing more than a hex viewer.
+
+STASH was designed not only to perform well in modern pipelines,  
+but to be readable long after the tools are gone.
+
 ## 🛠️ Implementation Notes
 
 - Each frame (`.sf`) is a standalone binary file:
