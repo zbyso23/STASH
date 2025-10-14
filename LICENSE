@@ -1,10 +1,32 @@
-Creative Commons Attribution 4.0 International (CC BY 4.0)
+Zbyšek License 1.0 — based on Creative Commons Attribution 4.0 International (CC BY 4.0)
 
 Copyright © 2025 Zbigniew Lipka
 
-This work is licensed under a Creative Commons Attribution 4.0 International License.
-You may share and adapt the material for any purpose, even commercially, provided that you give
-appropriate credit to the original author, provide a link to the license, and indicate if changes were made.
+This work is licensed under terms compatible with the Creative Commons Attribution 4.0 International License.
+You may share and adapt the material for any purpose, even commercially, provided that you:
 
-Full text of the license:
+- give appropriate credit to the original author,
+- include this license notice,
+- and indicate if changes were made.
+
+--- 
+
+🚫 Exception — Valve Corporation Exclusion:
+
+The Valve Corporation, including all its subsidiaries, divisions, and affiliated entities, 
+is explicitly prohibited from using, copying, modifying, incorporating, redistributing, 
+or otherwise exploiting this work, in part or in whole, without the author's prior written consent.
+
+This exception overrides all otherwise granted rights under CC BY 4.0 for the named entity.
+
+---
+
+All other individuals, organizations, and companies may use this work under the standard 
+terms of the Creative Commons Attribution 4.0 International License.
+
+No additional legal or technical restrictions may be applied beyond what is stated above.
+
+This license supersedes all previous licensing notices in this repository as of commit [INSERT COMMIT HASH OR TAG].
+
+For the full legal text of CC BY 4.0, see:
 https://creativecommons.org/licenses/by/4.0/legalcode

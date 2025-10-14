@@ -1,5 +1,5 @@
 # 🌀 STASH — Self-describing Tagged Archive Streamable Heaps  
-**Version:** 1.2 • **Spec Draft**  
+**Version:** 1.21 • **Spec Draft**  
 
 ---
 
@@ -7,9 +7,16 @@
 
 STASH is an append-only, verifiable archival format optimized for cloud-native workflows, differential sync, and long-term integrity.
 
-Instead of bundling files into a single opaque blob (like `.zip` or `.tar.gz`), STASH splits input data into fixed-size compressed frames (e.g. 64 KiB). Each frame is hashed (SHA-256) and referenced from a flat JSONL manifest, enabling fast random access, deduplication, and content-based verification.
+Instead of bundling files into a single opaque blob (like `.zip` or `.tar.gz`), STASH splits input data into compressed frames of selected standard sizes (e.g. 4 KiB, 64 KiB, 1 MiB). Each frame is hashed (SHA-256) and referenced from a flat JSONL manifest, enabling fast random access, deduplication, and content-based verification.
 
 All frames are immutable. No data is ever overwritten — updates are expressed as new manifest entries, making STASH ideal for incremental backups, verifiable replication, and scalable archival across SSD, HDD, tape, or cold storage.
+
+### 📏 Frame Size Selection
+
+STASH supports a predefined set of frame sizes, optimized for varying storage backends and access patterns:
+`4 KiB / 16 KiB / 64 KiB / 256 KiB / 1 MiB / 8 MiB / 64 MiB / 256 MiB`
+
+All frames within a single archive MUST use the same size. The selected size should balance compression efficiency, access granularity, and I/O performance depending on the target platform. Smaller frames favor random access and deduplication; larger frames improve compression and throughput.
 
 ---
 
@@ -34,7 +41,7 @@ The result is an **addressable, verifiable, and distributed archive format.**
 
 ## ⚙️ Core Principles
 
-- All content is split into fixed-size frames (default: 64 KiB), aligned to file boundaries where practical
+- All content is split into compressed frames of standard sizes (see STASH 1.21), aligned to file boundaries where practical  
 - Each frame is compressed independently, using codecs optimized for the file type (e.g. Zstd for binaries, Deflate for text)
 - All frames are **immutable** and **append-only**
 - The manifest is a flat JSONL file that maps files to frames and tracks all operations (add, delete, overwrite) as a linear log
@@ -51,6 +58,25 @@ The result is an **addressable, verifiable, and distributed archive format.**
 - Support for distributed sub-manifests and modular replication
 
 The result is a **scalable, verifiable, and fault-tolerant archive format** — designed as a foundation for modern archival systems with zero-dependency parsing, efficient synchronization, and long-term resilience.
+
+### 🆕 STASH 1.21 — Frame Size Class Set
+
+STASH 1.21 introduces an explicit **frame size class set**. Each archive MUST choose a single fixed frame size from the following standard options:
+`4 KiB / 16 KiB / 64 KiB / 256 KiB / 1 MiB / 8 MiB / 64 MiB / 256 MiB`
+
+This enables consistent memory management, compression tuning, and backend storage optimization across heterogeneous environments.
+
+Frame size MAY be:
+
+- **Globally fixed** at archive creation time (`manifest.config.frame_size`) — suitable for deterministic archives  
+- **Per-client adaptive**, if the archive permits reader-side frame reassembly or progressive access (e.g. caching layers, CDN nodes)
+
+Regardless of adaptation, all frames remain individually addressable, immutable, and self-describing.
+
+⚠️ Note on 256M:
+* Optional in STASH 1.21, mandatory support may be introduced in future version (e.g. STASH 1.3+)
+* Should only be used in archives where target systems support large memory-mapped access
+* Recommended for AI datasets, medical imaging, 3D reconstruction, simulation output, etc.
 
 ---
 
@@ -375,7 +401,7 @@ The manifest is designed to accept such extensions without breaking compatibilit
 
 ## 📜 License
 
-This specification is released under the **Creative Commons Attribution 4.0 International License (CC-BY 4.0)**.
+This specification is released under the **Zbyšek License 1.0**, which is based on the Creative Commons Attribution 4.0 International License (CC-BY 4.0), with one important exception.
 
 You are free to:
 
@@ -384,8 +410,14 @@ You are free to:
 
 Under the following terms:
 
-- **Attribution** — You must give appropriate credit, provide a link to the license, and indicate if changes were made.  
-- No additional restrictions — You may not apply legal terms or technological measures that legally restrict others from doing anything the license permits.
+- **Attribution** — You must give appropriate credit, indicate if changes were made, and include this license.  
+- **No additional restrictions** — You may not apply legal terms or technological measures that legally restrict others from doing anything the license permits.
+
+### 🚫 Exception — Valve Corporation Ban
+
+> **The Valve Corporation and any of its subsidiaries or affiliated entities are explicitly prohibited** from using, incorporating, adapting, redistributing, or otherwise exploiting this work in any form, without the author's written permission.
+
+---
 
 **Author:** © 2025 Zbigniew Lipka  
-**License text:** [CC-BY 4.0 International](https://creativecommons.org/licenses/by/4.0/)
+**Full license text:** See [LICENSE](./LICENSE)
