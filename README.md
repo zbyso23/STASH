@@ -1,5 +1,5 @@
 # 🌀 STASH — Self-describing Tagged Archive Streamable Heaps  
-**Version:** 1.21 • **Spec Draft**  
+**Version:** 2.00 • **Enterprise-Ready Specification Draft**  
 
 ---
 
@@ -7,16 +7,28 @@
 
 STASH is an append-only, verifiable archival format optimized for cloud-native workflows, differential sync, and long-term integrity.
 
-Instead of bundling files into a single opaque blob (like `.zip` or `.tar.gz`), STASH splits input data into compressed frames of selected standard sizes (e.g. 4 KiB, 64 KiB, 1 MiB). Each frame is hashed (SHA-256) and referenced from a flat JSONL manifest, enabling fast random access, deduplication, and content-based verification.
+Instead of bundling files into a single opaque blob (like `.zip` or `.tar.gz`), STASH splits input data into compressed frames of selected standard sizes (e.g. 4 KiB, 64 KiB, 1 MiB). Each frame is hashed (SHA-256 by default) and referenced from a flat JSONL manifest, enabling fast random access, deduplication, and content-based verification.
 
 All frames are immutable. No data is ever overwritten — updates are expressed as new manifest entries, making STASH ideal for incremental backups, verifiable replication, and scalable archival across SSD, HDD, tape, or cold storage.
 
+## 🆕 Version 2.0 Enhancements
+To achieve enterprise-grade scale and absolute minimal I/O overhead during krizové stavy (disaster recovery), STASH 2.0 introduces three core refinements to this original foundation:
+
+- **Fixed-Width Block Grid:** While preserving standard frame sizes, all frames within a single archive are now padded to a strictly uniform, predictable block boundary (frame_size + 48 bytes), enabling instant mathematical seeking (O(1) block striding) and eliminating lookups from scratch.
+- **Frame Packing Layer:** Small files (e.g., thousands of tiny text or configuration files) are packed sequentially into a single fixed frame buffer rather than triggering wasteful padding or internal fragmentation.
+- **Self-Describing Block Trailers:** Each fixed block embeds its own transaction meta-index right before a 48-byte Master Trailer, ensuring that if the global manifest is lost, a fast **Hop-and-Read Rescue** tool can skip the raw data entirely and rebuild the entire manifest.jsonl along with original file names and folder structures.
+
 ### 📏 Frame Size Selection
 
-STASH supports a predefined set of frame sizes, optimized for varying storage backends and access patterns:
-`4 KiB / 16 KiB / 64 KiB / 256 KiB / 1 MiB / 8 MiB / 64 MiB / 256 MiB`
+STASH 2.0 enforces a streamlined set of frame sizes optimized strictly for macro-aligned storage layers, high-throughput cloud streams, and predictable network seeking:
+`64 KiB / 1 MiB / 4 MiB / 16 MiB`
 
-All frames within a single archive MUST use the same size. The selected size should balance compression efficiency, access granularity, and I/O performance depending on the target platform. Smaller frames favor random access and deduplication; larger frames improve compression and throughput.
+All frames within a single archive MUST use the same size. The selected size class dictates the global layout geometry and is permanently recorded inside the Archive Header at offset 0x00 during creation.
+
+### 🆕 2.0 Geometric Alignment Constraints
+- **Deduplication vs. Throughput:** The chosen frame size determines the data aggregation window. Smaller classes (64 KiB) optimize random access performance and fine-grained content deduplication across heterogeneous datasets. Larger classes (4 MiB / 16 MiB) maximize sequential pipeline throughput and optimize network economy for cloud platforms (e.g., AWS S3) by minimizing transaction count.
+- **Elimination of Dynamic Scaling:** Unlike previous iterations, STASH 2.0 forbids reader-side adaptive frame sizes or mid-stream adjustments within a single file volume. The mgrid configuration remains absolute across the entire archive string to maintain uninterrupted O(1) block-stride calculations.
+- **Padding Mechanics:** If individual incoming assets or stacked data pools collected via the Frame Packing engine do not cleanly divide into the selected size class, the payload buffer is filled with deterministic zero-padding (0x00) exactly up to the frame_size threshold. The trailing byte marker is placed strictly at frame_size + 48 bytes, anchoring the mathematical alignment.
 
 ---
 
@@ -25,58 +37,52 @@ All frames within a single archive MUST use the same size. The selected size sho
 Classic archive formats (like .zip or .tar.gz) are monolithic by design. They bundle all content into a single linear stream, making random access, diffing, or partial updates inefficient or outright impossible.
 
 Modern data workloads — especially in cloud, archival, and compliance-focused environments — require:
-
 - Append-only immutable structures
-- Efficient incremental updates (no rewriting of large blobs)
+- Efficient incremental updates without rewriting large blobs
 - Content-addressed deduplication
 - Fast partial access to specific files or chunks
-- Cold storage optimization (tiered access: SSD → HDD → MO)
-- Verifiability and forensic audit support (GDPR, legal hold)
+- Cold storage optimization across tiered physical media (SSD → HDD → MO / Tape)
+- Verifiability and forensic audit support for automated compliance (GDPR, legal hold)
 
-STASH is designed for these realities: to serve as a building block for distributed, verifiable, scalable archival systems, with minimal dependencies and maximum portability.
+STASH 2.0 is designed for these realities. It serves as a programmatic building block for distributed, verifiable, and scalable archival ecosystems, guaranteeing minimal dependencies and maximum portability. By implementing an unyielding frame grid alongside an embedded meta-index layer, it mitigates cloud network cost penalties while remaining robust against global index loss.
 
 The result is an **addressable, verifiable, and distributed archive format.**
 
 ---
 
-## ⚙️ Core Principles
-
-- All content is split into compressed frames of standard sizes (see STASH 1.21), aligned to file boundaries where practical  
-- Each frame is compressed independently, using codecs optimized for the file type (e.g. Zstd for binaries, Deflate for text)
+⚙️ Core Principles
+- All content is split into compressed frames of standard macro-aligned sizes (`64 KiB / 1 MiB / 4 MiB / 16 MiB`), packed sequentially via the library buffer to eliminate internal fragmentation
+- Each frame is compressed independently, using codecs optimized for the data type (e.g., `Zstd` for binaries, `LZ4` for high-throughput pipelines, or none for pre-compressed streams)
 - All frames are **immutable** and **append-only**
-- The manifest is a flat JSONL file that maps files to frames and tracks all operations (add, delete, overwrite) as a linear log
-- Data is never modified in-place — updates are expressed by appending new frames and manifest records
-- Every frame is **content-addressed** by its hash (SHA-256 by default), enabling global deduplication and integrity checks
-- Manifest records are designed for **ultra-fast parsing**, with fixed-length binary fields (TS, OP, FRAME, SIZE, OFFSET)
-- Metadata and data are strictly separated, enabling selective sync, streaming, and low-latency access
+- The manifest is a flat JSONL file that maps files to specific frame offsets and tracks all operations (add, delete, link) as a linear log
+- Data is never modified in-place — updates are expressed exclusively by appending new frames and appending transaction rows to the manifest
+- Every frame block is content-addressed by its full master hash (SHA-256 or BLAKE3), enabling global storage deduplication and foolproof integrity validation
+- Manifest records are optimized for reverse bottom-up scanning, allowing sub-millisecond catalog initialization by prioritizing the latest transaction states
+- Metadata and data are strictly separated, allowing low-latency remote access, granular cloud stream carving, and zero-allocation parsing
 
-**STASH 1.2** addresses these needs with:
+**STASH 2.0** addresses these needs with:
+- Immutable, fixed-width compressed frame blocks padded to strict mathematical geometric boundaries
+- A flat append-only JSONL manifest accompanied by a prefix-based 256-file binary shard index layer
+- Embedded per-frame block meta-indexes and 48-byte Master Trailers for zero-overhead forensic recovery
+- Native support for distributed sub-manifest architecture, preventing write-lock contention across cloud clusters
 
-- Immutable compressed frames with per-frame SHA-256
-- A flat append-only JSONL manifest (with optional LUT index)
-- Embedded per-frame manifest trailers for recovery and integrity
-- Support for distributed sub-manifests and modular replication
+The result is a **scalable, verifiable, and fault-tolerant archive format** — designed as a foundation for modern archival systems with zero-dependency parsing, efficient synchronization, and long-term structural resilience.
 
-The result is a **scalable, verifiable, and fault-tolerant archive format** — designed as a foundation for modern archival systems with zero-dependency parsing, efficient synchronization, and long-term resilience.
 
-### 🆕 STASH 1.21 — Frame Size Class Set
 
-STASH 1.21 introduces an explicit **frame size class set**. Each archive MUST choose a single fixed frame size from the following standard options:
-`4 KiB / 16 KiB / 64 KiB / 256 KiB / 1 MiB / 8 MiB / 64 MiB / 256 MiB`
+## 🆕 STASH 2.0 — Frame Size Class Set
 
-This enables consistent memory management, compression tuning, and backend storage optimization across heterogeneous environments.
-
-Frame size MAY be:
-
-- **Globally fixed** at archive creation time (`manifest.config.frame_size`) — suitable for deterministic archives  
-- **Per-client adaptive**, if the archive permits reader-side frame reassembly or progressive access (e.g. caching layers, CDN nodes)
-
-Regardless of adaptation, all frames remain individually addressable, immutable, and self-describing.
-
-⚠️ Note on 256M:
-* Optional in STASH 1.21, mandatory support may be introduced in future version (e.g. STASH 1.3+)
-* Should only be used in archives where target systems support large memory-mapped access
-* Recommended for AI datasets, medical imaging, 3D reconstruction, simulation output, etc.
+STASH 2.0 establishes a finalized, strict **frame size class set**. Each archive MUST choose a single fixed frame size. This selection is stored directly within the Archive Header and encoded as a compact 8-bit byte identifier (uint8), where the byte value acts as a power-of-two multiplier yielding standard block bounds from `4 KiB` up to `256 MiB`:
+`4 KiB / 8 KiB / 16 KiB / 32 KiB / 64 KiB / 128 KiB / 256 KiB / 512 KiB / 1 MiB / 2 MiB / 4 MiB / 8 MiB / 16 MiB / 32 MiB / 64 MiB / 128 MiB / 256 MiB`
+This hard geometric predictability enables consistent, zero-allocation memory management, exact pipeline buffer tuning, and optimized block-level backend storage operations across cloud architectures.
+The frame size configuration MUST be:
+Globally fixed at archive creation time within the Archive Header at offset 0x06 — making the volume completely deterministic for downstream clients.
+Strictly uniform across the entire payload — meaning reader-side adaptive frame reassembly or mid-stream sizing changes are explicitly forbidden in order to maintain O(1) mathematical block-stride calculations.
+Regardless of the chosen size class, all frames remain individually addressable, immutable, and fully self-describing through their trailing structures.
+⚠️ Operational Notes on Large Allocations (64 MiB to 256 MiB):
+Large macro-aligned frame classes are recommended for high-bandwidth target systems supporting massive memory-mapped (mmap) storage arrays.
+Ideal for enterprise-grade workloads including AI/ML training datasets, medical imaging arrays, raw 3D volumetric reconstruction streams, and large database ingestion pipelines.
+Internal fragmentation for minor files within these massive blocks is entirely mitigated by the core Frame Packing aggregation engine.
 
 ---
 
