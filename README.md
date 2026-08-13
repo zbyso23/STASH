@@ -2,7 +2,7 @@
 
 **Version:** 2.0 — Consolidated Specification
 **Status:** Draft (post-review, internally consistent)
-**Target:** Server / enterprise / datacenter petabyte-scale storage. Not a general-purpose replacement for tar/zip. Desktop/edge use is explicitly out of scope for this version (see §14).
+**Target:** Server / enterprise / datacenter petabyte-scale storage. Not a general-purpose replacement for tar/zip. Desktop/edge use is explicitly out of scope for this version (see §15).
 
 ---
 
@@ -27,7 +27,7 @@ All frames are immutable. Updates are expressed as new manifest entries and new 
 
 ## 2. Archive Header
 
-Located at the start of Blob 0 (the first blob file — see §2.1). Applies to the whole archive; all blobs share one logical Archive Header, physically stored in Blob 0 only.
+Located at the start of Blob 0 (the first blob file — see §2.1). Applies to the whole archive; all blobs share one logical Archive Header, physically stored in Blob 0 only. All multi-byte integer fields below are little-endian (see global rule in §6).
 
 | Offset | Size (B) | Field | Type | Description |
 |---|---|---|---|---|
@@ -89,7 +89,9 @@ Single byte (`frame_size_class`), power-of-two multiplier from a fixed table:
 
 All frames in a single archive use the same class. No mid-stream adjustment. Recommended: 64 KiB–1 MiB for mixed/general datasets, 16 MiB–256 MiB for large homogeneous ML/imaging/database datasets.
 
-`BLOCK_STRIDE = frame_size + 48` bytes is the fixed on-disk stride between consecutive frame blocks (see §6).
+Note: `frame_size_class` sets the **total on-disk block size**, not the payload capacity — the actual payload budget is smaller by at least 48 bytes (Master Trailer) plus any Pre-Trailer overhead (§6). For the smallest class (4 KiB), this is a proportionally larger overhead than for large classes; very small classes are best suited to unpacked, single-file-per-frame use, not heavy small-file packing.
+
+`BLOCK_STRIDE = frame_size` exactly. `frame_size` is the full, aligned, on-disk block size — it already includes the Master Trailer and Pre-Trailer, not just the payload. This is what keeps every block boundary aligned to the chosen power-of-two class (critical for `mmap`, `O_DIRECT`, and SSD/NVMe flash-page alignment); see §6 for the internal split.
 
 ---
 
@@ -130,14 +132,22 @@ Go implementation: BLAKE3 has no stdlib implementation — use `zeebo/blake3` or
 
 ## 6. Frame Binary Layout
 
-Each frame occupies exactly `BLOCK_STRIDE = frame_size + 48` bytes on disk. Layout, offsets relative to the **start of the frame block**:
+**Global encoding rule:** all multi-byte integer fields in this specification (Archive Header, Master Trailer, Pre-Trailer, manifest.lut) are **little-endian**, without exception. This applies retroactively to every table in §2 and §6.1 even where not previously stated.
+
+`BLOCK_STRIDE = frame_size` exactly — no addition. `frame_size` (the value selected via `frame_size_class`, §3) is the **total, aligned, on-disk size of the block**, including the Master Trailer and Pre-Trailer, not just the payload. This is a deliberate correction from an earlier draft that defined `BLOCK_STRIDE = frame_size + 48`: adding a fixed 48 bytes on top of a power-of-two `frame_size` breaks alignment on every block after the first, defeating the entire purpose of the fixed grid (mmap page alignment, O_DIRECT alignment requirements, SSD/NVMe flash-page alignment). The usable **payload budget** for a given frame is therefore always somewhat less than the nominal class size:
 
 ```
-block_start                                                    block_start + BLOCK_STRIDE
-    |                                                                        |
-    v                                                                        v
-    [ compressed_payload ][ zero padding 0x00 ][ pre_trailer ][ 48B master trailer ]
-    |<---------------------- frame_size bytes ---------------------------->|<-- 48B -->|
+payload_budget = frame_size − 48 (Master Trailer) − pre_trailer_total_size
+```
+
+Layout, offsets relative to the **start of the frame block**:
+
+```
+block_start                                                                          block_start + frame_size
+    |                                                                                                |
+    v                                                                                                v
+    [ compressed_payload ][ zero padding 0x00 ][ pre_trailer_body ][ pre_trailer_len:4B ][ 48B master trailer ]
+    |<---------------------------------------------- frame_size (== BLOCK_STRIDE) --------------------------->|
 ```
 
 ### 6.1 Master Trailer (fixed 48 bytes, last 48 bytes of every block)
@@ -145,29 +155,62 @@ block_start                                                    block_start + BLO
 | Offset (from trailer start) | Size (B) | Field | Type | Description |
 |---|---|---|---|---|
 | 0x00 | 4 | magic | char[4] | `'STSH'` |
-| 0x04 | 2 | version | uint16 | `0x0002` |
+| 0x04 | 2 | version | uint16 (LE) | `0x0002` |
 | 0x06 | 1 | hash_id | uint8 | Matches Archive Header |
 | 0x07 | 1 | codec_id | uint8 | Codec used for **this** frame's payload |
 | 0x08 | 1 | block_type | uint8 | `0 = DATA`, `1 = PARITY` (see §7) |
 | 0x09 | 3 | reserved | bytes | Zero-filled, reserved for future flags |
-| 0x0C | 4 | data_len | uint32 | Real compressed payload length, before padding |
+| 0x0C | 4 | data_len | uint32 (LE) | Real compressed payload length, before padding |
 | 0x10 | 32 | hash_payload | bytes | Hash of `compressed_payload` only (see §4 scope rule) |
 
 (0x10 + 32 = 0x30 = 48 bytes total ✓)
 
-### 6.2 Pre-Trailer (Block Meta-Index) — variable length, immediately precedes the Master Trailer
+### 6.2 Pre-Trailer (Block Meta-Index)
 
-Binary structured record (not free text), terminated by `0x00`:
+The Pre-Trailer consists of two parts, laid out back-to-back immediately before the Master Trailer:
 
 ```
-repeated for each file packed into this frame:
-| varint | path_len   | length of UTF-8 path string
-| bytes  | path       | UTF-8 file path, path_len bytes
-| uint64 | inner_off  | byte offset of this file's data within compressed_payload
-| uint64 | inner_len  | byte length of this file's data within compressed_payload
-| uint64 | file_ver   | version counter for this path (matches manifest 'ver')
+[ pre_trailer_body ][ pre_trailer_len: uint32 (LE), 4 bytes ]
 ```
-Terminated by a single `0x00` byte after the last record.
+
+**`pre_trailer_len`** is a fixed 4-byte field holding the exact byte length of `pre_trailer_body` (not including itself, not including the Master Trailer). It is always the last thing before the Master Trailer, at a fixed, computable position — this is what makes reverse parsing deterministic. **There is no `0x00` terminator anywhere in the Pre-Trailer; the design in the previous draft (relying on a null-byte terminator) is retracted, since a null byte is a valid varint(0) and therefore ambiguous.**
+
+`pre_trailer_body` structure:
+
+```
+uint32 entry_count          (LE, 4 bytes — how many packed-file records follow)
+repeated entry_count times:
+    varint  path_len        (unsigned LEB128, see below; max value 4096)
+    bytes   path             (UTF-8, exactly path_len bytes)
+    uint64  inner_off        (LE, 8 bytes — byte offset within compressed_payload)
+    uint64  inner_len        (LE, 8 bytes — byte length within compressed_payload)
+    uint64  file_ver         (LE, 8 bytes — matches manifest 'ver')
+uint32 crc32c                (LE, 4 bytes — CRC32C (Castagnoli) over every byte of pre_trailer_body preceding this field, i.e. entry_count + all entries)
+```
+
+**Integrity note (important):** `hash_payload` (§6.1, §4) covers only `compressed_payload` — deliberately, to preserve deduplication. It does **not** cover the Pre-Trailer. Without a separate check, a single flipped bit in a stored path (e.g. `src/main.go` silently becoming `src/mxin.go`) would go completely undetected, and Hop-and-Read (§11) would recover corrupted metadata as if it were valid. The trailing `crc32c` field closes this gap: it is not cryptographic (CRC32C is a checksum, not a hash — it doesn't need to be, since it isn't a dedup/identity key), but it reliably catches bitrot/media corruption in metadata, which is the realistic threat model for this field. CRC32C was chosen specifically because it has widely available hardware acceleration (SSE4.2 `CRC32` instruction on x86, `CRC32C` on ARMv8), so it adds negligible overhead relative to a cryptographic hash. Readers (including Hop-and-Read) MUST verify `crc32c` before trusting any parsed Pre-Trailer entry; a mismatch means the frame's Pre-Trailer is corrupt (fall back to parity reconstruction, §7, if available).
+
+**Varint encoding:** unsigned LEB128 (identical to Protocol Buffers' varint) — 7 bits of value per byte, low-order group first, MSB of each byte set to 1 if more bytes follow, 0 on the final byte. `path_len` is capped at 4096 (matches common filesystem `PATH_MAX` conventions with margin); a value above this is invalid and MUST cause the frame to be rejected as malformed.
+
+**Deterministic reverse-parse algorithm (required for Hop-and-Read, §11):**
+1. Read the last 48 bytes of the block → Master Trailer (fixed offset, always known).
+2. Read the 4 bytes immediately preceding the Master Trailer → `pre_trailer_len`.
+3. **Sanity check:** if `pre_trailer_len > max_pre_trailer_total` (computed from `frame_size` per the formula below) or `pre_trailer_len` would place `pre_trailer_body_start` before `data_len`, the block is corrupt — abort and treat as unrecoverable via this path (fall back to §7 parity reconstruction if available).
+4. Compute `pre_trailer_body_start = block_end − 48 − 4 − pre_trailer_len`. This is exact and requires no scanning.
+5. Seek to `pre_trailer_body_start` and read forward (not backward): `entry_count` (4 bytes), then parse exactly `entry_count` records in order using the varint/fixed-field layout above, then the trailing `crc32c` (4 bytes). Parsing stops when `entry_count` records plus the checksum have been read — no terminator byte is needed or present.
+6. **Verify `crc32c`** against the bytes actually read (`entry_count` field + all entries). On mismatch, treat the Pre-Trailer as corrupt — same fallback as step 3.
+7. `compressed_payload` occupies `[block_start, block_start + data_len)` (from Master Trailer's `data_len`); everything between `data_len` and `pre_trailer_body_start` is zero padding and is skipped, never parsed.
+
+**Limits (normative):**
+- `MAX_PACKED_ENTRIES = 65535` per frame (`entry_count` MUST NOT exceed this, even though the field is uint32-wide — the cap bounds worst-case parse cost and reflects that Frame Packing targets small-file aggregation, not hundreds of thousands of files per frame).
+- `path_len` MUST NOT exceed 4096 bytes.
+- `MIN_PAYLOAD_RESERVE = 64` bytes — every frame MUST reserve at least this many bytes for `compressed_payload`, even when packing. This yields a hard, computable ceiling:
+  ```
+  max_pre_trailer_total = frame_size − 48 (Master Trailer) − 4 (pre_trailer_len field) − MIN_PAYLOAD_RESERVE
+  ```
+  where `pre_trailer_total = pre_trailer_body` (i.e. `4 [entry_count] + Σ per-entry bytes + 4 [crc32c]`). Implementations MUST reject (fail the pack operation, start a new frame instead) any attempt to write a Pre-Trailer whose `pre_trailer_body` size would exceed `max_pre_trailer_total`. This bound is checked incrementally while packing (before adding each new entry), not only at flush time — so a writer never produces a frame it would then have to reject.
+  - Worked example: `frame_size_class = 4 KiB` (4096 bytes) → `max_pre_trailer_total = 4096 − 48 − 4 − 64 = 3980` bytes available for `entry_count` + all packed-file records + `crc32c` combined.
+  - **Note on the `MAX_PACKED_ENTRIES` bound above:** this byte-budget ceiling already prevents pathological cases regardless of frame class. Even at the largest class (256 MiB) with `MAX_PACKED_ENTRIES = 65535` and a typical ~130-byte-per-entry record (short path + fixed fields), worst-case Pre-Trailer size is ~8.5 MB — not the multi-gigabyte metadata blob that an unbounded entry count would allow. The two limits (entry count and byte budget) are complementary, not redundant: byte budget bounds metadata size relative to frame size, entry count separately bounds parse-time cost even for a hypothetical frame class larger than 256 MiB in a future revision.
 
 **Packing determinism (required):** when Frame Packing combines multiple files into one frame, files MUST be ordered lexicographically by path before packing. This guarantees that identical sets of small files packed on different nodes produce byte-identical frames — and therefore correctly deduplicate — without any cross-node coordination.
 
@@ -179,8 +222,8 @@ Terminated by a single `0x00` byte after the last record.
 |---|---|---|---|
 | 0x00 | none | 0 | No redundancy beyond hash-based detection |
 | 0x01 | XOR | 1 lost frame per group | Simplest; single-disk-failure protection only |
-| 0x02 | Reed-Solomon | `parity_m` lost frames per group | Recommended default for enterprise/petabyte deployments |
-| 0x03 | LRC (Local Reconstruction Codes) | tunable | Lower rebuild I/O than RS, higher storage overhead |
+| 0x02 | Reed-Solomon | `parity_m` lost frames per group | **Recommended default** for enterprise/petabyte deployments |
+| 0x03 | LRC (Local Reconstruction Codes) | tunable | **EXPERIMENTAL — not recommended for production.** Go ecosystem libraries for LRC are comparatively immature/unaudited (§12) compared to Reed-Solomon (`klauspost/reedsolomon`). Included for future-proofing the enum; implementations MAY support it but SHOULD warn or require an explicit opt-in flag, and SHOULD document it as unproven until a mature reference implementation exists. |
 
 Fixed at archive creation via `parity_scheme` / `parity_k` / `parity_m` in the Archive Header (§2). **Mixing schemes within one archive is not supported** — if different data needs different protection levels, use separate archives or separate sub-manifests (§9), each with its own parity configuration.
 
@@ -227,12 +270,12 @@ Append-only `manifest.jsonl`. Reverse Log Scanning (bottom-up) determines curren
 
 - **`loc`** is always an array of `[blob_id, frame_hash, inner_offset, inner_length]` quadruples, one per frame the file spans. Single-frame files simply have a one-element array. `blob_id` is the two-hex-digit blob file index (matches `frames/blob-XX.stash`, §2.1).
 - **`ver`** is a per-path monotonic version counter, incremented on every ADD/replace of the same path. It has no relationship to the archive format version.
-- **`op: SUB`** is **removed in 2.0**. It is a legacy v1.21 construct — see §13. Only `LINK_MANIFEST` is valid in 2.0.
+- **`op: SUB`** is **removed in 2.0**. It is a legacy v1.21 construct — see §14. Only `LINK_MANIFEST` is valid in 2.0.
 - **`LINK_MANIFEST`** always declares `hash_id` explicitly (a sub-manifest may in principle be verified with a different hash algorithm than the parent's frame data, though the parent archive's own `hash_id` in the Archive Header still governs its own frames).
 
 ### 9.2 manifest.lut (optional binary index)
 
-Fixed-size binary records, prefix-sharded into `index/00.idx`–`index/ff.idx` by path hash prefix, fully derivable/rebuildable from `manifest.jsonl` at any time, never authoritative on its own (a cache/acceleration layer only).
+Fixed-size binary records, prefix-sharded into `index/00.idx`–`index/ff.idx` by path hash prefix, fully derivable/rebuildable from `manifest.jsonl` at any time, never authoritative on its own (a cache/acceleration layer only). All multi-byte fields are little-endian (§6 global rule).
 
 | Offset | Size (B) | Field | Type | Description |
 |---|---|---|---|---|
@@ -277,7 +320,7 @@ If `manifest.jsonl` is lost, the archive is rebuilt by:
 
 1. For each of the `blob_count` blob files (§2.1) — independently and optionally in parallel — reading `BLOCK_STRIDE` at a time from its start (mathematical stride, no scanning of payload data required).
 2. At each block boundary, reading the 48-byte Master Trailer to get `hash_payload`, `block_type`, `data_len`.
-3. For `block_type = DATA`, reading backward from the trailer into the Pre-Trailer to recover the flat list of `(path, inner_offset, inner_length, file_ver)` records for that frame.
+3. For `block_type = DATA`, apply the §6.2 deterministic reverse-parse algorithm (read `pre_trailer_len`, compute exact start, parse `entry_count` records forward) to recover the flat list of `(path, inner_offset, inner_length, file_ver)` records for that frame.
 4. For `block_type = PARITY`, recording group membership (including which blob each member was found in) for later cross-check/rebuild, not file paths.
 5. Emitting one synthesized `ADD` record per recovered `(path, file_ver)`, using `[blob_id, hash_payload]` as the `loc` reference (§9.1).
 6. Where the same path/version was packed redundantly across multiple identical frames (deduplicated), any one instance is sufficient to recover the mapping.
@@ -334,7 +377,23 @@ type WriteContext struct {
 
 ---
 
-## 13. Legacy v1.21 (historical reference only — not valid 2.0 syntax)
+## 13. Compaction / Garbage Collection
+
+Append-only + immutable frames means `DEL` (§9.1) never reclaims space — the frame stays on disk, only the manifest stops pointing to it. At petabyte scale with any meaningful churn (daily log rotation, dataset replacement), this leads to unbounded disk growth even when live data is a small fraction of what's stored. This is a real gap in a plain append-only design and MUST be addressed by every conformant implementation, even though compaction itself is an offline/background process, not part of the on-disk format read/write path.
+
+### 13.1 Mark — Sweep — Switch
+
+1. **Mark:** perform a reverse (bottom-up) scan of the manifest (§10.1, using a checkpoint if available) to build the set of currently-live `(blob_id, frame_hash)` references — every frame reachable from the latest state of every path, across all `LINK_MANIFEST`-connected sub-manifests.
+2. **Sweep:** walk every blob file block-by-block (`BLOCK_STRIDE` stride, §6) and copy only live frames (data frames referenced by the mark set, plus any parity frames whose parity group still has live members) into a new set of blob files. Frames not in the mark set are simply not copied.
+3. **Switch:** write a new manifest (or a new `LINK_MANIFEST`-referenced compacted sub-manifest) whose `loc`/`blob_id` entries point at the new blob files, verify it, then atomically replace the old root pointer (e.g. rename-on-commit, or append a terminal `LINK_MANIFEST` that supersedes the old one). Only after the switch is confirmed durable does the implementation physically delete the old blobs and old manifest.
+
+Compaction MUST be safe to abort/retry at any step: the old archive stays fully valid and readable until the Switch step completes, and a crash during Sweep simply means re-running Mark+Sweep from scratch (old data untouched, no partial corruption possible since nothing old is deleted until Switch succeeds).
+
+Compaction is naturally scoped per sub-manifest (§10.2) — a large archive does not need a single global compaction pass; each independently-owned sub-manifest can be compacted on its own schedule, consistent with the "sub-manifest = independently operable unit" principle already established for sharding.
+
+---
+
+## 14. Legacy v1.21 (historical reference only — not valid 2.0 syntax)
 
 v1.21 used standalone `.sf` files (`/frames/ab/cd/abcdef....sf`), a 2-byte `'SF'` magic, a 16-bit back-offset, and an embedded free-text JSONL trailer per frame, with `op: SUB` for sub-manifest references. This was superseded in 2.0 because:
 
@@ -349,18 +408,13 @@ Do not implement `.sf` standalone files or `op: SUB` in 2.0. This section exists
 
 ---
 
-## 14. Out of Scope for 2.0
+## 15. Out of Scope for 2.0
 
 - Encryption (non-normative guidance only — see below)
 - Desktop/edge deployment profiles (smaller frame classes, lighter parity, offline-first conflict resolution — candidate for a future v2.x/v3.0 profile mechanism, not this version)
 - Sub-block / content-defined-chunking deduplication (explicit non-goal, §0)
 - **Tape / cold-storage tiers** — deliberately excluded, not deferred. The tape ecosystem (proprietary libraries, LTO consortium tooling, specialized hardware) is a closed, conservative market with low realistic adoption odds for a new open format; effort is better spent on disk/SSD/cloud-object-storage deployments in datacenters, which are the addressable target.
 
-### 14.1 Encryption (non-normative)
+### 15.1 Encryption (non-normative)
 
 If implemented: encrypt only `compressed_payload`; header, trailer, and pre-trailer remain in plaintext so frames stay self-describing. Compute `hash_payload` over the ciphertext when encryption is active (integrity, not secrecy, is what the hash guarantees in that mode). Store algorithm/IV/key-ID references in manifest fields, not in the fixed binary layout. No specific algorithm is mandated by this spec; implementations should use current, well-reviewed authenticated encryption (e.g., AES-GCM or a ChaCha20-Poly1305 construction) and document their own key management separately.
-
----
-
-**Author:** © 2025-2026 Zbigniew Lipka  
-**Full license text:** See [LICENSE](./LICENSE)
