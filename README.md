@@ -1,8 +1,10 @@
-# 🌀 STASH — Self-describing Tagged Archive Streamable Heaps
+# 🌀 STASH
 
 **Version:** 2.0 — Consolidated Specification
 **Status:** Draft (post-review, internally consistent)
 **Target:** Server / enterprise / datacenter petabyte-scale storage. Not a general-purpose replacement for tar/zip. Desktop/edge use is explicitly out of scope for this version (see §15).
+
+**Note on the name:** earlier drafts expanded STASH as "Self-describing Tagged Archive Streamable Heaps." The "Tagged" element implied user-facing key/value tagging that this specification does not define anywhere (paths and versions are not tags). Rather than retrofit a tagging feature just to justify the acronym, the expansion is dropped here — the name is simply **STASH**. A future revision MAY introduce optional manifest-level tags (`"tags": {"key": "value"}` on `ADD` records) as a real feature, at which point re-adopting an expanded name would be accurate rather than aspirational.
 
 ---
 
@@ -384,10 +386,10 @@ Append-only + immutable frames means `DEL` (§9.1) never reclaims space — the 
 ### 13.1 Mark — Sweep — Switch
 
 1. **Mark:** perform a reverse (bottom-up) scan of the manifest (§10.1, using a checkpoint if available) to build the set of currently-live `(blob_id, frame_hash)` references — every frame reachable from the latest state of every path, across all `LINK_MANIFEST`-connected sub-manifests.
-2. **Sweep:** walk every blob file block-by-block (`BLOCK_STRIDE` stride, §6) and copy only live frames (data frames referenced by the mark set, plus any parity frames whose parity group still has live members) into a new set of blob files. Frames not in the mark set are simply not copied.
+2. **Sweep:** walk every blob file block-by-block (`BLOCK_STRIDE` stride, §6) and copy only live frames (data frames referenced by the mark set, plus any parity frames whose parity group still has live members) into a new set of blob files. Frames not in the mark set are simply not copied. **Implementations MUST write to a new set of blob files during Sweep — never overwrite or modify an existing blob file in place.** This is what guarantees the old manifest always points at fully intact, untouched data for as long as it remains the active root pointer; in-place rewriting would risk a crash leaving the old manifest referencing a partially-overwritten blob, which is exactly the corruption scenario the whole append-only design exists to avoid.
 3. **Switch:** write a new manifest (or a new `LINK_MANIFEST`-referenced compacted sub-manifest) whose `loc`/`blob_id` entries point at the new blob files, verify it, then atomically replace the old root pointer (e.g. rename-on-commit, or append a terminal `LINK_MANIFEST` that supersedes the old one). Only after the switch is confirmed durable does the implementation physically delete the old blobs and old manifest.
 
-Compaction MUST be safe to abort/retry at any step: the old archive stays fully valid and readable until the Switch step completes, and a crash during Sweep simply means re-running Mark+Sweep from scratch (old data untouched, no partial corruption possible since nothing old is deleted until Switch succeeds).
+Compaction MUST be safe to abort/retry at any step: the old archive stays fully valid and readable until the Switch step completes, and a crash during Sweep simply means re-running Mark+Sweep from scratch (old data untouched, no partial corruption possible since nothing old is deleted until Switch succeeds). **If a crash occurs after the new manifest has been committed but before the old blobs/manifest are deleted, the new manifest is already valid and authoritative — on restart, the implementation SHOULD simply resume and complete deletion of the old (now-orphaned) blobs and manifest; no rollback or re-verification of the new manifest is needed, since Switch only deletes after the new manifest was already confirmed durable.**
 
 Compaction is naturally scoped per sub-manifest (§10.2) — a large archive does not need a single global compaction pass; each independently-owned sub-manifest can be compacted on its own schedule, consistent with the "sub-manifest = independently operable unit" principle already established for sharding.
 
