@@ -1,13 +1,13 @@
 # 🌀 STASH
 
 ## Version 2.0 — Consolidated Specification
-### Revision R3 — Production / Enterprise Hardening (Wire-Breaking Fixes)
+### Revision R3 — Production / Enterprise Hardening (Concurrency, Manifest Scaling & GC Fixes)
 
 **Status:** Approved Specification
 **Target:** Server / enterprise / datacenter / petabyte-scale storage
 **Out of scope:** General-purpose desktop archive use, tape/cold-storage profiles, sub-block/CDC deduplication
 
-Note: R2 closed the remaining self-description gaps identified in the R1 production review (parity-group recoverability, multi-frame fragment ordering, encrypted manifest wire format, deterministic AEAD nonces). **R3 fixes a second review pass** that found operational failure modes R2 did not cover: unbounded memory allocation from `frame\_size\_class`, a 16-bit `group\_id` that wraps around at petabyte scale, dangling multi-frame fragments during scoped compaction, missing O\_DIRECT/mmap alignment for the Pre-Trailer, an infinite-loop failure mode in Frame Packing, an unbounded-manifest-line DoS in reverse scanning, and an under-specified prohibition on re-encrypting ciphertext during compaction.
+Note: R2 closed the remaining self-description gaps identified in the R1 production review (parity-group recoverability, multi-frame fragment ordering, encrypted manifest wire format, deterministic AEAD nonces). **R4 fixes a third review pass** that found operational failure modes R2 did not cover: unbounded memory allocation from `frame\_size\_class`, a 16-bit `group\_id` that wraps around at petabyte scale, dangling multi-frame fragments during scoped compaction, missing O\_DIRECT/mmap alignment for the Pre-Trailer, an infinite-loop failure mode in Frame Packing, an unbounded-manifest-line DoS in reverse scanning, and an under-specified prohibition on re-encrypting ciphertext during compaction.
 
 **R3 changes the Master Trailer binary layout** (§6.1: `group\_id` widens from uint16 to uint32; the redundant per-frame `version` field is removed). This is a **wire-breaking change** versus R1/R2 — see §2.1, header `version` is bumped to `0x0003` so readers can dispatch on trailer layout. R2-written archives are not directly parsed by an R3-only reader without a compatibility shim keyed on header `version`.
 
@@ -586,9 +586,23 @@ Readers MUST support reverse chunked scanning of `manifest.jsonl` in fixed-size 
 
 A checkpoint MAY accelerate startup. A checkpoint is never authoritative if it disagrees with the manifest tail.
 
-**Maximum line length (R3):** because `manifest.jsonl` is a variable-length-line text format, a single pathologically large line (e.g. an inflated `loc` array, whether from a malfunctioning writer or an adversary) can straddle many chunk boundaries. A naive reverse-chunked reader either fails to locate the line's start or must buffer unbounded amounts of memory to reassemble it.
+**Maximum line length:** `MAX\_MANIFEST\_LINE\_BYTES = 1 MiB`. A reader performing reverse chunked scanning MUST treat any line exceeding this limit as manifest corruption and MUST NOT buffer an unbounded line. A writer MUST NOT emit a line exceeding the limit.
 
-**Normative rule:** define `MAX\_MANIFEST\_LINE\_BYTES = 1 MiB`. A reader performing reverse chunked scanning MUST treat any line exceeding `MAX\_MANIFEST\_LINE\_BYTES` as manifest corruption at that record and MUST NOT attempt to buffer or reassemble a larger line. A writer MUST NOT emit a manifest line exceeding `MAX\_MANIFEST\_LINE\_BYTES`; a logical update whose serialized record would exceed this limit (e.g. a file with an extremely large `loc` array from many small fragments) MUST be rejected or restructured (e.g. via `LINK\_MANIFEST` sharding, §10.2) rather than written as an oversized single line.
+**Large logical files:** this limit MUST NOT impose a limit on the number of fragments of one logical file. A multi-frame logical file MUST use the transactional extent protocol below whenever one ordinary `ADD` record would exceed the line limit.
+
+The canonical extent protocol is:
+
+```json
+{"seq":100,"op":"ADD_BEGIN","tx_id":"...","path":"dataset.bin","ver":7,"total_len":10995116277760,"extent_count":3000000}
+{"seq":101,"op":"ADD_EXTENT","tx_id":"...","extent_index":0,"loc":[[0,"hash...",0,65536]]}
+{"seq":102,"op":"ADD_EXTENT","tx_id":"...","extent_index":1,"loc":[[1,"hash...",65536,65536]]}
+...
+{"seq":999999,"op":"ADD_COMMIT","tx_id":"...","extent_count":3000000}
+```
+
+`ADD_BEGIN`, every `ADD_EXTENT`, and `ADD_COMMIT` share one `tx_id`. Each line MUST remain below `MAX\_MANIFEST\_LINE\_BYTES`. `extent_index` MUST start at zero and increase contiguously. The logical file becomes visible atomically only after a valid `ADD_COMMIT` is durably committed. An incomplete extent transaction MUST be ignored during recovery. The manifest journal therefore remains append-only while a single logical file can be represented by arbitrarily many bounded records.
+
+`ADD_EXTENT` MUST carry explicit fragment offsets as defined in §6.2.2; array position is never the sole ordering mechanism. `LINK_MANIFEST` is for independent manifest namespaces and MUST NOT be used as a substitute for transactional extents of one logical file.
 
 ### 10.2 Sharding
 
@@ -753,6 +767,20 @@ This makes compaction restartable and prevents a partially copied blob set from 
 
 This rule composes with §13.6: a frame may simultaneously be a member of a parity group and a fragment of a multi-frame file; both membership sets MUST be intact in the new generation before the old generation is eligible for deletion.
 
+### 13.8 Emergency Pruning
+
+A compaction process MUST NOT wait indefinitely for a missing or inaccessible sibling fragment. It MUST classify the affected object or generation as **GC-blocked** and expose the exact missing fragment references.
+
+If an administrator explicitly invokes **Emergency Pruning**, the operation MUST be durable, auditable, and fail-closed rather than silently weakening integrity:
+
+1. The compactor records an `EMERGENCY_PRUNE` event containing the generation, affected blob(s), missing fragment references, timestamp, and operator-supplied reason.
+2. Every affected logical file is marked **DEGRADED / UNRECOVERABLE** if a manifest-referenced fragment is missing or cannot be verified.
+3. The affected old generation MAY then be deleted, even though some surviving fragments of that logical file are discarded with it.
+4. The active manifest MUST NOT claim the affected logical file is complete. A reader MUST surface the degraded state as an integrity error rather than returning a silently truncated file.
+5. Emergency Pruning MUST NOT be used merely because a compaction worker cannot access a healthy blob temporarily; normal retry/recovery MUST be attempted first.
+
+Emergency Pruning is therefore an explicit data-loss escape hatch, not a normal GC path. It prevents permanent storage exhaustion while preserving a durable record that integrity was intentionally sacrificed for the affected objects.
+
 \---
 
 ## 14\. Legacy v1.21
@@ -813,15 +841,25 @@ The Pre-Trailer body uses an independently unique nonce and is encrypted as one 
 
 **Fixed nonce length (R2 — normative):** for the AES-256-GCM profile, the nonce length is fixed at **12 bytes (96 bits)**, stored immediately preceding the ciphertext, as shown above. A reader parsing `payload\_ciphertext` MUST treat the first 12 bytes as `nonce` and the remainder as `ciphertext || tag`.
 
-#### 15.1.2 Deterministic nonce construction (R2)
+#### 15.1.2 Deterministic nonce construction (R4)
 
-Purely random 96-bit nonces carry a non-trivial collision risk at petabyte scale with billions of frames (birthday-bound). To guarantee absolute nonce uniqueness across the archive without relying on entropy generation, nonce construction MUST be deterministic:
+Encrypted frame payloads MUST support independent lock-free writers, one per blob. Therefore nonce allocation MUST be blob-local and MUST NOT depend on a shared global frame counter.
 
+For the AES-256-GCM frame-payload profile, the 12-byte nonce is:
+
+```text
+Nonce = first 4 bytes of archive_id || uint32_le(blob_id) || uint32_le(blob_local_counter)
 ```
-Nonce = first 4 bytes of archive\_id || 8-byte little-endian sequential frame counter
-```
 
-The frame counter MUST be monotonically incremented per encrypted frame (or per encrypted Pre-Trailer message, which uses its own independent counter/nonce as required by §15.1.1) and MUST NOT be reused within the same `archive\_id`. This construction mathematically guarantees nonce uniqueness across the entire archive while preserving high encryption throughput, since it requires no additional entropy generation per frame.
+`blob_id` MUST be stable and unique within the archive. `blob_local_counter` starts at zero for the first encrypted payload written to a blob and is incremented exactly once per encrypted frame payload. The pair `(blob_id, blob_local_counter)` MUST NEVER be reused with the same archive DEK.
+
+The counter state MUST be persisted as part of the blob's durable append state so crash recovery cannot reuse a nonce. A writer MUST advance the durable allocation state before exposing the corresponding encrypted frame as committed.
+
+This construction provides an independent nonce namespace per blob and therefore preserves the lock-free-per-blob write model. The 4-byte blob identifier and 4-byte local counter each provide 2^32 values; an implementation MUST reject an archive before either field would wrap.
+
+The encrypted Pre-Trailer body uses a separate nonce domain and MUST NOT reuse a frame-payload nonce. Its nonce MUST use an explicit domain-separation value and an independently persisted per-blob counter.
+
+Manifest encryption uses a third nonce domain and MUST NOT reuse either frame-payload or Pre-Trailer nonces.
 
 #### 15.1.3 Envelope encryption
 
@@ -860,7 +898,7 @@ When the encrypted profile (§15.1) is active, manifest records carrying `path`/
 {"seq":105,"ts":1739550123,"op":"ADD\_ENC","enc":"<base64\_string>"}
 ```
 
-* **`enc` construction:** `Base64(nonce || ciphertext || tag)`, where `nonce` is 12 bytes per §15.1.1, constructed per §15.1.2 (or an equivalent manifest-scoped monotonic counter distinct from the frame-payload counter — the two counters MUST NOT overlap in nonce space).
+* **`enc` construction:** `Base64(nonce || ciphertext || tag)`, where `nonce` is 12 bytes per §15.1.1, constructed from the manifest-specific nonce domain defined below; manifest nonces MUST NOT overlap frame-payload or Pre-Trailer nonce domains.
 * **Encrypted plaintext object:** the AEAD plaintext is the JSON object that would otherwise have appeared unencrypted, e.g. `{"path":"src/main.go","ver":2,"loc":\[\[...]]}`.
 * **AAD (Authenticated Additional Data):** to prevent replay and reorder attacks (an adversary splicing or reordering encrypted manifest lines), the implementation MUST include the binary representation of `seq` and `op` (here, `105` and `"ADD\_ENC"`) as AEAD Additional Authenticated Data. A decryption whose AAD does not match the record's actual `seq`/`op` MUST be rejected as tampered.
 
@@ -868,7 +906,19 @@ When the encrypted profile (§15.1) is active, manifest records carrying `path`/
 
 An implementation MUST NOT emit plaintext `ADD`/`DEL` records once the encrypted profile is active for an archive.
 
-#### 15.1.6 Encryption and disaster recovery
+#### 15.1.6 Encrypted manifest nonce domain
+
+Manifest records use a separate 12-byte nonce domain:
+
+```text
+Nonce = first 4 bytes of archive_id || 0xFFFFFFFF || uint32_le(manifest_local_counter)
+```
+
+`manifest_local_counter` MUST be persisted durably and MUST never repeat under the same archive DEK. The reserved `0xFFFFFFFF` domain value MUST NOT be used as a blob_id. Implementations MUST therefore reject `blob_id = 0xFFFFFFFF`.
+
+AAD MUST include `seq`, `op`, and `tx_id` when present. This binds each encrypted record to its journal position and transactional extent operation.
+
+#### 15.1.7 Encryption and disaster recovery
 
 Encryption changes the meaning of "self-describing recovery":
 
@@ -879,7 +929,7 @@ Encryption changes the meaning of "self-describing recovery":
 
 This limitation is explicit and normative.
 
-#### 15.1.7 Encryption and deduplication
+#### 15.1.8 Encryption and deduplication
 
 Because the encrypted payload is hashed, deduplication requires identical ciphertext.
 
@@ -916,6 +966,12 @@ A conformant STASH 2.0 implementation MUST preserve all of the following:
 * Archive Header `version` MUST be used by readers to select the correct Master Trailer layout (`0x0002` = R1/R2 16-bit `group\_id`; `0x0003` = R3 32-bit `group\_id`, no per-frame `version` field) (§2.1).
 * Frame Packing MUST fail fast (not loop) when a single file cannot fit into a freshly initialized, empty frame, and MUST escalate it to the multi-frame path (§8.2).
 * A manifest line MUST NOT exceed `MAX\_MANIFEST\_LINE\_BYTES` (1 MiB); readers MUST treat an oversized line as corruption rather than buffer it (§10.1).
+* A logical file with more fragments than fit in one manifest line MUST use `ADD_BEGIN`/`ADD_EXTENT`/`ADD_COMMIT`; the transaction becomes visible only after `ADD_COMMIT`.
+* `extent_index` is contiguous and explicit; fragment ordering MUST NOT depend on JSON array position alone.
+* Frame-payload AES-GCM nonces use independent `(blob_id, blob_local_counter)` namespaces and MUST NOT use a shared global frame counter.
+* `blob_id = 0xFFFFFFFF` is reserved and MUST NOT be assigned to a blob.
+* Frame-payload, Pre-Trailer, and manifest encryption nonce domains MUST be distinct.
+* A GC-blocked generation MUST expose missing fragment references; Emergency Pruning is the only explicit override and MUST mark affected logical files degraded/unrecoverable.
 * Data-frame writes may be parallel, but each blob append position is serialized.
 * Manifest commits are serialized and have strictly increasing `seq`.
 * A manifest MUST NOT reference a frame before that frame is durably committed.
