@@ -1,4 +1,4 @@
-# STASH
+# 🌀 STASH
 
 ## Version 2.0 — Consolidated Specification
 ### Revision R8 — Production / Enterprise Hardening and Pre-Implementation Interoperability Closure
@@ -18,7 +18,7 @@ R8 does **not** introduce new storage capabilities.
 
 > **R8 is FROZEN. Further wire-format changes require implementation evidence from conformance testing, fuzzing, crash injection, recovery testing, interoperability testing, security analysis, or measured performance results.**
 
-R8 preserves the core STASH model:
+R8 preserves the core 🌀 STASH model:
 
 - append-only storage;
 - immutable committed frames;
@@ -39,7 +39,7 @@ Implementations MUST preserve these priorities in this order:
 
 1. **Predictable grid geometry.** Physical frame boundaries are always aligned to the 4 KiB base quantum. In `FIXED` mode, arbitrary frame positions are directly computable in O(1). In `VARIABLE` mode, every frame self-describes its physical extent and the next frame is deterministically reachable from the current frame.
 2. **Immutable copy-on-write with bounded physical rewrite scope.** A committed frame is never modified in place. VARIABLE geometry prevents physical frame-size policy from forcing unrelated rewrites, but R8 embeds absolute `logical_offset`; therefore insert/delete operations that shift downstream logical offsets necessarily rewrite the affected downstream frame metadata. R8 does not claim insertion-stable extent identities.
-3. **Recovery-preserving whole-frame deduplication.** `hash_payload` is a payload candidate key, but a physical frame MAY be shared by multiple logical references only when the complete frame identity and recovery metadata are equivalent as defined in §4.2. STASH does not perform sub-frame content-defined chunking.
+3. **Recovery-preserving whole-frame deduplication.** `hash_payload` is a payload candidate key, but a physical frame MAY be shared by multiple logical references only when the complete frame identity and recovery metadata are equivalent as defined in §4.2. 🌀 STASH does not perform sub-frame content-defined chunking.
 4. **Self-describing recovery.** Raw frame data MUST contain enough information to identify the logical object, logical placement, physical extent, parity membership, and integrity state without `manifest.jsonl`.
 5. **Throughput at enterprise scale.** Normal hot-path reads MUST use a maintained physical offset index rather than repeated linear blob scans. Parallel per-blob writing remains supported.
 
@@ -55,7 +55,7 @@ Encryption is an explicit qualification to priority 4: without the appropriate k
 - None of those mechanisms reconstruct missing or corrupted data.
 - Repair requires parity, another intact copy, external replication, or another recovery source.
 
-> **Checksums and hashes detect corruption; redundancy repairs it. STASH never treats CRC32C or content hashes as error-correction mechanisms.**
+> **Checksums and hashes detect corruption; redundancy repairs it. 🌀 STASH never treats CRC32C or content hashes as error-correction mechanisms.**
 
 ## 0.2 Threat model and residual risks
 
@@ -196,7 +196,7 @@ A reader MUST validate all available blob headers before allocating frame-sized 
 
 Within one generation, available headers MUST agree on every archive field and on `generation_id`. A disagreement is corruption.
 
-A reader MUST reject unknown `version`, `frame_size_mode`, invalid `max_frame_quanta`, unsupported allocation size, any non-zero reserved Header flag bit, any non-zero reserved byte, or inconsistent header copies before using those values for memory allocation. `flags & 0x01` declares an encrypted archive. In such an archive, DATA/PACKED payloads and their sensitive Pre-Trailers plus sensitive manifest records use §15 encryption. PARITY payloads and the required zero-entry PARITY Pre-Trailer remain plaintext parity structures as defined in §7 so keyless erasure recovery remains possible. R8 defines no on-disk `key_id`; key selection is deployment metadata outside the STASH wire format and is normally keyed by `archive_id`.
+A reader MUST reject unknown `version`, `frame_size_mode`, invalid `max_frame_quanta`, unsupported allocation size, any non-zero reserved Header flag bit, any non-zero reserved byte, or inconsistent header copies before using those values for memory allocation. `flags & 0x01` declares an encrypted archive. In such an archive, DATA/PACKED payloads and their sensitive Pre-Trailers plus sensitive manifest records use §15 encryption. PARITY payloads and the required zero-entry PARITY Pre-Trailer remain plaintext parity structures as defined in §7 so keyless erasure recovery remains possible. R8 defines no on-disk `key_id`; key selection is deployment metadata outside the 🌀 STASH wire format and is normally keyed by `archive_id`.
 
 ## 2.4 Blob naming
 
@@ -339,7 +339,7 @@ The hash excludes:
 
 Identical logical plaintext is not guaranteed to have identical `hash_payload`, because compression output and encryption nonce/key context can change the stored representation.
 
-> STASH R8 does not define cross-archive or cross-tenant plaintext deduplication. `hash_payload` identifies the exact stored payload representation and is used only as a deduplication/index candidate key.
+> 🌀 STASH R8 does not define cross-archive or cross-tenant plaintext deduplication. `hash_payload` identifies the exact stored payload representation and is used only as a deduplication/index candidate key.
 
 ## 4.2 Recovery-preserving deduplication
 
@@ -371,7 +371,7 @@ For every `ZSTD_*` payload:
 
 - the stored representation MUST contain exactly one independently decodable Zstandard frame;
 - no external Zstandard dictionary is permitted;
-- decoding MUST NOT depend on another STASH frame;
+- decoding MUST NOT depend on another 🌀 STASH frame;
 - malformed or truncated compressed input MUST fail closed;
 - decompressed output MUST equal the declared logical representation exactly;
 - for non-packed DATA, decompressed output MUST equal `logical_length`;
@@ -402,7 +402,7 @@ The following names are combinations of existing wire fields. No `profile_id` is
 
 ### BASELINE
 
-Purpose: **minimum interoperable STASH implementation**.
+Purpose: **minimum interoperable 🌀 STASH implementation**.
 
 ```text
 hash        SHA-256
@@ -460,7 +460,7 @@ encryption
 
 They do not redefine VARIABLE/FIXED, parity, PACKED, `blob_count`, or `MAX_FRAME_SIZE`. Those remain orthogonal archive properties. A writer claiming BASELINE or SECURE conformance MUST use STORE for every frame; a writer claiming FAST conformance MUST use ZSTD_FAST for every compressible frame (STORE MAY be used only when compression is explicitly skipped because the stored representation would not be smaller). Per-frame codec override remains a wire capability for explicitly configured/custom archives, but an override outside a named profile makes that archive non-conformant to the named profile. Because no `profile_id` is stored, readers determine compatibility from actual wire fields and MUST NOT infer a profile name from a single header field.
 
-The STASH Go reference implementation MUST support BASELINE, SECURE, and FAST.
+The 🌀 STASH Go reference implementation MUST support BASELINE, SECURE, and FAST.
 
 ---
 
@@ -1248,7 +1248,7 @@ R8 defines one encryption algorithm: AES-256-GCM. Encryption is enabled exactly 
 
 ## 15.1 Archive DEK
 
-An encrypted STASH archive uses one cryptographically random 32-byte archive data-encryption key:
+An encrypted 🌀 STASH archive uses one cryptographically random 32-byte archive data-encryption key:
 
 ```text
 archive_DEK = 32 bytes
@@ -1491,11 +1491,11 @@ archive DEK
 new KEK
 ```
 
-This does not modify STASH frames and does not require a new archive.
+This does not modify 🌀 STASH frames and does not require a new archive.
 
 ### 15.9.2 Archive DEK rotation
 
-The archive DEK is immutable for the lifetime of an encrypted STASH archive. Changing it requires a new archive plus an explicit decrypt/migrate/re-encrypt operation.
+The archive DEK is immutable for the lifetime of an encrypted 🌀 STASH archive. Changing it requires a new archive plus an explicit decrypt/migrate/re-encrypt operation.
 
 Normal compaction MUST NOT rotate the archive DEK and MUST continue to copy encrypted live frames byte-for-byte. Deployments MUST enforce an operational AES-GCM key-usage policy appropriate to their assurance target; R8 does not claim an unlimited cryptographic lifetime for a single archive DEK. Creating a new archive is the defined DEK-rotation boundary.
 
@@ -1755,7 +1755,7 @@ Tests MUST verify:
 - stored nonce tampering rejection;
 - byte-identical encrypted compaction across multiple generations;
 - recovery after compaction using stored nonce rather than current physical position;
-- KEK rewrap leaves STASH frame bytes unchanged;
+- KEK rewrap leaves 🌀 STASH frame bytes unchanged;
 - archive-DEK change is rejected as an in-place operation.
 
 ## 17.10 Hash and integrity separation
@@ -1871,7 +1871,7 @@ The reference FUSE adapter is permanently read-only, calls only the public Go li
 - [ ] Nonce namespace reuse/wrap is fatal.
 - [ ] Encrypted compaction preserves nonce/ciphertext/tag/hash/frame_ordinal byte-for-byte.
 - [ ] Disaster recovery reads stored nonce rather than deriving from current placement.
-- [ ] KEK rotation rewraps the unchanged DEK without changing STASH frames.
+- [ ] KEK rotation rewraps the unchanged DEK without changing 🌀 STASH frames.
 - [ ] Archive DEK cannot be rotated in place.
 - [ ] FIXED Hop-and-Read supports direct slot arithmetic; VARIABLE Hop-and-Read advances from validated `frame_quanta`.
 - [ ] All media-derived sizes/offsets are validated before allocation or concurrency creation.
@@ -2003,7 +2003,7 @@ FAST
 README material describing R8 MUST state:
 
 ```text
-STASH 2.0 Revision R8
+🌀 STASH 2.0 Revision R8
 wire version 0x0006
 ```
 
@@ -2037,7 +2037,7 @@ It MUST state that the R8 required test matrix is part of the specification and 
 
 # 22. Freeze
 
-> **STASH 2.0 R8 / wire 0x0006 is FROZEN after pre-implementation interoperability closure.**
+> **🌀 STASH 2.0 R8 / wire 0x0006 is FROZEN after pre-implementation interoperability closure.**
 
 The next milestone is not R9. The next milestone is:
 
@@ -2058,3 +2058,9 @@ performance benchmarks
 ```
 
 Further wire-format revisions require evidence from the reference implementation or conformance testing. Speculative feature additions are not sufficient reason to change the format.
+
+## License
+
+🌀 STASH is open-source software licensed under the [MIT License](LICENSE).
+
+**Author:** © 2025-2026 Zbigniew Lipka
