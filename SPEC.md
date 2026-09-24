@@ -75,6 +75,7 @@ R8 uses the following terms normatively:
 - **blob_ordinal** — active blob number `0 .. blob_count-1` within one generation. It is not a globally unique historical blob identifier.
 - **generation_id** — uint64 generation / compaction-attempt namespace identifier.
 - **object_id** — binary identity derived from canonical path and object version, as defined in §6.5. It is not rename-stable.
+- **frame_hash** — the value of a frame's `hash_payload` field (§6.2, §4), used as the manifest location-tuple element (§9.1) and as the physical-offset-index lookup key (§10.5). `frame_hash` and `hash_payload` denote the identical 32-byte value; `frame_hash` is the name used in manifest/index contexts, `hash_payload` is the name used in the on-disk Master Trailer field definition.
 
 The terms `frame_size_class`, global `BLOCK_STRIDE`, and implicit `loc[]` ordering are not valid R8 concepts.
 
@@ -91,7 +92,7 @@ archive/
   root.current
   generation-0000000000000000/
     manifest.jsonl
-    manifest.checkpoint
+    manifest.checkpoint      # non-normative in R8; see note below
     index/
       blob-00.idx
       blob-01.idx
@@ -105,6 +106,8 @@ archive/
 ```
 
 `root.current` identifies the authoritative generation. Updating it during compaction MUST be atomic and durable.
+
+`manifest.checkpoint` is shown for layout completeness only. R8 does not define its binary format, update cadence, or any normative reader/writer behavior. An implementation MUST NOT require its presence for correctness, and MUST fall back to full `manifest.jsonl` replay (optionally accelerated by §10.5's physical index) when it is absent. A normative checkpoint format is out of scope for this frozen revision.
 
 The initial archive generation is:
 
@@ -716,7 +719,7 @@ For non-packed extents:
 [blob_ordinal, frame_hash, logical_offset, logical_length]
 ```
 
-The manifest intentionally does **not** contain `physical_offset`. Physical placement changes during compaction and belongs to the per-generation physical index (§10.4).
+The manifest intentionally does **not** contain `physical_offset`. Physical placement changes during compaction and belongs to the per-generation physical index (§10.5).
 
 `frame_hash` lookup can return multiple physical candidates if payload-identical frames exist. The physical index is therefore a multimap; object/trailer metadata resolves the intended extent.
 
