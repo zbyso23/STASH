@@ -1,1458 +1,1902 @@
-# 🌀 STASH
+# STASH
 
 ## Version 2.0 — Consolidated Specification
-### Revision R7 — Production / Enterprise Hardening (Dual Frame Geometry, Self-Describing Placement, Indexed Access, and Crash-Safe Recovery)
+### Revision R8 — Production / Enterprise Hardening and Profile Simplification
 
-**Status:** Final / Approved Specification  
-**Wire version:** `0x0005`  
+**Status:** Final / Frozen Specification  
 **Target:** Server / enterprise / datacenter / petabyte-scale storage  
-**Out of scope:** General-purpose desktop archive use, tape/cold-storage profiles, sub-block/CDC deduplication
+**Wire version:** `0x0006`  
+**Encoding:** little-endian for every multi-byte integer unless explicitly stated otherwise
 
-R7 is a wire-breaking consolidation of R5 plus the R6 Grid-Aligned Variable Frames change set. It introduces a CRC-protected 96-byte Master Trailer, a CRC-protected 64-byte self-identifying blob prefix, explicit physical and logical geometry, versioned generation identity, a mandatory rebuildable offset index, and an immutable archive-level choice between `VARIABLE` and `FIXED` frame sizing. Readers MUST dispatch on the Archive Header `version`; an R7-only reader MUST reject older layouts rather than guess.
+The R8 version bump is required because algorithm identifiers and the cryptographic construction changed semantics even though the R7 physical field layout is retained.
 
-The final R7 allocation consumes fields that were reserved in pre-final R7 drafts. A `0x0005` blob or frame lacking valid R7 prefix/trailer CRC32C values is invalid; pre-final drafts are not a separate compatibility profile.
+R8 is the final pre-implementation wire-format hardening revision. It retains the R7 physical layout and storage capabilities while deliberately narrowing the algorithm surface, fully specifying the cryptographic construction, strengthening resource-exhaustion requirements, and making wire-conformance testing normative.
+
+R8 does **not** introduce new storage capabilities.
+
+> **R8 is FROZEN. Further wire-format changes require implementation evidence from conformance testing, fuzzing, crash injection, recovery testing, interoperability testing, security analysis, or measured performance results.**
+
+R8 preserves the core STASH model:
+
+- append-only storage;
+- immutable committed frames;
+- whole-frame integrity and deduplication;
+- self-describing manifest-independent recovery;
+- per-blob parallel writes;
+- parity / erasure recovery;
+- crash-safe manifest transactions;
+- generation-based compaction;
+- encrypted metadata and payload support;
+- enterprise / petabyte-scale operation.
 
 ---
 
-## 0. Design Priorities
+# 0. Design Priorities
 
 Implementations MUST preserve these priorities in this order:
 
-1. **Deterministic bounded geometry** — every frame has a validated extent of `N × 4096` bytes; FIXED archives additionally provide direct slot arithmetic.
-2. **Self-describing recovery** — every non-packed DATA frame carries its logical identity and placement independently of `manifest.jsonl` and the derived offset index.
-3. **Whole-frame stored-payload integrity and deduplication** — STASH does not deduplicate sub-block content.
-4. **Throughput at enterprise scale** — per-blob writes remain parallel, hot-path lookups use a maintained offset index, and all allocations are bounded before untrusted sizes are honored.
+1. **Predictable grid geometry.** Physical frame boundaries are always aligned to the 4 KiB base quantum. In `FIXED` mode, arbitrary frame positions are directly computable in O(1). In `VARIABLE` mode, every frame self-describes its physical extent and the next frame is deterministically reachable from the current frame.
+2. **Localized immutable copy-on-write.** A logical edit MUST NOT require rewriting unrelated following frames solely because the edited logical region changed length.
+3. **Whole-frame, bit-identical deduplication.** STASH does not perform sub-frame content-defined chunking.
+4. **Self-describing recovery.** Raw frame data MUST contain enough information to identify the logical object, logical placement, physical extent, parity membership, and integrity state without `manifest.jsonl`.
+5. **Throughput at enterprise scale.** Normal hot-path reads MUST use a maintained physical offset index rather than repeated linear blob scans. Parallel per-blob writing remains supported.
 
-The offset index is load-bearing for normal-path performance but never for correctness: it MUST be rebuildable from the blobs. The encryption profile is an explicit recoverability boundary: frame geometry, ciphertext integrity, logical placement, and parity membership remain discoverable without keys; plaintext paths and versions require the appropriate key.
+Encryption is an explicit qualification to priority 4: without the appropriate key, a recovery scanner can still discover frame boundaries, physical extents, hashes, and parity structure, but plaintext paths and encrypted logical metadata are not recoverable.
 
----
+## 0.1 Detection is not repair
 
-## 1. Overview
+**Integrity detection and error correction are separate mechanisms.**
 
-STASH is an append-only, verifiable archival format for cloud-native and datacenter workflows.
+- CRC32C detects accidental structural corruption.
+- `hash_payload` detects mismatch of the exact stored payload representation.
+- AEAD authenticates encrypted representations.
+- None of those mechanisms reconstruct missing or corrupted data.
+- Repair requires parity, another intact copy, external replication, or another recovery source.
 
-Input is stored in immutable grid-aligned frames. Every frame occupies a complete physical extent whose size is a positive multiple of `BASE_QUANTUM = 4096` bytes and includes payload, zero padding, Pre-Trailer, and a fixed 96-byte Master Trailer. The archive chooses one immutable size mode:
-
-- `VARIABLE`: each frame selects its own valid `frame_size`, up to `MAX_FRAME_SIZE`;
-- `FIXED`: every frame occupies exactly `MAX_FRAME_SIZE`.
-
-Updates append new frames and manifest records. A committed frame is never overwritten in place.
-
-Each blob begins with a 64-byte self-identifying prefix: a 48-byte immutable Archive Header, an 8-byte `generation_id`, a 1-byte `blob_ordinal`, three reserved zero bytes, and a 4-byte CRC32C covering the complete prefix with its own field treated as zero. Frames begin at `FRAME_REGION_START = 0x40`.
-
-```text
-+--------------------------------+ 0x00
-| Archive Header (48 B)          |
-+--------------------------------+ 0x30
-| generation_id (8 B)            |
-+--------------------------------+ 0x38
-| blob_ordinal (1 B)             |
-| Reserved zero prefix (3 B)     |
-+--------------------------------+ 0x3C
-| Prefix CRC32C (4 B)            |
-+--------------------------------+ 0x40
-| Frame 0 (N × 4096 B)           |
-+--------------------------------+
-| Frame 1 (M × 4096 B)           |
-+--------------------------------+
-| ...                            |
-+--------------------------------+
-```
-
-For VARIABLE mode:
-
-```text
-frame_start(0)   = 0x40
-frame_start(n+1) = frame_start(n) + frame_size(n)
-```
-
-For FIXED mode:
-
-```text
-frame_start(n) = 0x40 + n × MAX_FRAME_SIZE
-```
-
-`frame_hash` in the manifest is the Master Trailer's `hash_payload`. It identifies stored payload bytes, not a unique physical position; the per-blob offset index resolves it to one or more candidate physical offsets (§10.3).
+> **Checksums and hashes detect corruption; redundancy repairs it. STASH never treats CRC32C or content hashes as error-correction mechanisms.**
 
 ---
 
-## 2. Archive, Blob, and Generation Model
+# 1. Terminology
 
-The immutable Archive Header is exactly 48 bytes and MUST be present at offset `0x00` of every blob. All multi-byte integers are little-endian. The remaining 16 bytes form the generation descriptor and checksum defined in §2.2.
+R8 uses the following terms normatively:
 
-### 2.1 Header fields
+- **BASE_QUANTUM** — 4096 bytes.
+- **Grid-Aligned Variable Frame** — a frame whose physical size is `N * BASE_QUANTUM`, where `N >= 1` and the archive is in `VARIABLE` mode.
+- **FIXED frame** — a frame whose physical size is exactly `MAX_FRAME_SIZE`.
+- **physical_offset** — absolute byte offset of a frame from the beginning of its blob file.
+- **frame_area_offset** — `physical_offset - ARCHIVE_HEADER_SIZE`.
+- **frame_quanta** — physical frame size divided by `BASE_QUANTUM`.
+- **logical_offset** — byte offset of a non-packed frame's data within the logical object.
+- **logical_length** — number of logical object bytes represented by that frame.
+- **Logical Recovery Quantum** — a 4096-byte unit used by recovery/index implementations to map logical extents. It is not a separate wire object.
+- **frame_ordinal** — immutable creation-time ordinal of a frame within its origin `(generation_id, blob_ordinal)` namespace. It is metadata, not the current physical slot after compaction.
+- **physical_quantum_index** — creation-time physical start position, measured in 4 KiB quanta from the origin blob frame area.
+- **blob_ordinal** — active blob number `0 .. blob_count-1` within one generation. It is not a globally unique historical blob identifier.
+- **generation_id** — uint64 generation / compaction-attempt namespace identifier.
+- **object_id** — binary identity derived from canonical path and object version, as defined in §6.5. It is not rename-stable.
+
+The terms `frame_size_class`, global `BLOCK_STRIDE`, and implicit `loc[]` ordering are not valid R8 concepts.
+
+---
+
+# 2. Archive and Generation Layout
+
+## 2.1 Directory model
+
+Recommended layout:
+
+```text
+archive/
+  root.current
+  generation-0000000000000000/
+    manifest.jsonl
+    manifest.checkpoint
+    index/
+      blob-00.idx
+      blob-01.idx
+      ...
+    frames/
+      blob-00.stash
+      blob-01.stash
+      ...
+  generation-0000000000000001/
+    ...
+```
+
+`root.current` identifies the authoritative generation. Updating it during compaction MUST be atomic and durable.
+
+The initial archive generation is:
+
+```text
+generation_id = 0
+```
+
+Each new generation / compaction attempt MUST use a `generation_id` that has never previously been allocated under the same archive encryption key. IDs MUST NOT be reused after abort, crash, or deletion.
+
+A reference implementation MAY discover the next generation identifier by scanning existing `generation-XXXXXXXXXXXXXXXX/` names and allocating a value greater than every previously observed value. This is an implementation mechanism, not a wire-format dependency.
+
+## 2.2 Archive Header — 64 bytes
+
+Every blob file MUST begin with the same 64-byte Archive Header for its generation.
+
+```text
+ARCHIVE_HEADER_SIZE = 64 = 0x40
+FRAME_AREA_START    = 0x40
+```
 
 | Offset | Size | Field | Type | Description |
 |---|---:|---|---|---|
-| `0x00` | 4 | `magic` | char[4] | `STSH` |
-| `0x04` | 2 | `version` | uint16 | `0x0005` for R7 |
-| `0x06` | 1 | `max_frame_size_class` | uint8 | Selects `MAX_FRAME_SIZE`; see §3.1 |
-| `0x07` | 1 | `hash_id` | uint8 | See §4 |
-| `0x08` | 1 | `codec_id` | uint8 | Archive default; per-frame override allowed |
-| `0x09` | 1 | `parity_scheme` | uint8 | See §7 |
-| `0x0A` | 1 | `parity_k` | uint8 | Data frames per parity group |
-| `0x0B` | 1 | `parity_m` | uint8 | Parity frames per parity group |
-| `0x0C` | 1 | `blob_count` | uint8 | Active blobs per generation, `1..255` |
-| `0x0D` | 1 | `frame_size_mode` | uint8 | `0x00 = VARIABLE`, `0x01 = FIXED` |
-| `0x0E` | 2 | `archive_flags` | uint16 | Bit `0x0001 = ENCRYPTED`; all other bits MUST be zero in R7 |
-| `0x10` | 32 | `archive_id` | bytes | Random UUID, zero-padded to 32 bytes |
+| `0x00` | 4 | magic | char[4] | `STSH` |
+| `0x04` | 2 | version | uint16 | `0x0006` for R8 |
+| `0x06` | 1 | frame_size_mode | uint8 | `0x00 VARIABLE`, `0x01 FIXED` |
+| `0x07` | 1 | hash_id | uint8 | §4 |
+| `0x08` | 1 | codec_id | uint8 | archive default; per-frame override allowed |
+| `0x09` | 1 | parity_scheme | uint8 | §7 |
+| `0x0A` | 1 | parity_k | uint8 | data members per parity group |
+| `0x0B` | 1 | parity_m | uint8 | parity members per parity group |
+| `0x0C` | 1 | blob_count | uint8 | `1..255` active blobs in this generation |
+| `0x0D` | 1 | flags | uint8 | zero in base R8 profile |
+| `0x0E` | 2 | header_size | uint16 | MUST equal `64` |
+| `0x10` | 4 | max_frame_quanta | uint32 | `MAX_FRAME_SIZE / 4096` |
+| `0x14` | 8 | generation_id | uint64 | generation identity |
+| `0x1C` | 4 | reserved | bytes | MUST be zero |
+| `0x20` | 32 | archive_id | bytes | immutable archive identifier |
 
-All Header fields are immutable for the life of the archive, including across compaction generations. In particular, `frame_size_mode` and `archive_flags` MUST NOT change through migration, compaction, or generation switching. Changing either requires creation of a new archive instance and an explicit data migration. A reader MUST reject any unknown R7 `archive_flags` bit.
+The following fields are immutable for the entire life of one archive instance and MUST be identical across all generations:
 
-**Version dispatch:** `0x0002` selects the R1/R2 trailer, `0x0003` selects the R3-R5 48-byte trailer, `0x0004` is reserved for the R6 development layout, and `0x0005` selects the R7 96-byte trailer. A reader MUST NOT parse one layout as another.
+- `frame_size_mode`;
+- `hash_id`;
+- archive default `codec_id` policy;
+- `parity_scheme`, `parity_k`, `parity_m`;
+- `blob_count` unless an explicit future format revision defines migration semantics;
+- `max_frame_quanta`;
+- `archive_id`.
 
-### 2.2 Self-identifying blob prefix, checksum, and validation
+`generation_id` is intentionally generation-specific.
 
-The bytes following the 48-byte Header are:
+Changing `frame_size_mode` requires creation of a new archive instance. Compaction MUST NOT convert `VARIABLE -> FIXED`, `FIXED -> VARIABLE`, or mix modes between generations of the same archive.
 
-| Blob offset | Size | Field | Type | Description |
-|---|---:|---|---|---|
-| `0x30` | 8 | `generation_id` | uint64 | Containing published generation; see §2.4 |
-| `0x38` | 1 | `blob_ordinal` | uint8 | Blob position in this generation, `0..blob_count-1` |
-| `0x39` | 3 | `prefix_reserved` | bytes[3] | MUST be zero in R7 |
-| `0x3C` | 4 | `prefix_crc32c` | uint32 | CRC32C of the complete 64-byte prefix with this field treated as zero |
+## 2.3 Header validation
 
-Throughout R7, CRC32C means the reflected Castagnoli algorithm with polynomial `0x82F63B78`, initial value `0xFFFFFFFF`, and final XOR `0xFFFFFFFF`; the check value for ASCII `123456789` is `0xE3069283`. Stored uint32 CRC values are little-endian.
+A reader MUST validate all available blob headers before allocating frame-sized buffers.
 
-To calculate `prefix_crc32c`, a writer serializes the complete 64-byte prefix with bytes `0x3C..0x3F` set to zero, calculates CRC32C over bytes `0x00..0x3F`, and stores the result at `0x3C` in little-endian form. The checksum therefore covers every immutable Header field as well as `generation_id`, `blob_ordinal`, and `prefix_reserved`.
+Within one generation, available headers MUST agree on every archive field and on `generation_id`. A disagreement is corruption.
 
-A reader MUST read the complete 64-byte blob prefix into a fixed-size buffer, calculate and compare `prefix_crc32c`, verify `prefix_reserved == 0`, and only then trust any Header- or generation-derived field or allocate frame-sized buffers. A valid magic with an invalid Prefix CRC is corruption.
+A reader MUST reject unknown `version`, `frame_size_mode`, invalid `max_frame_quanta`, unsupported allocation size, or inconsistent header copies before using those values for memory allocation.
 
-The repeated checksummed prefix removes Blob 0 and external filenames as single points of recovery failure. A reader MUST:
+## 2.4 Blob naming
 
-- validate the Prefix CRC of each available blob independently;
-- verify that all valid prefixes selected for one generation agree on every immutable Header parameter, `archive_id`, and `generation_id`;
-- require each selected `blob_ordinal` to be in range and unique within the generation;
-- reject a filename/root binding whose declared generation or blob ordinal disagrees with its CRC-valid prefix;
-- reject the archive as inconsistent if two CRC-valid prefixes claiming the same `(archive_id, generation_id, blob_ordinal)` disagree;
-- permit recovery with a subset of blobs when at least one valid prefix remains, while explicitly reporting missing ordinals;
-- enforce its configured allocation ceiling before allocating a buffer derived from the Header.
-
-CRC32C provides accidental-corruption detection, not cryptographic authenticity. Deployments requiring tamper resistance MUST use the encrypted/authenticated profile or an external authenticated envelope.
-
-### 2.3 Blob files
-
-Blob files are named:
+Blob files remain:
 
 ```text
 frames/blob-00.stash
-frames/blob-01.stash
 ...
 frames/blob-FE.stash
 ```
 
-For `blob_count = N`, valid `blob_ordinal` values are `0..N-1`. `blob_count` is the number of active blobs in one generation, not a global historical count.
+`blob_ordinal` is therefore uint8. At most 255 active blobs exist in one generation.
 
-The canonical filename ordinal MUST agree with the CRC-valid `blob_ordinal` stored in the prefix during normal operation. Raw recovery MUST use the stored ordinal rather than infer identity from an untrusted or lost filename.
-
-Frame-to-blob assignment is a write-time decision. A conformant implementation MUST ensure that two writers never allocate overlapping physical extents in one blob. The required concurrency model is one serialized append allocator per blob; different blobs MAY be appended in parallel.
-
-### 2.4 Generation identity
-
-Each successfully published generation has a `generation_id : uint64` stored redundantly in every blob prefix and in its generation metadata/root namespace:
-
-```text
-initial generation_id = 0
-next generation_id    = previous generation_id + 1
-```
-
-`generation_id` is not a physical frame position and is deliberately outside the immutable 48-byte Archive Header because it changes when a new generation is published. It MUST be unique and MUST NOT be reused under the same archive encryption key. Generation metadata/root identity MUST agree with every selected CRC-valid blob prefix. A mismatch is corruption or a mixed-generation input set, never an override.
-
-At cold start, a writer or compactor MAY discover the highest existing value from generation metadata and CRC-valid blob prefixes and chooses `max(generation_id) + 1`, rejecting uint64 wraparound. During raw recovery, the tuple `(archive_id, generation_id, blob_ordinal)` in the checksummed prefix is authoritative for classifying otherwise detached or renamed blobs; directory and filename structure is only a hint.
-
-The tuple `(generation_id, blob_ordinal, frame_ordinal)` is the creation namespace for newly encrypted frame material (§15.3). The prefix values identify the **containing generation and blob**. After byte-preserving compaction, they need not identify the historical creation namespace of every copied frame. Readers MUST NOT derive a copied frame's nonce from its current prefix or position: every AEAD nonce is stored with its ciphertext representation, so decryption and recovery do not require reconstructing the historical tuple.
-
-### 2.5 Parity-group spread
-
-When `blob_count > 1`, DATA/PACKED members and PARITY frames belonging to one parity group MUST span at least two distinct blobs. Implementations MUST enforce this at the library boundary.
-
-### 2.6 Global parity invariant
-
-If `parity_scheme != 0x00`, then `blob_count MUST be >= 2`. A single-blob archive declaring active parity is invalid.
-
-When `parity_scheme == 0x00`, `parity_k` and `parity_m` MUST both be zero. When parity is active, both MUST be non-zero and `parity_k + parity_m <= 256` so every position fits the uint8 `group_index`; XOR additionally requires `parity_m == 1`.
+Historical generations MAY reuse the same ordinal values because generation identity separates them. `blob_ordinal` MUST NOT be treated as a globally monotonically increasing archive identifier.
 
 ---
 
-## 3. Physical and Logical Geometry
+# 3. Grid Geometry and Frame Size Modes
 
-### 3.1 Constants and maximum size class
+## 3.1 Base quantum
 
 ```text
-BASE_QUANTUM       = 4096 bytes
-ARCHIVE_HEADER_SIZE = 48 bytes
-BLOB_PREFIX_SIZE    = 64 bytes
-MASTER_TRAILER_SIZE = 96 bytes
-PRE_TRAILER_LEN_SIZE = 4 bytes
-FRAME_REGION_START = 0x40
+BASE_QUANTUM = 4096 bytes
 ```
 
-`max_frame_size_class` selects the immutable archive maximum:
-
-| Value | Size | Value | Size | Value | Size |
-|---|---:|---|---:|---|---:|
-| `0x00` | 4 KiB | `0x06` | 256 KiB | `0x0C` | 16 MiB |
-| `0x01` | 8 KiB | `0x07` | 512 KiB | `0x0D` | 32 MiB |
-| `0x02` | 16 KiB | `0x08` | 1 MiB | `0x0E` | 64 MiB |
-| `0x03` | 32 KiB | `0x09` | 2 MiB | `0x0F` | 128 MiB |
-| `0x04` | 64 KiB | `0x0A` | 4 MiB | `0x10` | 256 MiB |
-| `0x05` | 128 KiB | `0x0B` | 8 MiB |  |  |
+Every physical frame size MUST be a positive integral multiple of `BASE_QUANTUM`.
 
 ```text
-MAX_FRAME_SIZE = size(max_frame_size_class)
-MAX_FRAME_QUANTA = MAX_FRAME_SIZE / BASE_QUANTUM
-MAX_LOGICAL_FRAME_LENGTH = MAX_FRAME_SIZE
+frame_size = frame_quanta * BASE_QUANTUM
+frame_quanta >= 1
+frame_quanta <= max_frame_quanta
+MAX_FRAME_SIZE = max_frame_quanta * BASE_QUANTUM
 ```
 
-Production writers MUST NOT create an archive with `max_frame_size_class > 0x0E` (64 MiB) without an explicit non-default profile. A reader MUST validate the class against its configured ceiling before allocating a frame-sized buffer. Values `0x0F` and `0x10` remain format-reserved opt-in profiles.
+Production implementations MUST impose a configured safe allocation ceiling before allocating a buffer based on untrusted frame metadata.
 
-### 3.2 Physical frame geometry
+The R8 reference implementation SHOULD default to a practical `MAX_FRAME_SIZE` such as 4 MiB for mixed workloads. Production configurations MUST impose a validated allocation ceiling and SHOULD NOT exceed 64 MiB by default; larger values require explicit operator configuration and implementation-specific resource validation.
 
-For every frame:
+## 3.2 VARIABLE mode — `frame_size_mode = 0x00`
+
+A frame MAY use any integral number of 4 KiB quanta from `1` through `max_frame_quanta`.
 
 ```text
-frame_size = frame_quanta × BASE_QUANTUM
-1 <= frame_quanta <= MAX_FRAME_QUANTA
 4096 <= frame_size <= MAX_FRAME_SIZE
-frame_size mod BASE_QUANTUM = 0
+frame_size % 4096 == 0
 ```
 
-In `VARIABLE` mode, each frame MAY choose any value satisfying those invariants. In `FIXED` mode:
+There is no global `BLOCK_STRIDE`.
+
+The next physical frame is:
 
 ```text
-frame_size   = MAX_FRAME_SIZE
-frame_quanta = MAX_FRAME_QUANTA
+next_frame_offset = current_frame_offset + current_frame_size
 ```
 
-A new archive writer SHOULD default to `VARIABLE` unless the caller explicitly selects `FIXED`; the chosen value is always encoded in the Header and never inferred from observed frames.
+The frame's fixed Prefix (§6.1) makes `current_frame_size` available before reading the variable-length body.
 
-A FIXED-mode reader MUST treat any other `frame_quanta` as corruption. This check is mandatory even when the slot start was calculated arithmetically.
+## 3.3 FIXED mode — `frame_size_mode = 0x01`
 
-`physical_offset` is the byte offset of the frame from the beginning of its blob. `physical_frame_size` is `frame_size`. Neither value is a logical-file offset.
-
-### 3.3 Logical frame geometry
-
-For a non-packed DATA frame:
+Every frame MUST satisfy:
 
 ```text
-logical_offset : uint64
-logical_length : uint64
-logical_offset mod BASE_QUANTUM = 0
-0 < logical_length <= MAX_LOGICAL_FRAME_LENGTH
+frame_quanta == max_frame_quanta
+frame_size   == MAX_FRAME_SIZE
 ```
 
-The claimed logical range is the half-open interval:
+Any frame with a different `frame_quanta` is corrupt.
+
+Exact physical addressing is restored:
+
+```text
+frame_start(n) = 0x40 + n * MAX_FRAME_SIZE
+```
+
+and:
+
+```text
+frame_ordinal_at_creation =
+    (physical_offset - 0x40) / MAX_FRAME_SIZE
+```
+
+FIXED mode therefore supports direct random frame positioning and parallel disaster-recovery partitioning without a sequential dependency on previous frames.
+
+The final logical fragment of an object MAY have `logical_length < MAX_FRAME_SIZE`; unused physical capacity is padding.
+
+## 3.4 Physical and logical geometry are independent
+
+Physical frame size and logical object extent are different quantities.
+
+A compressed frame can represent a logical region whose byte length differs from `data_len`. `frame_size` is physical allocation; `data_len` is stored payload representation length; `logical_length` is logical object data length.
+
+Implementations MUST NOT use these fields interchangeably.
+
+---
+
+## 3.5 VARIABLE vs FIXED intent
+
+New archives SHOULD default to `VARIABLE` unless `FIXED` is explicitly selected.
+
+| Mode | Primary purpose |
+|---|---|
+| `VARIABLE` | General enterprise archival use. Reduces padding and write amplification while retaining independent quantum-boundary recovery. |
+| `FIXED` | Deterministic direct-slot geometry. Optimized for workloads where maximum recovery-scan parallelism and direct physical arithmetic justify increased padding. |
+
+R8 defines no additional frame-size modes. `frame_size_mode` remains immutable for the entire archive lifetime.
+
+---
+
+# 4. Hash Algorithms and Hash Scope
+
+R8 deliberately exposes only two payload-hash algorithms:
+
+| Value | Algorithm | Digest |
+|---|---|---:|
+| `0x00` | reserved | — |
+| `0x01` | BLAKE3 | 32 B |
+| `0x02` | SHA-256 | 32 B |
+| `0x03-0xFF` | reserved | — |
+
+Writers MUST NOT emit reserved values. Readers MUST reject unknown non-zero `hash_id` values.
+
+`hash_id` is immutable for the lifetime of the archive.
+
+## 4.1 Hash scope
+
+`hash_payload` is computed over the exact stored payload representation:
+
+- unencrypted: STORE or compressed payload bytes exactly as stored;
+- encrypted: `nonce[12] || ciphertext || tag[16]` exactly as stored.
+
+The hash excludes:
+
+- Frame Prefix;
+- zero padding;
+- Pre-Trailer;
+- `pre_trailer_len`;
+- Master Trailer;
+- Archive Header.
+
+Identical logical plaintext is not guaranteed to have identical `hash_payload`, because compression output and encryption nonce/key context can change the stored representation.
+
+> STASH R8 does not define cross-archive or cross-tenant plaintext deduplication. Deduplication operates only on byte-identical stored payload representations.
+
+---
+
+# 5. Compression Profiles
+
+`codec_id` identifies a complete R8 compression-strength profile, not merely an algorithm family.
+
+| Value | Profile | Algorithm | Compression level |
+|---|---|---|---:|
+| `0x00` | STORE | none | — |
+| `0x01` | ZSTD_FAST | Zstandard | 1 |
+| `0x02` | ZSTD_DEFAULT | Zstandard | 3 |
+| `0x03` | ZSTD_DENSE | Zstandard | 9 |
+| `0x04-0xFF` | reserved | — | — |
+
+The Archive Header `codec_id` remains the archive default and MAY be overridden per frame by the Master Trailer `codec_id`.
+
+Writers MUST NOT emit reserved codec identifiers. Readers MUST reject unknown non-zero codec identifiers.
+
+## 5.1 Zstandard requirements
+
+For every `ZSTD_*` payload:
+
+- the stored representation MUST contain exactly one independently decodable Zstandard frame;
+- no external Zstandard dictionary is permitted;
+- decoding MUST NOT depend on another STASH frame;
+- malformed or truncated compressed input MUST fail closed;
+- decompressed output MUST equal the declared logical representation exactly;
+- decompressed output MUST NOT exceed the already validated STASH logical-length ceiling.
+
+The writer compression-strength profiles are normative:
+
+```text
+ZSTD_FAST    = level 1
+ZSTD_DEFAULT = level 3
+ZSTD_DENSE   = level 9
+```
+
+R8 does **not** claim that independent Zstandard implementations or library versions necessarily produce byte-identical compressed output from equal logical input.
+
+```text
+equal logical data != guaranteed equal compressed bytes
+```
+
+Whole-frame deduplication therefore occurs only when the resulting stored representations are byte-identical.
+
+There is no `ZSTD_MAX` profile in R8. Values `0x04-0xFF` are genuinely reserved.
+
+## 5.2 Named interoperability and deployment profiles
+
+The following names are combinations of existing wire fields. No `profile_id` is stored on disk.
+
+### BASELINE
+
+Purpose: **minimum interoperable STASH implementation**.
+
+```text
+hash        SHA-256
+compression STORE
+encryption  NONE
+```
+
+A minimal conformant R8 reader/writer MUST support BASELINE and MUST additionally support:
+
+- VARIABLE geometry;
+- DATA frames;
+- Frame Prefix CRC32C;
+- Master Trailer integrity through the mandatory Pre-Trailer CRC32C binding defined in §6.4;
+- Pre-Trailer CRC32C;
+- manifest reading/writing;
+- physical-offset-index rebuild;
+- raw physical scanning;
+- logical reconstruction of non-packed DATA.
+
+A BASELINE-only implementation MAY omit writing FIXED, PACKED, parity, encryption, and compaction, but it MUST safely recognize and reject unsupported R8 features rather than misparse them.
+
+### SECURE
+
+Purpose: **conservative authenticated enterprise archival profile**.
+
+```text
+hash        SHA-256
+compression STORE
+encryption  AES-256-GCM
+```
+
+The cryptographic construction is fully defined by §15. The SECURE **payload-hash/compression/encryption path** uses conservative standardized primitives and does not require BLAKE3 or Zstandard for those functions. R8 nevertheless retains the R7 `object_id` derivation in §6.5, which uses BLAKE3; therefore a full conformant writer still needs the object-ID primitive.
+
+### FAST
+
+Purpose: **maximum practical ingest and recovery throughput**.
+
+```text
+hash        BLAKE3
+compression ZSTD_FAST
+encryption  NONE
+```
+
+FAST is intended for deployments where encryption is unnecessary or is provided by another trusted storage/security layer.
+
+### Profile scope
+
+The names bind only:
+
+```text
+hash
+compression
+encryption
+```
+
+They do not redefine VARIABLE/FIXED, parity, PACKED, `blob_count`, or `MAX_FRAME_SIZE`. Those remain orthogonal archive properties.
+
+The STASH Go reference implementation MUST support BASELINE, SECURE, and FAST.
+
+---
+
+# 6. Frame Binary Format
+
+R8 uses a fixed 16-byte Frame Prefix at the start and a fixed 96-byte Master Trailer at the end of every frame.
+
+```text
+[ Frame Prefix: 16 B ]
+[ stored payload ]
+[ zero padding ]
+[ Pre-Trailer body ]
+[ pre_trailer_len: 4 B ]
+[ Master Trailer: 96 B ]
+```
+
+The complete region above is exactly `frame_size` bytes.
+
+## 6.1 Frame Prefix — 16 bytes
+
+The Prefix exists so a VARIABLE-mode recovery scanner can determine the physical extent before reading the complete frame.
+
+| Offset | Size | Field | Type | Description |
+|---|---:|---|---|---|
+| `0x00` | 4 | magic | char[4] | `STFR` |
+| `0x04` | 4 | frame_quanta | uint32 | physical size / 4096 |
+| `0x08` | 4 | prefix_crc32c | uint32 | CRC32C over `magic || frame_quanta || flags` |
+| `0x0C` | 4 | flags | uint32 | zero in base R8 profile |
+
+A reader MUST validate Prefix magic, CRC, and bounds before allocating or reading the full frame.
+
+In FIXED mode it MUST additionally verify:
+
+```text
+frame_quanta == max_frame_quanta
+```
+
+## 6.2 Master Trailer — 96 bytes
+
+R8 retains the larger self-describing trailer because non-packed DATA frames must carry logical placement information directly in raw storage.
+
+| Offset | Size | Field | Type | Description |
+|---|---:|---|---|---|
+| `0x00` | 4 | magic | char[4] | `STSH` |
+| `0x04` | 1 | hash_id | uint8 | MUST match Archive Header |
+| `0x05` | 1 | codec_id | uint8 | codec used by this frame |
+| `0x06` | 1 | block_type | uint8 | `0 DATA`, `1 PARITY`, `2 PACKED` |
+| `0x07` | 1 | flags | uint8 | reserved / zero in base profile |
+| `0x08` | 4 | group_id | uint32 | `0` if not in parity group |
+| `0x0C` | 1 | group_index | uint8 | group position |
+| `0x0D` | 1 | group_k | uint8 | data count |
+| `0x0E` | 1 | group_m | uint8 | parity count |
+| `0x0F` | 1 | reserved | uint8 | zero |
+| `0x10` | 4 | data_len | uint32 | stored payload representation length |
+| `0x14` | 4 | frame_quanta | uint32 | redundant with Prefix; MUST agree |
+| `0x18` | 16 | object_id | bytes | logical object identity; zero for non-object parity frames |
+| `0x28` | 8 | logical_offset | uint64 | non-packed logical byte offset |
+| `0x30` | 8 | logical_length | uint64 | logical bytes represented |
+| `0x38` | 8 | frame_ordinal | uint64 | immutable creation-time ordinal |
+| `0x40` | 32 | hash_payload | bytes | §4 |
+
+Trailer and Prefix `frame_quanta` disagreement is corruption.
+
+### Block-type semantics
+
+**DATA:** one non-packed logical object extent. `object_id`, `logical_offset`, `logical_length` are mandatory.
+
+**PACKED:** multiple small logical objects described in the Pre-Trailer. Trailer-level `object_id`, `logical_offset`, and `logical_length` MUST be zero. Packed entry offsets use `inner_offset` semantics (§8).
+
+**PARITY:** parity payload. Object-placement fields MUST be zero unless a future format revision explicitly defines otherwise.
+
+## 6.3 Payload budget
+
+The exact physical constraint is:
+
+```text
+data_len
++ FRAME_PREFIX_SIZE
++ zero_padding_len
++ pre_trailer_len
++ 4                       // pre_trailer_len field
++ MASTER_TRAILER_SIZE
+= frame_size
+```
+
+where:
+
+```text
+FRAME_PREFIX_SIZE  = 16
+MASTER_TRAILER_SIZE = 96
+zero_padding_len >= 0
+```
+
+Therefore:
+
+```text
+data_len <=
+    frame_size
+  - 16
+  - 4
+  - 96
+  - pre_trailer_len
+```
+
+A writer MUST calculate this exact budget before commit. A reader MUST reject overlap between payload and Pre-Trailer.
+
+## 6.4 Pre-Trailer
+
+Immediately before the 4-byte `pre_trailer_len` field is `pre_trailer_body`.
+
+Unencrypted body structure:
+
+```text
+uint32 entry_count
+repeated entry_count times:
+    varint path_len
+    bytes  canonical_path_utf8
+    uint64 inner_offset_or_logical_offset
+    uint64 inner_length_or_logical_length
+    uint64 file_ver
+uint32 crc32c
+```
+
+`pre_trailer_len` is the complete byte length of `pre_trailer_body`, including the CRC field.
+
+R8 does not add a physical CRC field to the 96-byte Master Trailer. Instead, the mandatory Pre-Trailer CRC32C binds the externally located length field **and the complete 96-byte Master Trailer bytes**:
+
+```text
+crc32c = CRC32C(
+    pre_trailer_body_without_crc
+    || uint32_le(pre_trailer_len)
+    || master_trailer_bytes[96]
+)
+```
+
+This preserves the R7 physical layout while making accidental modification of any Master Trailer bit detectable before trailer metadata is trusted. A frame with zero logical Pre-Trailer entries still carries the minimal body (`entry_count = 0` plus CRC32C), so this integrity binding is always present.
+
+Reverse parsing order:
+
+1. locate the 96-byte Master Trailer from the known frame end;
+2. read `pre_trailer_len` immediately before it;
+3. validate length bounds before allocation;
+4. locate and read the complete body;
+5. verify CRC32C using the formula above, including the complete Master Trailer bytes;
+6. only then trust or parse Pre-Trailer or Master Trailer metadata.
+
+Encrypted Pre-Trailers replace the plaintext body with the AEAD representation defined in §15.4.
+
+## 6.5 `object_id`
+
+R8 uses a 16-byte object identifier:
+
+```text
+object_id = first_16_bytes(
+    BLAKE3(
+        ASCII("STASH-OBJECT-ID-V2")
+        || canonical_path_utf8
+        || uint64_le(file_ver)
+    )
+)
+```
+
+`object_id` is **not stable across rename**.
+
+A rename changes `canonical_path`, therefore produces a new `object_id`. In R8, rename is modeled as a new logical object/version under copy-on-write semantics. Existing frames under the old identity remain valid until they become unreachable and are reclaimed by GC.
+
+R8 does not define a path-independent inode/object UUID alias layer.
+
+## 6.6 Logical placement invariants
+
+For non-packed DATA frames:
+
+```text
+logical_offset % BASE_QUANTUM == 0
+logical_length > 0
+```
+
+`logical_length` MAY be non-4KiB-aligned for the final logical region.
+
+A frame represents:
 
 ```text
 [logical_offset, logical_offset + logical_length)
 ```
 
-The addition MUST be checked for uint64 overflow. `logical_length` is the exact uncompressed logical byte count represented by the frame; it is distinct from stored `data_len`. The final quantum of the complete object MAY be only partially used. For a non-sparse multi-frame object, every non-final extent MUST have `logical_length mod BASE_QUANTUM == 0`; otherwise the next aligned extent would create a gap or overlap. A compressed frame MAY have `logical_length > data_len`, but decoded output MUST equal `logical_length` exactly and MUST never exceed the archive maximum above. For STORE, decrypted/plain payload length MUST equal `logical_length`; encryption overhead remains part of `data_len`, not logical length.
-
-PACKED frames do not use trailer-level `logical_offset`/`logical_length`; their per-file `inner_off`/`inner_len` values are defined in §6.2 and §8, and the complete uncompressed packed buffer MUST NOT exceed `MAX_LOGICAL_FRAME_LENGTH`. PARITY frames have no logical object range.
-
-### 3.4 Exact payload budget
-
-Define:
-
-```text
-pre_trailer_total_size = pre_trailer_body_size + PRE_TRAILER_LEN_SIZE
-payload_capacity =
-    frame_size
-  - MASTER_TRAILER_SIZE
-  - pre_trailer_total_size
-
-padding_len = payload_capacity - data_len
-```
-
-A valid frame MUST satisfy:
-
-```text
-data_len >= 0
-pre_trailer_body_size >= 8
-payload_capacity >= 0
-padding_len >= 0
-data_len + padding_len + pre_trailer_total_size
-    + MASTER_TRAILER_SIZE == frame_size
-```
-
-The `data_len` field includes any stored payload nonce and authentication tag. `pre_trailer_body_size` likewise means the exact stored body representation: plaintext body in the base profile or `nonce || ciphertext || tag` in the encrypted profile. There is no implicit extra allowance. Every byte in the physical frame is accounted for by this equation.
-
-The padding region between stored payload and Pre-Trailer body MUST be zero-filled and is excluded from `hash_payload`.
-
-### 3.5 Logical Recovery Grid
-
-The Logical Recovery Grid uses the same 4096-byte quantum as the physical extent grid, but the two coordinate spaces are independent:
-
-```text
-logical_sector = logical_offset / BASE_QUANTUM
-quantum_count  = ceil(logical_length / BASE_QUANTUM)
-```
-
-A recovery implementation MAY represent an object as an in-memory map of Logical Recovery Quanta and map each validated DATA frame onto its claimed range. This is an implementation model, not an additional wire representation.
+Physical discovery order MUST NOT define object order.
 
 ---
 
-## 4. Hash Algorithms
+# 7. Parity / Erasure Coding
 
-|Value|Algorithm|Digest|
-|-|-|-:|
-|`0x00`|reserved|—|
-|`0x01`|BLAKE3|32 B|
-|`0x02`|SHA-256|32 B|
-|`0x03`|SHA3-256|32 B|
-|`0x04–0xFF`|reserved|—|
-
-The archive's `hash_id` is fixed for its lifetime.
-
-### 4.1 Hash scope
-
-`hash_payload` MUST be calculated over the exact bytes stored in the frame's payload region, before padding and before the Pre-Trailer and Master Trailer are appended.
-
-In the normal unencrypted case this is `compressed_payload`. In encrypted mode this is the encrypted payload representation, including its nonce/AEAD overhead as specified in §15.2.
-
-The hash MUST NOT cover:
-
-* zero padding;
-* Pre-Trailer;
-* Master Trailer;
-* the blob's Archive Header.
-
-This makes stored-payload deduplication dependent on byte-identical stored payload representations. Placement metadata is outside the digest, so equal hashes are not unique physical-frame identities (§10.3).
-
----
-
-## 5. Compression Codecs
-
-|Value|Codec|
-|-|-|
-|`0x00`|STORE|
-|`0x01`|LZ4|
-|`0x02`|Zstd|
-|`0x03`|LZMA|
-|`0x04`|Brotli|
-|`0x05–0xFF`|reserved|
-
-`codec_id` in the Archive Header is the default and MAY be overridden per frame.
-
-### 5.1 Canonical compression parameters
-
-A codec identifier alone is insufficient to guarantee byte-identical output across different codec versions or settings. Therefore, for frames intended to be reproducibly deduplicated across independent writers, the implementation MUST use a documented **canonical parameter profile** for the selected codec.
-
-For the default Zstd profile, the STASH reference implementation MUST publish the exact compression level and relevant deterministic parameters used for archive creation.
-
-Two implementations MAY produce different compressed bytes when using different valid codec profiles; such frames remain valid STASH frames but will not deduplicate.
-
-The manifest and frame format do not assume that compression is globally reproducible merely from the codec name.
-
-### 5.2 Canonical parameters — all codecs (R2)
-
-**Normative rule:** the canonical-parameter-profile requirement of §5.1 applies symmetrically to every supported codec (LZ4, LZMA, Brotli), not only Zstd. Each implementation MUST document and fix the exact compression level and deterministic parameters for every codec it enables for archive creation, so that byte-identical deduplication is achievable regardless of which codec is in use.
-
----
-
-## 6. Frame Binary Layout
-
-All multi-byte integers are little-endian. Every frame has the following complete physical representation:
-
-```text
-[ compressed_payload / encrypted_payload ]
-[ zero padding ]
-[ stored_pre_trailer_body ]
-[ pre_trailer_len : uint32_le ]
-[ Master Trailer : 96 B ]
-```
-
-The Master Trailer is always the final 96 bytes of the frame.
-
-### 6.1 Master Trailer
-
-The R7 Master Trailer is exactly 96 bytes:
-
-| Offset | Size | Field | Type | Description |
-|---|---:|---|---|---|
-| `0x00` | 4 | `magic` | char[4] | `STSH` |
-| `0x04` | 1 | `hash_id` | uint8 | MUST match Archive Header |
-| `0x05` | 1 | `codec_id` | uint8 | Codec used for this frame |
-| `0x06` | 1 | `block_type` | uint8 | `0x00 = DATA`, `0x01 = PARITY`, `0x02 = PACKED` |
-| `0x07` | 1 | `group_index` | uint8 | Position `0..k+m-1`; zero when `group_id == 0` |
-| `0x08` | 4 | `group_id` | uint32 | Archive-scoped parity-group ID; zero means no group |
-| `0x0C` | 4 | `data_len` | uint32 | Exact stored payload representation length |
-| `0x10` | 32 | `hash_payload` | bytes[32] | Hash of the exact stored payload representation |
-| `0x30` | 4 | `frame_quanta` | uint32 | Physical extent in 4096-byte quanta |
-| `0x34` | 4 | `trailer_crc32c` | uint32 | CRC32C of the 96-byte Master Trailer with this field treated as zero |
-| `0x38` | 16 | `object_id` | bytes[16] | Versioned logical-object identity; zero for PACKED/PARITY |
-| `0x48` | 8 | `logical_offset` | uint64 | Global logical byte offset for non-packed DATA |
-| `0x50` | 8 | `logical_length` | uint64 | Logical bytes represented by non-packed DATA |
-| `0x58` | 8 | `frame_ordinal` | uint64 | Immutable creation ordinal within a writer namespace |
-
-The first 48 bytes preserve the R5 core field order; the placement extension occupies the final 48 bytes. The trailer is not optional for PACKED or PARITY frames: fields without meaning for their block type are encoded as zero and validated as such.
-
-#### 6.1.1 Block-type invariants
-
-**DATA (`0x00`):**
-
-- `object_id` MUST be non-zero;
-- `logical_offset` and `logical_length` MUST satisfy §3.3;
-- the Pre-Trailer MUST contain exactly one entry matching the same logical placement and versioned object identity;
-- empty committed DATA frames are forbidden.
-
-If the deterministic object-ID derivation produces sixteen zero bytes, the writer MUST fail rather than encode the value reserved for PACKED/PARITY.
-
-**PACKED (`0x02`):**
-
-- `object_id`, `logical_offset`, and `logical_length` MUST be zero;
-- the Pre-Trailer MUST contain at least one packed-file entry;
-- per-file placement is carried only by `inner_off`/`inner_len` in the Pre-Trailer.
-
-**PARITY (`0x01`):**
-
-- `object_id`, `logical_offset`, and `logical_length` MUST be zero;
-- `group_id` MUST be non-zero and `group_index` MUST select a parity slot;
-- the Pre-Trailer MUST contain zero entries.
-
-For any block type, `frame_size = frame_quanta × BASE_QUANTUM` and the exact payload-budget equation in §3.4 MUST hold. In FIXED mode, `frame_quanta` MUST equal `MAX_FRAME_QUANTA`; mismatch is corruption.
-
-#### 6.1.2 Parity identity
-
-`group_id` is scoped to the archive, not one blob. Every member of a parity group self-describes its membership with identical non-zero `group_id` and a unique `group_index`. Data slots are `0..parity_k-1`; parity slots are `parity_k..parity_k+parity_m-1`. Writers MUST treat uint32 wraparound as a fatal error and MUST NOT reuse an active or historical group ID in the same archive.
-
-#### 6.1.3 Frame ordinal
-
-For newly created frames, `frame_ordinal` is allocated monotonically within `(generation_id, blob_ordinal)`, beginning at zero. It is not a physical byte offset and, after byte-preserving compaction, need not equal the destination FIXED slot number.
-
-On cold writer start, the next ordinal MAY be discovered by scanning valid trailers in the active generation and choosing `max(frame_ordinal) + 1`. This is conceptually the same recovery pattern as `generation_id` discovery (§2.4). Wraparound is fatal. A writer MUST NOT reuse a previously minted `(generation_id, blob_ordinal, frame_ordinal)` tuple under the same encryption key.
-
-#### 6.1.4 Master Trailer CRC32C
-
-`trailer_crc32c` uses the R7 CRC32C definition in §2.2. A writer MUST:
-
-1. serialize the complete 96-byte Master Trailer with bytes `0x34..0x37` set to zero;
-2. calculate CRC32C over all 96 bytes;
-3. store the result at `0x34` in little-endian form.
-
-A reader calculates the same value while logically treating bytes `0x34..0x37` as zero and compares it with the stored field. The checksum therefore covers magic, codec/hash/type fields, parity identity, `data_len`, `hash_payload`, `frame_quanta`, object placement, and `frame_ordinal`.
-
-The reader MUST validate `trailer_crc32c` before trusting any trailer field for allocation, logical placement, parity grouping, or ordinal discovery. During raw VARIABLE scanning, a candidate with valid magic but invalid trailer CRC is not a frame candidate and scanning continues at the next quantum boundary.
-
-CRC32C detects accidental corruption and materially strengthens keyless recovery; it is not a substitute for the encrypted profile's AEAD authenticity.
-
-### 6.2 Pre-Trailer
-
-The stored Pre-Trailer is:
-
-```text
-[ stored_pre_trailer_body ][ pre_trailer_len : uint32_le ]
-```
-
-`pre_trailer_len` is the exact byte length of `stored_pre_trailer_body`. In the unencrypted profile, the stored body is the plaintext body. In the encrypted profile, it is `nonce[12] || ciphertext || tag[16]`; see §15.2 and §15.4.
-
-The plaintext body is:
-
-```text
-uint32_le entry_count
-repeated entry_count times:
-    varint     path_len
-    bytes      canonical_path_utf8
-    uint64_le  inner_off
-    uint64_le  inner_len
-    uint64_le  file_ver
-bytes zero_metadata_padding[0..7]
-uint32_le crc32c
-```
-
-The body is self-delimiting: after exactly `entry_count` entries have been parsed, every remaining byte before the final CRC32C is metadata padding and MUST be zero.
-
-#### 6.2.1 CRC coverage and alignment
-
-CRC32C, as defined in §2.2, covers every plaintext-body byte preceding the CRC field, including `entry_count`, all entries, and zero metadata padding. It does not cover `pre_trailer_len`.
-
-Define `ALIGNMENT = 8`. The writer MUST choose `zero_metadata_padding` so that the **stored** Pre-Trailer representation satisfies:
-
-```text
-(pre_trailer_len + PRE_TRAILER_LEN_SIZE) mod ALIGNMENT = 0
-```
-
-Because `frame_size` and `MASTER_TRAILER_SIZE` are both multiples of 8, this guarantees:
-
-```text
-(pre_trailer_body_start - frame_start) mod ALIGNMENT = 0
-```
-
-This padding is inside the authenticated/CRC-protected Pre-Trailer body. Payload padding cannot change a reverse-anchored body start and MUST NOT be used to claim this alignment property.
-
-The reader MUST authenticate/decrypt when applicable, verify CRC32C, validate zero metadata padding, and only then trust `entry_count`, paths, offsets, lengths, or versions.
-
-#### 6.2.2 Entry offset semantics
-
-**PACKED frames:** `inner_off` and `inner_len` identify one file inside the uncompressed packed buffer:
-
-```text
-logical_buffer = file_1 || file_2 || ... || file_n
-```
-
-They are never physical offsets and never synonyms for trailer-level `logical_offset`/`logical_length`.
-
-**Non-packed DATA:** the single entry's `inner_off` is the global logical byte offset of this fragment and MUST equal the Master Trailer's `logical_offset`. `inner_len` MUST equal the Master Trailer's `logical_length`. The manifest `loc` tuple MUST carry the same values.
-
-#### 6.2.3 Object identity
-
-For a canonical path and per-path `file_ver`, the 16-byte object identity is:
-
-```text
-object_id = first_16_bytes(
-    HASH_hash_id(
-        "STASH-OBJECT-ID-V1" ||
-        uint32_le(path_byte_length) ||
-        canonical_path_utf8 ||
-        uint64_le(file_ver)
-    )
-)
-```
-
-The length prefix and fixed domain label are mandatory. Every non-packed fragment of that `(canonical_path, file_ver)` MUST carry the same `object_id`. A reader that can decrypt the path metadata MUST recompute and verify the value. Two distinct decoded `(path, file_ver)` pairs producing one `object_id` are a `CORRUPTION / ID_COLLISION` condition, never an implicit merge.
-
-`object_id` is deliberately not stable across rename: a changed canonical path produces a new object ID. R7 has no manifest-level path-to-stable-UUID indirection. A rename is therefore a new logical object/version and requires new self-describing frame placement; old frames remain addressable until GC.
-
-#### 6.2.4 Limits
-
-Normative limits:
-
-- `MAX_PACKED_ENTRIES = 65535`;
-- `path_len <= 4096` bytes;
-- `MIN_PAYLOAD_RESERVE = 64` bytes for DATA/PACKED writer fit decisions.
-
-The maximum stored Pre-Trailer body that a DATA/PACKED writer may select is:
-
-```text
-max_pre_trailer_body =
-    frame_size
-  - MASTER_TRAILER_SIZE
-  - PRE_TRAILER_LEN_SIZE
-  - MIN_PAYLOAD_RESERVE
-```
-
-A writer MUST account for metadata alignment padding and encryption overhead incrementally while packing.
-
-### 6.3 Deterministic reverse parsing
-
-When `frame_start` and `frame_size` are known, the reader MUST:
-
-1. compute `frame_end = frame_start + frame_size`, rejecting overflow;
-2. read the final 96 bytes as the R7 Master Trailer;
-3. validate `trailer_crc32c` before trusting any trailer-derived size or identity;
-4. validate magic, block type, `frame_quanta`, size-mode rules, group fields, placement fields, and `data_len`;
-5. read `pre_trailer_len` at `frame_end - 96 - 4`;
-6. reject any length that exceeds the exact frame bounds;
-7. compute `pre_trailer_body_start = frame_end - 96 - 4 - pre_trailer_len`;
-8. verify Pre-Trailer alignment and non-overlap with the stored payload;
-9. verify every payload-padding byte is zero;
-10. hash exactly `[frame_start, frame_start + data_len)` and compare it with `hash_payload`;
-11. authenticate/decrypt the Pre-Trailer when enabled, verify CRC32C, then parse entries;
-12. enforce the block-type-specific consistency rules in §6.1.1.
-
-When an encrypted Pre-Trailer key is unavailable, steps 10-11 cannot establish plaintext metadata validity. The reader MAY still classify the frame as **physically/hash valid but metadata opaque** after all keyless structural, bounds, padding, and `hash_payload` checks succeed. It MUST NOT claim full semantic validation or invent PACKED entries.
-
-Raw discovery when `frame_size` is not yet known is defined in §11.2.
-
----
-
-## 7. Parity / Erasure Coding
+R8 defines exactly two non-zero parity algorithms:
 
 | Value | Scheme | Tolerance |
-|---|---|---:|
+|---|---|---|
 | `0x00` | none | 0 |
 | `0x01` | XOR | 1 frame/group |
 | `0x02` | Reed-Solomon | `parity_m` frames/group |
-| `0x03` | LRC | tunable; EXPERIMENTAL |
+| `0x03-0xFF` | reserved | — |
 
-The scheme and parameters are immutable archive properties. Mixing schemes in one archive is forbidden.
+Writers MUST NOT emit any other non-zero parity scheme. Readers MUST reject unknown non-zero parity-scheme values.
 
-A group is closed only after all required data members (DATA or PACKED) are fixed. PARITY frames MUST be written only after group membership is fixed. All DATA, PACKED, and PARITY members of one group MUST use an identical physical `frame_size` and therefore identical `frame_quanta`. This is a hard structural invariant; a mixed-extent group is corrupt. In FIXED mode the invariant follows automatically from the archive geometry but MUST still be validated.
+Header invariants:
 
-Every group member carries `group_id` and `group_index` in its own Master Trailer. Raw recovery therefore buckets frames by `group_id`, validates unique positions and equal geometry, and reconstructs missing members without the manifest.
+```text
+NONE:
+    parity_k = 0
+    parity_m = 0
 
-Parity payload identity is the exact stored parity payload representation, and `hash_payload` covers those exact bytes. Padding, Pre-Trailer, and Master Trailer remain outside the hash scope.
+XOR:
+    parity_k > 0
+    parity_m = 1
 
-The manifest MAY record a non-authoritative management entry:
+Reed-Solomon:
+    parity_k > 0
+    parity_m > 0
+
+all active parity:
+    blob_count >= 2
+    parity_k + parity_m <= 256
+```
+
+Every DATA and PARITY member of a group self-describes:
+
+- `group_id`;
+- `group_index`;
+- `group_k`;
+- `group_m`.
+
+`group_id` MUST be unique within the archive lifetime and MUST NOT wrap or be reused.
+
+## 7.1 Equal physical geometry within a group
+
+All members of one parity group MUST have identical `frame_quanta` and therefore identical physical `frame_size`.
+
+This is mandatory in both modes. In FIXED mode the invariant is trivially satisfied because every frame has `frame_size = MAX_FRAME_SIZE`. In VARIABLE mode the writer MUST form groups only from equal-sized frames or defer frames until a compatible group can be formed.
+
+## 7.2 Spread rule
+
+A parity group MUST span at least two distinct blobs when parity is enabled. Compaction MUST preserve this rule in the destination generation.
+
+## 7.3 Manifest redundancy
+
+A `PARITY_GROUP` manifest record MAY redundantly list group members for operational convenience, but raw-frame `group_id`/`group_index`/`group_k`/`group_m` metadata is authoritative for manifest-independent group discovery.
+
+Integrity detection is not repair: CRC32C, `hash_payload`, and AEAD can identify damage, but only parity or another intact source can reconstruct damaged data.
+
+---
+
+# 8. Frame Packing
+
+PACKED frames aggregate small files before compression.
+
+Packing procedure:
+
+1. normalize paths;
+2. sort files lexicographically by canonical path;
+3. concatenate file bytes into one logical packed buffer;
+4. compress the complete buffer using the selected canonical codec profile;
+5. write one PACKED frame if physical limits permit.
+
+Packed entries use:
+
+```text
+inner_offset
+inner_length
+```
+
+relative to the **uncompressed packed logical buffer**.
+
+Non-packed DATA frames use:
+
+```text
+logical_offset
+logical_length
+```
+
+relative to the complete logical object.
+
+These semantics MUST NOT be mixed.
+
+PACKED frames are supported identically in VARIABLE and FIXED modes. In FIXED mode the physical container is always `MAX_FRAME_SIZE`; unused capacity is padding.
+
+If a candidate packed file cannot fit into an otherwise-empty frame, the writer MUST fail the packing attempt immediately and route the file through the non-packed multi-frame path. It MUST NOT retry indefinitely.
+
+---
+
+# 9. Logical Object Mapping and Localized Copy-on-Write
+
+## 9.1 Manifest location tuple
+
+For non-packed extents:
+
+```text
+[blob_ordinal, frame_hash, logical_offset, logical_length]
+```
+
+The manifest intentionally does **not** contain `physical_offset`. Physical placement changes during compaction and belongs to the per-generation physical index (§10.4).
+
+`frame_hash` lookup can return multiple physical candidates if payload-identical frames exist. The physical index is therefore a multimap; object/trailer metadata resolves the intended extent.
+
+## 9.2 Ordering
+
+Logical order is determined exclusively by `logical_offset`.
+
+The order of entries inside `loc`, `ADD_EXTENT`, index files, or physical blob discovery MUST NOT be used as an ordering guarantee.
+
+## 9.3 Logical Recovery Grid
+
+R8 defines a conceptual 4 KiB Logical Recovery Grid:
+
+```text
+logical_quantum_index = logical_offset / 4096
+quantum_count = ceil(logical_length / 4096)
+```
+
+A recovery implementation MAY map extents into 4 KiB entries, page tables, interval maps, radix structures, or another equivalent representation.
+
+The in-memory representation is implementation-defined and is not part of the wire format.
+
+## 9.4 Overlap and gap detection
+
+During recovery, two live extents of the same `(object_id, version)` claiming overlapping logical byte ranges are a conflict/corruption condition unless an explicit newer manifest transaction resolves the overlap.
+
+A reader MUST NOT silently choose one candidate.
+
+Missing logical regions MUST be surfaced as incomplete/degraded data, not zero-filled silently unless higher-level policy explicitly requests sparse-file semantics.
+
+## 9.5 Immutable localized rewrite
+
+A committed frame MUST NEVER be modified in place.
+
+A logical modification is implemented as:
+
+```text
+read affected frame(s)
+-> decompress/decrypt as required
+-> modify logical bytes
+-> repartition into valid R8 frame extents
+-> write new immutable frame(s)
+-> durably commit new manifest version
+-> old frame(s) remain until GC
+```
+
+This is a logical rewrite/repartition operation, not physical frame splitting.
+
+## 9.6 Insert / resize behavior in VARIABLE mode
+
+VARIABLE mode exists to localize size-changing edits.
+
+Example:
+
+```text
+OLD:
+[A 4096 KiB][B ...][C ...]
+
+insert 100 KiB into A
+
+NEW, if permitted by MAX_FRAME_SIZE:
+[A' 4196 KiB][B unchanged][C unchanged]
+```
+
+Subsequent frames MUST NOT be rewritten solely to preserve old fixed-size boundaries.
+
+If the rewritten frame would exceed `MAX_FRAME_SIZE`, only the affected local region is repartitioned into multiple new grid-aligned frames. Unaffected following frames remain referenceable with their existing hashes.
+
+## 9.7 FIXED-mode rewrite semantics
+
+In FIXED mode every newly written physical frame remains exactly `MAX_FRAME_SIZE`.
+
+A local insert may therefore require one or more full fixed frames for the modified region, and the last new fragment can be logically shorter while remaining physically full-sized.
+
+FIXED mode intentionally trades greater write amplification for direct physical O(1) geometry and faster disaster-recovery partitioning.
+
+---
+
+# 10. Manifest and Physical Indexing
+
+## 10.1 Manifest journal
+
+`manifest.jsonl` remains an append-only logical journal.
+
+Every committed record carries a strictly increasing `seq`. `ts` is informational only and MUST NOT define ordering.
+
+Manifest writes are serialized through one logical manifest commit stream even while blob data writes occur in parallel.
+
+`MAX_MANIFEST_LINE_BYTES = 1 MiB`.
+
+Readers MUST reject a line exceeding the bound rather than buffer unbounded data.
+
+## 10.2 Normal ADD / DEL
+
+Example non-packed ADD:
 
 ```json
-{"seq":77,"op":"PARITY_GROUP","group_id":42,"frame_quanta":1024,"data_frames":[[0,"hash1"],[3,"hash2"]],"parity_frames":[[7,"phash1"]]}
+{"seq":1,"op":"ADD","path":"db/data.bin","ver":7,"loc":[[3,"<hash>",0,4194304]]}
 ```
 
-Each reference is `[blob_ordinal, frame_hash]`. The entry MUST agree with scanned frame metadata when both are available; disagreement is corruption, not an override.
+`DEL` removes the current logical path version but does not physically delete referenced frames.
 
----
+## 10.3 Large object transactions: `ADD_BEGIN` / `ADD_EXTENT` / `ADD_COMMIT`
 
-## 8. Frame Packing
+A logical object whose location metadata does not fit in one bounded line MUST use a transactional extent sequence.
 
-Frame Packing aggregates small files into one frame with `block_type = PACKED`. It operates identically at the logical level in VARIABLE and FIXED archives.
-
-### 8.1 Packing order and representation
-
-Files MUST be sorted lexicographically by canonical UTF-8 path before packing. The writer constructs:
-
-```text
-logical_buffer = file_1_bytes || file_2_bytes || ... || file_n_bytes
-stored_payload = CODEC(logical_buffer)
-```
-
-The frame's Pre-Trailer records one entry per packed file. `inner_off`/`inner_len` address the uncompressed `logical_buffer`. The frame hash covers `stored_payload` exactly.
-
-In VARIABLE mode, the writer SHOULD select the smallest valid grid-aligned `frame_size` that satisfies the exact payload budget after compression, metadata padding, and optional encryption overhead. In FIXED mode, every PACKED frame occupies `MAX_FRAME_SIZE`; unused capacity is zero padding.
-
-### 8.2 Packing fit algorithm
-
-Compressed size is not known from logical input size. A compliant writer MUST:
-
-1. accumulate a candidate set in canonical path order;
-2. build and compress the candidate logical buffer using the selected canonical codec profile;
-3. build the complete stored Pre-Trailer representation, including metadata alignment and encryption overhead;
-4. select a valid VARIABLE extent or the sole FIXED extent;
-5. accept the candidate only if the exact §3.4 equation succeeds;
-6. otherwise seal the previous non-empty candidate and retry the new file alone.
-
-If a single file fails to fit into a fresh empty candidate at `MAX_FRAME_SIZE`, the writer MUST immediately return a distinct packing-overflow result and route the file to the non-packed multi-frame path. It MUST NOT retry the same file indefinitely in new empty PACKED frames.
-
-### 8.3 Packed frame determinism
-
-Byte-identical packed output requires identical canonical paths, ordering, contents, file versions, codec, canonical codec parameters, encryption representation, and packing policy. The format does not claim cross-implementation byte identity from equal logical input alone.
-
----
-
-## 9. Manifest and Logical Object Semantics
-
-`manifest.jsonl` is the append-only journal authoritative for current path state. Frames remain immutable and self-describing; physical offsets remain derived placement data.
-
-### 9.1 Core records
+Example:
 
 ```json
-{"seq":1,"ts":1739550001,"op":"ADD","path":"src/main.go","ver":2,"object_id":"4cf0...32 hex chars...","total_len":4096,"loc":[[0,"f5a2...64 hex chars...",0,4096]]}
-{"seq":2,"ts":1739550002,"op":"ADD","path":"big/dataset.bin","ver":1,"object_id":"ca11...32 hex chars...","total_len":100663296,"loc":[[3,"aaa1...",0,67108864],[17,"bbb2...",67108864,33554432]]}
-{"seq":3,"ts":1739550123,"op":"DEL","path":"src/utils.go","ver":2}
+{"seq":100,"op":"ADD_BEGIN","tx_id":"...","path":"db/huge.bin","ver":8}
+{"seq":101,"op":"ADD_EXTENT","tx_id":"...","extent_sequence":0,"loc":[[0,"h1",0,4194304],[1,"h2",4194304,4194304]]}
+{"seq":102,"op":"ADD_EXTENT","tx_id":"...","extent_sequence":1,"loc":[[2,"h3",8388608,4194304]]}
+{"seq":103,"op":"ADD_COMMIT","tx_id":"...","extent_count":3}
 ```
 
-`seq : uint64` is strictly increasing within one manifest generation. `ts` is informational and MUST NOT determine logical order. JSON integers used by normative fields MUST be non-negative and exactly representable as their declared unsigned type; readers MUST reject floating-point or exponent forms for these fields.
+One `ADD_EXTENT` line SHOULD batch as many extent tuples as possible without exceeding `MAX_MANIFEST_LINE_BYTES`.
 
-### 9.2 Version and rename semantics
+`ADD_EXTENT` does **not** require an `fsync` after every line.
 
-Before hashing, sorting, or comparison, a path MUST be canonicalized as well-formed UTF-8 in Unicode NFC, with `/` as separator, no leading slash, no NUL, no empty component, and no `.` or `..` component. Drive letters and backslashes are not wire-path syntax. Case is preserved; deployments MUST NOT apply locale-dependent case folding. The canonical byte sequence is used unchanged by Frame Packing, manifest identity, and `object_id` derivation.
+The object becomes logically visible only after a valid durable `ADD_COMMIT`.
 
-`ver : uint64` is monotonically increasing per canonical path. Two operations MUST NOT commit competing current states with the same `(path, ver)`.
+A transaction missing `ADD_COMMIT`, containing duplicate/missing `extent_sequence`, or failing declared extent-count validation is incomplete and MUST be ignored as a committed object version.
 
-`object_id` MUST equal the derivation in §6.2.3. It identifies one versioned logical object, not a stable inode. Consequently:
+## 10.4 Durability / group commit
 
-- a content replacement at the same path increments `ver` and produces a new `object_id`;
-- a rename changes `canonical_path` and produces a new `object_id`;
-- R7 defines no needs-no-rewrite rename alias;
-- old frames remain immutable and addressable until they are proven dead and reclaimed by GC.
-
-A rename is committed as a new self-describing ADD for the destination followed by a DEL for the source in the same higher-level transaction or equivalent serialized journal sequence. Implementations MUST NOT represent rename by silently changing only a manifest path while retaining frame metadata that claims the old identity.
-
-### 9.3 Manifest write serialization
-
-DATA/PACKED/PARITY writes MAY occur concurrently across blobs. Appends to one manifest MUST pass through one logical serializer so every complete record receives a unique `seq`. A local lock, distributed lease, dedicated writer service, or ordered delta-log merge is acceptable; arbitrary concurrent `write()` calls are not assumed to preserve JSONL records.
-
-### 9.4 Manifest `loc` tuple
-
-The tuple is intentionally independent of physical byte offset:
+Required ordering:
 
 ```text
-loc = [blob_ordinal, frame_hash, logical_or_inner_offset, logical_or_inner_length]
+write all referenced frame bytes
+-> flush/fsync affected blob(s)
+-> append manifest transaction records
+-> append ADD_COMMIT / terminal record
+-> flush/fsync manifest
+-> report transaction durable
 ```
 
-- `blob_ordinal` is an integer in `0..blob_count-1`;
-- `frame_hash` is the 32-byte `hash_payload`, canonically encoded as 64 lowercase hexadecimal characters in plaintext JSON;
-- for non-packed DATA, the final two values are `logical_offset` and `logical_length` and MUST equal the Master Trailer and sole Pre-Trailer entry;
-- for PACKED data, they are `inner_off` and `inner_len` into the uncompressed packed buffer and MUST match the corresponding Pre-Trailer entry.
+Multiple manifest records MAY share one group `fsync` boundary.
 
-The tuple MUST NOT contain `physical_offset`: compaction may change physical placement without changing logical references. Normal readers resolve `(blob_ordinal, frame_hash)` through the per-blob offset index (§10.3) and validate the remaining identity/placement fields against each candidate.
+A manifest MUST never become durably authoritative before every referenced frame is durably stored.
 
-Because `hash_payload` excludes placement metadata, equal payload hashes can legitimately resolve to multiple physical offsets. An index MUST preserve all candidates rather than overwrite one mapping. `object_id`, block type, logical/inner range, Pre-Trailer identity, and full frame validation disambiguate them.
+## 10.5 Mandatory per-generation physical offset index
 
-### 9.5 Multi-frame objects and order independence
+R8 retains the physical frame offset index from an optional optimization to a first-class maintained structure.
 
-For non-packed multi-frame objects, `logical_offset` is the only normative placement order. JSON array order, physical discovery order, `frame_ordinal`, blob order, and frame size MUST NOT determine logical order.
-
-For each committed non-sparse object, the reader MUST:
-
-1. validate every referenced frame independently;
-2. sort claims by ascending `logical_offset`;
-3. reject uint64 range overflow;
-4. reject any two non-identical claims whose half-open ranges overlap;
-5. reject gaps relative to `[0, total_len)`;
-6. require the final covered byte to equal `total_len`.
-
-An exact duplicate claim with the same hash, object identity, offset, and length MAY be collapsed as an idempotent duplicate. Any other overlap is `CORRUPTION / CONFLICT`; the reader MUST NOT choose a winner unless a separate explicit versioning rule selects one complete committed object version.
-
-Physical discovery order MUST NOT affect reconstruction. A frame for offset 128 MiB may be discovered before the frame for offset zero.
-
-### 9.6 Copy-on-Write and localized replacement
-
-A committed frame MUST NEVER be modified in place. A replacement operation follows:
+Recommended path:
 
 ```text
-read old logical content as needed
-→ decompress/decrypt as needed
-→ construct new immutable frame(s)
-→ append and durably flush frame(s)
-→ update derived offset index
-→ atomically commit manifest record/transaction
+index/blob-XX.idx
 ```
 
-Changing a frame's **physical** extent in VARIABLE mode does not change its logical placement and MUST NOT force changes to following logical ranges. For example, a less-compressible replacement may grow from 100 KiB to 200 KiB physically while retaining the same `logical_offset` and `logical_length`.
-
-R7 does not permit a new version to claim that old frame metadata contains a different `object_id`, path version, or logical placement. Any reused stored payload must still be represented by self-consistent R7 frame metadata for the new committed object.
-
-### 9.7 Insert, delete, and repartition semantics
-
-An insert or delete that changes the byte length before a later fragment necessarily changes that later fragment's absolute logical byte offset. R7's `logical_offset` is an actual byte offset, not an order label. Therefore the format MUST NOT claim both that later embedded offsets remain unchanged and that the resulting ranges are non-overlapping.
-
-Normatively:
-
-- a same-length replacement may remain localized to the affected logical range;
-- a true insert/delete MUST emit self-consistent placement metadata for every subsequently shifted live range;
-- an implementation MAY avoid recompression of unchanged payload bytes, but it MUST NOT retain stale embedded offsets;
-- a needs-no-rewrite insert/delete would require an additional indirection or piece-table layer, which R7 does not define.
-
-If a new stored representation cannot fit within `MAX_FRAME_SIZE`, the writer MUST logically repartition it into multiple new frames. Every resulting physical extent MUST be grid-aligned, every non-final logical range SHOULD end on a Logical Recovery Quantum boundary, and no old frame is changed or deleted in place.
-
-### 9.8 Manifest corruption
-
-A malformed, oversized, or truncated record MUST NOT become a valid update. Readers MUST detect invalid JSON, missing fields, unknown operations, invalid ordinals/hashes/types, non-monotonic versions, invalid `object_id`, invalid `loc`, range overflow, gaps, overlaps, and frame/manifest metadata disagreement.
-
-An incomplete final line MAY be ignored only as an uncommitted append. Deployments requiring manifest tamper evidence SHOULD additionally use signed or hash-chained manifest checkpoints/segments.
-
----
-
-## 10. Manifest Scaling and Physical Offset Index
-
-### 10.1 Reverse scanning and bounded records
-
-Readers MUST support reverse chunked scanning of `manifest.jsonl` in bounded chunks, typically 4-16 MiB.
+The index belongs to one `(generation_id, blob_ordinal)` pair and maps:
 
 ```text
-MAX_MANIFEST_LINE_BYTES = 1 MiB
+frame_hash -> one or more physical frame records
 ```
 
-A writer MUST NOT emit a larger line. A reader MUST treat an oversized line as corruption and MUST NOT allocate an unbounded buffer. A path-state checkpoint MAY accelerate manifest startup, but it is not authoritative when it disagrees with a valid committed tail.
+A canonical 64-byte record is:
 
-### 10.2 Transactional `ADD_EXTENT`
+| Offset | Size | Field |
+|---|---:|---|
+| `0x00` | 32 | frame_hash |
+| `0x20` | 8 | physical_offset |
+| `0x28` | 4 | frame_quanta |
+| `0x2C` | 1 | block_type |
+| `0x2D` | 3 | reserved |
+| `0x30` | 8 | frame_ordinal |
+| `0x38` | 8 | reserved |
 
-The line-size bound MUST NOT limit an object's fragment count. When an ordinary ADD would exceed it, the writer MUST use a bounded transaction. Canonical plaintext examples are:
+Records SHOULD be sorted lexicographically by `frame_hash` so an on-disk implementation can provide O(log N) lookup by binary search. An implementation MAY maintain an in-memory hash map for O(1) average lookup.
+
+Duplicate `frame_hash` records are valid; lookup is a multimap.
+
+The index:
+
+- MUST be maintained for normal hot-path operation;
+- MUST be regenerated during compaction for the new generation;
+- MUST be fully rebuildable by raw blob scanning;
+- MUST NOT be authoritative for correctness;
+- MUST NOT make disaster recovery depend on its presence.
+
+If an index is missing/corrupt, a reader MAY degrade to scanning for correctness, but MUST schedule/rebuild the index before returning to the normal hot path.
+
+## 10.6 LINK_MANIFEST
+
+Canonical example:
 
 ```json
-{"seq":100,"op":"ADD_BEGIN","transaction_id":"9dc1...","object_id":"ca11...","path":"dataset.bin","ver":7,"total_len":10995116277760,"extent_count":3000000,"extent_record_count":1000000}
-{"seq":101,"op":"ADD_EXTENT","transaction_id":"9dc1...","object_id":"ca11...","extent_sequence":0,"extent_index":0,"loc":[[0,"hash0",0,65536],[1,"hash1",65536,65536],[2,"hash2",131072,65536]]}
-{"seq":102,"op":"ADD_EXTENT","transaction_id":"9dc1...","object_id":"ca11...","extent_sequence":1,"extent_index":3,"loc":[[0,"hash3",196608,65536]]}
-{"seq":1000101,"op":"ADD_COMMIT","transaction_id":"9dc1...","object_id":"ca11...","extent_count":3000000,"extent_record_count":1000000}
+{"seq":42,"op":"LINK_MANIFEST","path":"submanifests/user-data.jsonl","hash_id":1,"hash":"...","lines":50000}
 ```
 
-Normative rules:
+Linked manifests are independently verifiable. Compaction liveness MUST evaluate the complete reachable manifest graph.
 
-- `transaction_id` MUST be unique among reachable transactions in the archive;
-- every transaction record MUST repeat the same `transaction_id` and `object_id`;
-- `extent_sequence` starts at zero and is contiguous per ADD_EXTENT record;
-- `extent_index` identifies the first individual extent in that record;
-- if one record carries `N` tuples, the next record's `extent_index` is the previous value plus `N`;
-- every line remains below `MAX_MANIFEST_LINE_BYTES`;
-- offsets are explicit; neither `extent_sequence`, `extent_index`, nor JSON array order replaces `logical_offset`;
-- the object becomes visible only after a durable ADD_COMMIT whose declared record and extent counts exactly match the collected transaction;
-- a transaction missing a valid ADD_BEGIN, any contiguous extent record, or ADD_COMMIT is ignored as uncommitted after a crash.
+---
 
-Writers SHOULD batch as many extents per record as practical. ADD_EXTENT records MUST NOT require one `fsync` each; multiple records MAY be appended and durably flushed once at the ADD_COMMIT boundary.
+# 11. Disaster Recovery — Hop-and-Read
 
-### 10.3 Mandatory per-blob offset index
+## 11.1 Common recovery start
 
-Every active generation MUST maintain a persisted offset-index checkpoint for every active blob. Its semantic mapping is:
+For every available blob:
+
+1. read the 64-byte Archive Header at `0x00`;
+2. validate archive parameters and `frame_size_mode`;
+3. begin at `FRAME_AREA_START = 0x40`.
+
+## 11.2 VARIABLE-mode scan
+
+At each current frame offset:
+
+1. read the 16-byte Frame Prefix;
+2. validate Prefix CRC and `frame_quanta` bounds;
+3. compute `frame_size = frame_quanta * 4096`;
+4. read or seek directly to the 96-byte Master Trailer at `current + frame_size - 96`;
+5. validate Prefix/Trailer agreement;
+6. validate payload and Pre-Trailer boundaries;
+7. verify hash / AEAD / CRC as required;
+8. recover logical metadata;
+9. advance:
 
 ```text
-hash_payload → one or more candidate records
-candidate record = (physical_offset, frame_quanta, frame_ordinal)
+current += frame_size
 ```
 
-At minimum, each index artifact MUST be bound to:
+This scan is deterministic but sequentially dependent on the previous frame's validated size.
 
-- `archive_id`;
-- `generation_id`;
-- `blob_ordinal`;
-- R7 wire version;
-- `indexed_blob_length`;
-- an integrity checksum or authenticated equivalent.
+## 11.3 FIXED-mode scan
 
-The on-disk encoding of this **derived checkpoint** is implementation-defined so a reader can select an O(1) hash table, O(log N) sorted tree, or equivalent structure. Interoperability does not depend on that encoding because the index MUST be rebuildable from conformant blob scans. Implementations SHOULD use the canonical sidecar location `indexes/blob-XX.offset-index`.
+A reader can directly address any frame slot:
 
-The index value is multi-valued because `hash_payload` does not cover Pre-Trailer or placement metadata. A writer/indexer MUST retain every valid candidate with the same hash. A single-value implementation MUST reject a duplicate rather than silently replace the prior offset.
+```text
+physical_offset(n) = 0x40 + n * MAX_FRAME_SIZE
+```
 
-Normal hot-path lookup MUST use the maintained index and MUST NOT linearly scan the blob. The index-supplied `frame_quanta` is a location hint, not trusted frame truth; the reader MUST validate it against the located Master Trailer and archive mode before trusting the frame.
+Recovery MAY partition slot ranges across threads/nodes without first walking earlier frames.
 
-If an index is missing, stale, fails integrity validation, or lacks a manifest-referenced candidate, the reader MUST:
+Every slot's Prefix MUST still confirm:
 
-1. mark it unavailable rather than trust partial results;
-2. degrade the affected lookup to bounded blob/grid scanning;
-3. initiate a rebuild in the background or before the next performance-critical operation;
-4. atomically publish the rebuilt checkpoint only after validation.
+```text
+frame_quanta == max_frame_quanta
+```
 
-The fallback may be slow but MUST remain functionally correct. Failure of this derived index is not data corruption by itself.
+## 11.4 Logical reconstruction
 
-For new writes, the durability order is frame bytes, index entry/checkpoint update, then manifest reference (§12.1). If a crash nevertheless leaves an incomplete index update, scan-and-rebuild restores it. Compaction MUST generate and validate all new-generation offset indexes before root switch (§13.4).
+For DATA frames, recovery uses `object_id`, `logical_offset`, and `logical_length` from self-describing metadata.
 
-FIXED mode does not remove this requirement. FIXED geometry makes the address of a **known slot number** O(1) and makes full recovery scans parallelizable, but a manifest `loc` deliberately contains no slot number or physical offset; lookup by hash therefore remains index-assisted.
+Frames MAY be discovered in arbitrary physical order.
 
-### 10.4 Sharding and `LINK_MANIFEST`
+A recovery implementation MAY create a 4 KiB logical map and mark the quanta covered by each recovered extent. For example a 4 MiB logical extent covers 1024 Logical Recovery Quanta.
 
-`LINK_MANIFEST` MAY reference an independently operated sub-manifest. Each target MUST be independently verifiable by its declared algorithm and digest. Canonical schema:
+Discovery order is irrelevant; logical placement is authoritative.
+
+## 11.5 PACKED recovery
+
+PACKED frames are reconstructed by reverse-parsing and validating the Pre-Trailer, then mapping each entry using its packed-buffer `inner_offset` / `inner_length` metadata.
+
+## 11.6 Parity recovery
+
+Parity groups are reconstructed from frame-local `group_id`, `group_index`, `group_k`, and `group_m` metadata. Manifest presence is not required to discover group membership.
+
+## 11.7 Encrypted recovery
+
+The stored AEAD nonce is authoritative for decryption.
+
+Recovery MUST read the nonce directly from:
+
+```text
+nonce[12] || ciphertext || tag[16]
+```
+
+It MUST NOT derive or guess the decryption nonce from the frame's **current** physical location, because compaction is permitted to byte-copy ciphertext to a different generation/blob/offset.
+
+---
+
+# 12. Concurrency and Writer Allocation
+
+Data writers MAY operate concurrently across blobs.
+
+Within one blob, physical extent allocation MUST be serialized so two writers cannot claim overlapping frame regions.
+
+VARIABLE mode allocator advances by the just-committed `frame_size`.
+
+FIXED mode allocator advances by `MAX_FRAME_SIZE`.
+
+Manifest commits remain a separate serialization domain.
+
+`frame_ordinal` allocation is writer-local to one `(generation_id, blob_ordinal)` namespace. A cold-start writer MAY discover the next ordinal by scanning/rebuilding blob state once, then keep the next value in memory. This is analogous to generation-ID discovery and does not require a global archive lock.
+
+---
+
+# 13. Compaction / Garbage Collection
+
+Compaction remains:
+
+```text
+Mark -> Sweep -> Freeze/Merge -> Switch -> GC
+```
+
+## 13.1 Global Mark
+
+Mark liveness over the complete manifest graph reachable from the root, not just the sub-manifest that triggered compaction.
+
+Logical multi-frame files and parity groups are integrity units and MUST NOT be partially forgotten by scoped liveness analysis.
+
+## 13.2 Sweep
+
+Write a new generation. Never modify active-generation blob files in place.
+
+Compaction MAY change:
+
+- current `generation_id`;
+- current `blob_ordinal`;
+- current `physical_offset`;
+- current physical ordering.
+
+Byte-copy compaction MUST preserve:
+
+- stored payload bytes;
+- ciphertext nonce and tag;
+- `hash_payload`;
+- object/logical placement metadata;
+- frame's immutable creation metadata;
+- parity metadata;
+- `frame_quanta`.
+
+In VARIABLE mode a normal byte-copy Sweep MUST NOT resize a frame. Resizing/repacking is a rewrite operation, not opaque compaction.
+
+## 13.3 Encrypted opaque-copy invariant
+
+Encrypted frames MUST be copied byte-for-byte during normal Sweep.
+
+The new current physical location has no effect on the stored nonce.
+
+A compactor MUST NOT decrypt/re-encrypt a live frame for the purpose of relocation, nonce refresh, dedup optimization, or physical reordering.
+
+## 13.4 Concurrent writes
+
+Writes occurring after the Mark snapshot MUST be captured in a delta manifest or protected during the final Freeze/Merge/Switch interval by an appropriate lock/lease.
+
+No writer may commit against the old root after the new root becomes authoritative.
+
+## 13.5 Switch
+
+The destination generation, manifest, and physical indices MUST be fully written, verified, and durable before the root pointer is atomically switched.
+
+Old generations remain intact until the switch is durable.
+
+## 13.6 Parity groups during compaction
+
+If any live member of a parity group is copied, the complete required group MUST be present in the new generation before Switch.
+
+The destination MUST preserve equal `frame_quanta` across group members and the multi-blob spread requirement.
+
+## 13.7 Multi-frame logical object integrity
+
+All live sibling extents of a logical object version MUST be verified in the destination before the old generation containing the only remaining copy of a required extent is deleted.
+
+If a required extent cannot be found or verified, the generation is **GC-blocked** rather than silently deleted.
+
+## 13.8 Emergency Pruning and parity impact
+
+Emergency Pruning is an explicit operator-authorized data-loss escape hatch for a permanently GC-blocked generation.
+
+Before deletion, the implementation MUST perform **Parity Impact Analysis** over every parity group touched by any frame that will be lost.
+
+Each affected parity group MUST be classified as:
+
+- **HEALTHY** — required protection level still intact;
+- **DEGRADED** — data remains reconstructable but redundancy is below the configured target;
+- **UNRECOVERABLE** — one or more protected logical data extents can no longer be reconstructed.
+
+Emergency Pruning MUST:
+
+1. durably record an `EMERGENCY_PRUNE` event with generation, affected blobs/frames, operator reason, and timestamp;
+2. mark every directly incomplete logical object `DEGRADED` or `UNRECOVERABLE`;
+3. record every parity group whose protection level changes;
+4. create/schedule parity rebuild for repairable surviving groups, or explicitly mark them `UNPROTECTED/DEGRADED` until repair completes;
+5. prevent the active manifest/health metadata from claiming original parity protection while the group is degraded;
+6. only then permit deletion of the blocked old generation.
+
+Emergency Pruning MUST NOT be used merely because a healthy resource is temporarily unreachable.
+
+---
+
+# 14. Legacy Compatibility
+
+R8 wire version is `0x0006`.
+
+Readers MUST dispatch on Archive Header `version` and MUST NOT parse older layouts using R8 structures.
+
+At minimum:
+
+- `0x0002` — R1/R2 family;
+- `0x0003` — R3/R4/R5 family;
+- `0x0004` — R6 development wire layout;
+- `0x0005` — R7;
+- `0x0006` — R8.
+
+R8-only implementations MUST reject unsupported versions rather than guess.
+
+Legacy v1.21 `.sf` and `SUB` syntax remains migration-only and is not valid R8 syntax.
+
+---
+
+# 15. Encryption — Normative R8 Enterprise Profile
+
+R8 defines one encryption algorithm: AES-256-GCM. Encryption is optional at the archive/profile level; when enabled, the following construction is normative.
+
+## 15.1 Archive DEK
+
+An encrypted STASH archive uses one cryptographically random 32-byte archive data-encryption key:
+
+```text
+archive_DEK = 32 bytes
+```
+
+The archive DEK MUST remain fixed for the lifetime of the encrypted archive. It MUST NOT be embedded in blobs, Frame Prefixes, Pre-Trailers, or Master Trailers.
+
+A deployment MAY store a wrapped copy and key identifier in protected archive metadata or an external KMS-backed configuration.
+
+## 15.2 Domain-separated AEAD keys
+
+Three independent 256-bit keys are derived using HKDF-SHA-256:
+
+```text
+salt = archive_id[32]
+IKM  = archive_DEK
+```
+
+Exact derivations:
+
+```text
+frame_aead_key =
+    HKDF-SHA256(
+        IKM  = archive_DEK,
+        salt = archive_id,
+        info = ASCII("STASH-FRAME-AEAD-R8"),
+        L    = 32
+    )
+
+pretrailer_aead_key =
+    HKDF-SHA256(
+        IKM  = archive_DEK,
+        salt = archive_id,
+        info = ASCII("STASH-PRETRAILER-AEAD-R8"),
+        L    = 32
+    )
+
+manifest_aead_key =
+    HKDF-SHA256(
+        IKM  = archive_DEK,
+        salt = archive_id,
+        info = ASCII("STASH-MANIFEST-AEAD-R8"),
+        L    = 32
+    )
+```
+
+The quoted `info` strings are exact ASCII bytes without a trailing NUL. The three keys MUST NOT be collapsed into one key.
+
+## 15.3 AES-256-GCM stored representation
+
+```text
+algorithm = AES-256-GCM
+nonce     = 12 bytes
+tag       = 16 bytes
+```
+
+Stored payload representation:
+
+```text
+payload_ciphertext = nonce[12] || ciphertext || tag[16]
+```
+
+Stored encrypted Pre-Trailer representation:
+
+```text
+pre_trailer_ciphertext = nonce[12] || ciphertext || tag[16]
+```
+
+Encrypted manifest fields similarly store `nonce || ciphertext || tag` inside the encoded manifest representation.
+
+Payload, Pre-Trailer, and manifest use their respective independently derived AEAD keys. `hash_payload` covers the complete stored encrypted payload representation including nonce and tag.
+
+## 15.4 Frame AAD
+
+R8 frame payload and encrypted Pre-Trailer AEAD bind only stable bytes that are available from the frame itself after manifest loss and remain unchanged during byte-preserving compaction.
+
+Canonical AAD is:
+
+```text
+archive_id[32]
+|| uint16_le(version)              // MUST be 0x0006
+|| frame_prefix_magic[4]           // exact bytes, normally "STFR"
+|| uint32_le(frame_quanta)         // validated Prefix value
+|| uint32_le(frame_prefix_flags)
+|| master_trailer_bytes[0x00:0x40] // first 64 bytes, ending immediately before hash_payload
+```
+
+`master_trailer_bytes[0x00:0x40]` includes the trailer magic, algorithm IDs, block type/flags, parity metadata, `data_len`, redundant `frame_quanta`, `object_id`, `logical_offset`, `logical_length`, and `frame_ordinal`. It deliberately excludes `hash_payload`, because `hash_payload` is calculated over the completed stored payload representation and including it in payload AAD would create a circular dependency.
+
+The Frame Prefix CRC32C itself is not included in AAD; its covered semantic fields are already included explicitly.
+
+The same canonical frame AAD is used with the separately derived `frame_aead_key` and `pretrailer_aead_key`. Key separation prevents the two AEAD domains from collapsing even though their stable AAD bytes are equal.
+
+A byte-preserving compactor MUST retain all AAD-covered frame metadata unchanged. Destination generation, destination blob ordinal, and destination physical offset are intentionally absent from AAD.
+
+## 15.5 Collision-free numeric nonce construction
+
+R8 removes BLAKE3-based/truncated-hash nonce derivation entirely.
+
+For encrypted archives only, implementations MUST enforce before encryption:
+
+```text
+generation_id <= 0xFFFFFFFF
+frame_ordinal <= 0x00FFFFFFFFFFFFFF
+```
+
+The physical fields remain uint64. Exceeding the encrypted-profile limit MUST fail before a new encryption operation is attempted.
+
+### 15.5.1 Frame payload nonce
+
+For every newly encrypted frame:
+
+```text
+payload_nonce =
+    uint32_le(generation_id)
+    || uint8(blob_ordinal)
+    || uint56_le(frame_ordinal)
+```
+
+Exact size:
+
+```text
+4 + 1 + 7 = 12 bytes
+```
+
+`uint56_le(x)` means the low seven bytes of the canonical little-endian unsigned representation, and is valid only after the bound above has been checked.
+
+### 15.5.2 Pre-Trailer nonce
+
+The Pre-Trailer uses the identical numeric nonce representation:
+
+```text
+pretrailer_nonce =
+    uint32_le(generation_id)
+    || uint8(blob_ordinal)
+    || uint56_le(frame_ordinal)
+```
+
+Reusing the numeric nonce bytes here is safe because Pre-Trailer and payload use different independently derived AEAD keys.
+
+### 15.5.3 Manifest nonce
+
+For every newly encrypted manifest record:
+
+```text
+manifest_nonce =
+    uint32_le(generation_id)
+    || uint64_le(seq)
+```
+
+Exact size:
+
+```text
+4 + 8 = 12 bytes
+```
+
+### 15.5.4 Nonce uniqueness invariant
+
+Under one derived AEAD key:
+
+- `generation_id` MUST never be reused;
+- `frame_ordinal` MUST never be reused within one `(generation_id, blob_ordinal)` namespace;
+- manifest `seq` MUST remain unique within its generation;
+- any wraparound or attempted reuse is fatal.
+
+The construction is injective inside the permitted R8 encrypted namespaces and does not rely on probabilistic collision resistance.
+
+Stored nonces remain part of the ciphertext representation. Readers MUST use the stored nonce for decryption.
+
+## 15.6 Compaction and encrypted frame identity
+
+A copied frame is not a new encryption operation.
+
+Normal compaction MUST preserve byte-for-byte:
+
+```text
+nonce
+ciphertext
+tag
+hash_payload
+frame_ordinal
+origin frame identity/AAD metadata
+```
+
+Current destination `generation_id`, `blob_ordinal`, and `physical_offset` may change, but MUST NOT be used to recompute a nonce or replace authenticated origin identity.
+
+A compactor MUST NOT decrypt/re-encrypt a live frame merely for relocation, nonce refresh, physical reordering, or dedup optimization.
+
+## 15.7 Encrypted manifest records
+
+Sensitive path/version-bearing records use an encrypted envelope such as:
 
 ```json
-{"seq":42,"ts":1739551000,"op":"LINK_MANIFEST","path":"submanifests/user-data.jsonl","hash_id":1,"hash":"8f2c3a5e...64 hex chars...","lines":50000}
+{"seq":105,"ts":1739550123,"op":"ADD_ENC","enc":"<base64(nonce || ciphertext || tag)>"}
 ```
 
-`path`, `hash_id`, `hash`, and `lines` are required. A sub-manifest is an operational scaling boundary, not a frame-geometry boundary. `LINK_MANIFEST` MUST NOT substitute for transactional extents of one object.
+Equivalent encrypted envelopes apply to DEL and transactional ADD records when sensitive fields are present.
+
+Manifest AAD canonically binds:
+
+```text
+archive_id[32]
+|| uint16_le(version)              // 0x0006
+|| uint32_le(generation_id)
+|| uint64_le(seq)
+|| uint32_le(op_len)
+|| exact UTF-8 op bytes
+```
+
+An AAD mismatch is tampering and MUST be rejected.
+
+## 15.8 Key rotation
+
+### KEK/KMS rotation
+
+A deployment MAY rotate the KEK/KMS key by unwrapping and rewrapping the unchanged archive DEK:
+
+```text
+old KEK
+    ↓ unwrap
+archive DEK
+    ↓ rewrap
+new KEK
+```
+
+This does not modify STASH frames and does not require a new archive.
+
+### Archive DEK rotation
+
+The archive DEK is immutable for the lifetime of an encrypted STASH archive. Changing it requires a new archive plus an explicit decrypt/migrate/re-encrypt operation.
+
+Normal compaction MUST NOT rotate the archive DEK and MUST continue to copy encrypted live frames byte-for-byte.
+
+## 15.9 Encryption and self-describing recovery
+
+Without keys, recovery can still obtain frame boundaries, `frame_quanta`, physical frame size, block type, payload hash, and plaintext parity metadata. Plaintext object path/version and encrypted Pre-Trailer mappings require the relevant key.
+
+With keys, recovery reads the nonce directly from the stored `nonce || ciphertext || tag` representation. It MUST NOT derive a decryption nonce from the frame's current physical location.
+
+## 15.10 Encryption and deduplication
+
+R8 distinguishes logical/content identity from ciphertext identity. Standard R8 encryption does not guarantee that identical plaintext written independently produces identical ciphertext.
+
+Convergent/content-derived encryption and cross-tenant plaintext deduplication are outside R8.
 
 ---
 
-## 11. Normal Access and Disaster Recovery
+# 16. Resource-Exhaustion Hardening and Normative Invariants
 
-### 11.1 Normal indexed access
+## 16.1 General untrusted-input rule
 
-For a manifest `loc`, a normal reader MUST:
+> No untrusted on-disk value may directly cause unbounded memory allocation, recursion, goroutine/task creation, or uncontrolled work amplification before applicable wire and implementation ceilings have been validated.
 
-1. select the declared `blob_ordinal`;
-2. query its generation-bound offset index by `frame_hash`;
-3. inspect each candidate record without assuming the hash is physically unique;
-4. locate the candidate trailer using indexed `(physical_offset, frame_quanta)`;
-5. perform complete §6.3 validation;
-6. require object/packed identity and logical/inner placement to match the manifest tuple;
-7. return the unique valid match or report corruption/ambiguity.
+Readers MUST enforce bounded processing for at least:
 
-The expected lookup complexity is O(1) for a hash index or O(log N) for a sorted/tree index, plus the size of a genuine equal-hash candidate bucket. A missing or invalid index triggers §10.3 degradation and rebuild.
+- frame size;
+- Pre-Trailer size;
+- PACKED entry count;
+- path length;
+- manifest record size;
+- pending manifest transaction state;
+- recovery concurrency;
+- physical-index rebuild concurrency.
 
-### 11.2 Raw physical discovery
-
-Recovery begins by validating `prefix_crc32c` for every available 64-byte blob prefix, followed by reserved-zero validation and grouping on `(archive_id, generation_id, blob_ordinal)`. It never depends on Blob 0, generation-directory names, or canonical blob filenames. Conflicting archive/generation groups MUST remain separate recovery candidates and MUST NOT be silently merged.
-
-#### FIXED mode
-
-Candidate slot starts are known independently:
+Existing R8 wire/production ceilings include:
 
 ```text
-frame_start(n) = FRAME_REGION_START + n × MAX_FRAME_SIZE
+blob_count <= 255
+MAX_PACKED_ENTRIES = 65535
+path_len <= 4096
+manifest line <= 1 MiB
+parity_k + parity_m <= 256
+production MAX_FRAME_SIZE <= 64 MiB by default
 ```
 
-Slots MAY be read and validated in parallel across the entire blob. Each trailer MUST report `frame_quanta == MAX_FRAME_QUANTA`. A non-zero remainder after the last complete slot is a truncated/uncommitted tail and MUST NOT be treated as a valid frame.
+Archive-scale collections MUST be streamable rather than requiring archive-sized in-memory slices.
 
-#### VARIABLE mode
-
-Because `frame_quanta` is stored in the trailer at an unknown frame end, a raw scanner probes trailer positions on quantum boundaries. For every integer `q >= 1` whose candidate end is within the blob:
+Checked arithmetic is mandatory for all externally influenced:
 
 ```text
-candidate_end           = FRAME_REGION_START + q × BASE_QUANTUM
-candidate_trailer_start = candidate_end - MASTER_TRAILER_SIZE
+offset + length
+size multiplication
+frame end
+logical range end
+index range
+Pre-Trailer boundaries
 ```
 
-If the 96-byte candidate lacks R7 magic or fails `trailer_crc32c`, advance to the next quantum boundary. Only after that checksum succeeds may the scanner parse `frame_quanta`—still without allocating the claimed frame—and compute:
+Unsigned overflow MUST fail closed.
 
-```text
-candidate_size  = frame_quanta × BASE_QUANTUM
-candidate_start = candidate_end - candidate_size
-```
+## 16.2 Geometry
 
-The candidate is accepted only if all of the following hold:
+A conformant R8 implementation MUST preserve:
 
-- `1 <= frame_quanta <= MAX_FRAME_QUANTA`;
-- `candidate_start >= FRAME_REGION_START`;
-- `(candidate_start - FRAME_REGION_START) mod BASE_QUANTUM == 0`;
-- the full frame lies within the blob and passes every available §6.3 check; with keys this includes Pre-Trailer AEAD and block-type metadata consistency, while without keys the frame is classified only as physically/hash valid with opaque metadata;
-- its physical range does not conflict with another independently validated frame range.
+- `ARCHIVE_HEADER_SIZE == 64` and `FRAME_AREA_START == 0x40`;
+- `FRAME_PREFIX_SIZE == 16`;
+- `MASTER_TRAILER_SIZE == 96`;
+- `BASE_QUANTUM == 4096`;
+- `1 <= frame_quanta <= max_frame_quanta`;
+- `frame_size == frame_quanta * BASE_QUANTUM` using checked arithmetic;
+- in FIXED mode, `frame_quanta == max_frame_quanta` for every frame;
+- in VARIABLE mode, frame start/end are quantum aligned;
+- `frame_size_mode` is immutable for the archive lifetime;
+- new archives SHOULD default to VARIABLE unless FIXED is explicitly selected.
 
-This boundary scan is not a chain: corruption of one frame does not prevent discovery of later frames. Implementations MAY batch large range reads (for example 4 MiB), examine the contained 4 KiB boundary candidates in memory, and fetch/assemble complete frames only after a trailer candidate passes structural checks.
+## 16.3 Immutability and logical placement
 
-A trailer magic match alone is never sufficient. No frame-sized allocation may occur before `frame_quanta` has passed the archive and implementation ceilings.
+- A committed frame is never modified in place.
+- Size-changing edits append replacement frame(s) and atomically update manifest state.
+- Non-packed DATA carries non-zero `object_id`, explicit `logical_offset`, and `logical_length`.
+- Logical reconstruction depends on logical placement, not physical discovery order or JSON array order.
+- Packed `inner_offset` semantics are never confused with non-packed `logical_offset` semantics.
+- Conflicting overlapping live extents are corruption unless explicitly resolved by version semantics.
+- `object_id` remains path/version derived and is intentionally not rename-stable.
 
-### 11.3 Logical reconstruction
+## 16.4 Manifest and physical index
 
-For every accepted frame:
+- Manifest commits are serialized by `seq` and never reference undurable frames.
+- Huge mappings use bounded transactional `ADD_BEGIN` / batched `ADD_EXTENT` / `ADD_COMMIT`.
+- Incomplete transactions are ignored after crash.
+- The per-generation `frame_hash -> physical_offset` index is mandatory for the normal hot path, is rebuildable from raw scan, and is not load-bearing for correctness.
+- Missing/corrupt index state degrades to bounded scan/rebuild rather than data loss.
 
-- verify `hash_payload` over exact stored payload bytes;
-- bucket group members by `group_id` and validate identical group geometry;
-- for DATA, map `(object_id, logical_offset, logical_length)` onto the Logical Recovery Grid;
-- for PACKED, authenticate/verify its Pre-Trailer, decompress the packed buffer, and recover each entry by `inner_off`/`inner_len`;
-- when keys are available, validate `object_id` against decoded `(canonical_path, file_ver)` and emit recovered ADD candidates;
-- when keys are unavailable, retain non-packed object IDs, ranges, hashes, and parity identity, but do not invent plaintext paths or versions.
+## 16.5 Parity
 
-Within each object, frames are ordered solely by `logical_offset`. Physical order, discovery order, blob order, JSON order, `frame_ordinal`, and physical frame size are irrelevant to logical placement. Implementations MAY materialize a 4 KiB in-memory recovery map; frames remain whole on wire and on disk.
+- R8 parity IDs are only NONE, XOR, and Reed-Solomon.
+- Every parity group is self-describing.
+- Group members have identical `frame_quanta`.
+- Active parity spans at least two blobs.
+- Emergency Pruning performs parity-impact analysis and never silently claims lost redundancy is intact.
 
-### 11.4 Conflict, overlap, and completeness
+## 16.6 Integrity
 
-Two validated frames claiming overlapping logical ranges for the same `object_id` are `CORRUPTION / CONFLICT` unless they are exact idempotent duplicates or belong to separately identifiable committed versions. Recovery MUST NOT choose one based on discovery order or higher physical offset.
+- Frame Prefix CRC32C is validated before trusting `frame_quanta`.
+- The mandatory Pre-Trailer CRC32C binds `pre_trailer_len` and the complete Master Trailer bytes before either metadata region is trusted.
+- `hash_payload` verifies the exact stored payload representation.
+- AEAD verifies encrypted representations.
+- Detection alone never implies repair.
 
-When plaintext metadata is available, any `object_id` collision across distinct `(path, file_ver)` pairs is a hard ID-collision error. Gaps produce an incomplete/degraded object, never silent zero filling unless a future sparse-object profile explicitly defines it.
+## 16.7 Encryption
 
-### 11.5 Parity-assisted recovery
-
-After raw bucketing, the reader MAY reconstruct missing/corrupted group members when at least the scheme-required number of valid equal-sized members remains. A reconstructed frame MUST pass the same payload and metadata validation as an originally present frame before it contributes to a logical object. Group membership is derived from trailer fields; a manifest `PARITY_GROUP` record is optional and non-authoritative.
+- AES-256-GCM nonce is exactly 12 bytes and tag exactly 16 bytes.
+- Payload, Pre-Trailer, and manifest use separately derived HKDF-SHA-256 keys.
+- Encrypted-archive `generation_id` and `frame_ordinal` limits are enforced before encryption.
+- Numeric nonce layouts are exact and injective in the permitted namespaces.
+- Stored nonce is authoritative for decryption.
+- Byte-preserving compaction preserves nonce/ciphertext/tag/hash/frame_ordinal.
+- Any nonce namespace reuse or wraparound is fatal.
+- Archive DEK rotation requires migration to a new archive; ordinary KEK rewrap does not.
 
 ---
 
-## 12. Reference Implementation — Go
+# 17. Required R8 Wire Conformance Harness and Test Matrix
 
-Recommended dependencies:
+The R8 required test matrix is part of the specification and is not optional implementation guidance.
+
+## 17.1 Independent golden vectors
+
+The reference implementation MUST include independently constructed golden vectors for:
+
+```text
+64-byte Archive Header
+16-byte Frame Prefix
+96-byte Master Trailer
+plaintext Pre-Trailer
+encrypted representation
+minimum valid frame
+representative VARIABLE frame
+representative FIXED frame
+```
+
+Golden vectors MUST NOT be generated by the production encoder under test.
+
+Required forms:
+
+```text
+structured value -> encoder -> exact golden bytes
+exact golden bytes -> decoder -> exact structured value
+encoder -> decoder round trip
+```
+
+Encoder correctness MUST therefore not rely solely on `Encode(x) -> Decode() -> x`, because encoder and decoder could share the same defect.
+
+For fixed structures, sentinel values SHOULD make byte ordering visually unambiguous, for example `0x11223344` and `0x0102030405060708`.
+
+## 17.2 Exhaustive metadata-corruption tests
+
+For the 16-byte Frame Prefix, flip every individual bit without recomputing its CRC32C and require rejection before altered Prefix fields are trusted.
+
+For the 96-byte Master Trailer, flip every individual bit without recomputing the mandatory Pre-Trailer CRC32C that binds the trailer and require rejection before altered trailer fields are trusted.
+
+The minimal zero-entry Pre-Trailer case MUST be included so trailer-integrity testing does not depend on PACKED metadata being present.
+
+## 17.3 Decoder fuzzing
+
+All untrusted binary and manifest decoders MUST be fuzz-tested. For arbitrary input they MUST:
+
+```text
+never panic
+never read outside validated bounds
+never cause unbounded allocation
+never cause uncontrolled concurrency
+return either a validated value or an error
+```
+
+## 17.4 Arithmetic boundaries
+
+Tests MUST include:
+
+```text
+0
+maximum valid value
+maximum valid value + 1
+MaxUint32
+MaxUint64
+overflowing additions
+overflowing multiplications
+truncated buffers
+```
+
+## 17.5 Geometry and recovery
+
+Required cases include:
+
+- minimum 4 KiB frame;
+- representative mixed VARIABLE sizes;
+- `MAX_FRAME_SIZE`;
+- `MAX_FRAME_SIZE + BASE_QUANTUM` rejection;
+- FIXED `frame_quanta != max_frame_quanta` rejection;
+- local VARIABLE insert/resize with unaffected following frames remaining byte-identical where possible;
+- MAX-size repartition into multiple grid-aligned immutable frames;
+- arbitrary physical discovery order reconstructing the same logical object;
+- overlapping live logical ranges producing corruption/conflict;
+- missing physical index degrading to scan and rebuilding the same mapping;
+- raw recovery with deleted manifest/index.
+
+## 17.6 Manifest and crash durability
+
+Verify:
+
+- batched `ADD_EXTENT` up to the manifest-line ceiling;
+- incomplete transaction ignored after crash;
+- group commit does not require one fsync per extent record;
+- frame durability precedes committed manifest reference;
+- crash injection at frame write, blob flush, manifest append, manifest flush, compaction Sweep, root Switch, and GC deletion boundaries.
+
+## 17.7 Compression
+
+Tests MUST verify exact logical round-trip for:
+
+```text
+STORE
+ZSTD_FAST
+ZSTD_DEFAULT
+ZSTD_DENSE
+```
+
+Unknown compression IDs MUST fail closed. Every ZSTD payload MUST decode independently. Malformed/truncated streams and declared-output-limit violations MUST fail closed.
+
+## 17.8 Parity
+
+Tests MUST verify:
+
+```text
+NONE
+XOR
+Reed-Solomon
+```
+
+and reject every reserved parity identifier. Equal member physical size and multi-blob spread invariants MUST be tested. Emergency Pruning tests MUST verify parity health is downgraded/rebuilt explicitly rather than silently lost.
+
+## 17.9 Cryptography
+
+Tests MUST verify:
+
+- HKDF-SHA-256 golden vectors for all three derived keys;
+- exact numeric frame/pretrailer/manifest nonce byte layouts;
+- nonce uniqueness across blob ordinals, frame ordinals, generations, and manifest `seq` values;
+- rejection at encrypted-profile numeric limits before new encryption;
+- tag tampering rejection;
+- AAD tampering rejection;
+- stored nonce tampering rejection;
+- byte-identical encrypted compaction across multiple generations;
+- recovery after compaction using stored nonce rather than current physical position;
+- KEK rewrap leaves STASH frame bytes unchanged;
+- archive-DEK change is rejected as an in-place operation.
+
+## 17.10 Hash and integrity separation
+
+Tests MUST verify both BLAKE3 and SHA-256, reject every reserved hash identifier, and demonstrate that CRC/hash/AEAD detection does not cause repair unless an actual parity/copy recovery source exists.
+
+---
+
+# 18. Reference Implementation Notes — Go
+
+Recommended packages:
 
 | Function | Package |
 |---|---|
-| BLAKE3 | `zeebo/blake3` or equivalent |
 | SHA-256 | `crypto/sha256` |
-| SHA3-256 | `crypto/sha3` |
-| Zstd/LZ4/Brotli | `klauspost/compress` |
-| Reed-Solomon | `klauspost/reedsolomon` |
-| CRC32C | Go `hash/crc32` with Castagnoli |
-| Binary encoding | `encoding/binary` |
-
-The reference implementation SHOULD reuse bounded buffers, validate untrusted quanta before pooling/allocation, avoid exposing unsealed PACKED frames, serialize each blob's append allocator, serialize manifest commits, maintain one offset index per blob, and benchmark parity on target hardware.
-
-### 12.1 Durability ordering
-
-A manifest MUST NOT reference a frame before the complete frame and its normal-path index entry are durable. Required order:
-
-```text
-write all required immutable frames
-→ flush/fsync affected blob(s)
-→ append/update affected offset-index checkpoints
-→ flush/fsync index state
-→ append ADD or ADD_BEGIN / ADD_EXTENT batch(es) / ADD_COMMIT
-→ flush/fsync manifest at the commit boundary
-→ report commit
-```
-
-For object storage, each arrow means the provider's equivalent durable publication primitive. Index failure after a crash still degrades safely to scan/rebuild, but a conformant writer MUST follow this order during normal commit.
-
-Intermediate ADD_EXTENT lines are not individual commit points and MUST NOT force one `fsync` each. The transaction becomes authoritative only after a valid durable ADD_COMMIT. Recovery discards a transaction lacking that boundary.
-
----
-
-## 13. Compaction / Garbage Collection
-
-Compaction uses Mark → Sweep → Freeze/Merge → Index → Switch. It creates `generation_id + 1`; it MUST NOT reuse an older generation ID or change any Archive Header property, especially `frame_size_mode` or `MAX_FRAME_SIZE`.
-
-Before copying frames, the compactor MUST write each destination blob's CRC-valid prefix with the new containing `generation_id` and its unique destination `blob_ordinal`. The generation metadata/root prepared for publication MUST contain the same identity.
-
-### 13.1 Mark
-
-Mark resolves liveness against the complete manifest graph reachable from the root: the root manifest and every reachable LINK_MANIFEST target. A sub-manifest-triggered run MUST NOT use only local references. It must also close over two dependency sets:
-
-- every DATA/PACKED/PARITY member of a live parity group;
-- every extent of a live multi-frame `object_id`.
-
-### 13.2 Sweep and immutable identity
-
-Live frames are copied into new blob files; old blobs are never modified. Compaction MUST preserve stored payload, `hash_payload`, `object_id`, logical placement, block type, group identity, physical frame size, and archive mode. It may change generation, physical offset, and—subject to the rules below—physical blob assignment.
-
-Frames SHOULD be copied byte-for-byte. For encrypted archives, a normal Sweep MUST copy the **entire frame byte-for-byte**, including payload ciphertext, encrypted Pre-Trailer representation, stored nonces, tags, trailer, and `frame_ordinal`. It MUST NOT decrypt/re-encrypt, refresh nonces, recompress, repack, or derive a nonce from the destination position.
-
-If encrypted byte-preserving copies from different source blobs would create duplicate `frame_ordinal` values in one destination blob, the compactor MUST preserve the source `blob_ordinal` or choose another destination blob. It MUST NOT solve the collision by rewriting the copied trailer. Newly created frames in the destination generation start above the maximum copied ordinal for that destination blob.
-
-### 13.3 Concurrent writes during Sweep
-
-Writes after the Mark snapshot MUST be identifiable as a manifest tail. The implementation MUST use either:
-
-**Delta manifest:** writers append to a delta while Sweep runs; Freeze stops commits briefly, drains the delta, merges it, validates every resulting loc, writes final manifest/index state, and switches atomically.
-
-**Manifest lock:** writers continue during Sweep but an exclusive local/distributed lock covers the complete Freeze/Merge/Index/Switch interval so no commit can target the old root after the new root becomes authoritative.
-
-### 13.4 Index and root switch
-
-Before switch, the new generation MUST have:
-
-- complete validated blobs;
-- a complete manifest and reachable sub-manifests;
-- a validated per-blob offset index bound to the new `generation_id` and final blob lengths;
-- verified object coverage and parity-group invariants.
-
-Recommended layout:
-
-```text
-root.current
-  → generation-00000000000000000042/
-       manifest.jsonl
-       frames/
-       indexes/
-```
-
-After all content and indexes are durable, atomically replace `root.current`. The old generation remains intact until the switch is confirmed durable.
-
-### 13.5 Crash cases
-
-- Crash during Sweep/Merge/Index: old generation remains authoritative.
-- Crash before root switch: old generation remains authoritative.
-- Crash after root switch but before old deletion: new generation is authoritative; old generation is garbage.
-- Crash during garbage deletion: restart deletion; do not roll back the root.
-
-### 13.6 Parity and multi-frame integrity
-
-If one live DATA or PACKED member of a parity group is copied, every DATA, PACKED, and PARITY member with that `group_id` MUST enter the same new generation. Equal `frame_quanta`, unique `group_index`, and the cross-blob spread rule MUST be revalidated.
-
-Every extent referenced by one committed multi-frame `object_id` is an indivisible Mark/Sweep unit. The old generation MUST NOT be deleted until every sibling extent is present, hash-verified, indexable, and durable in the new generation. Parity membership and logical-object membership compose; both closures must be complete.
-
-### 13.7 Emergency Pruning
-
-If a required sibling remains missing or inaccessible after normal retry/recovery, mark the object or generation **GC-BLOCKED** and expose the exact missing references. Emergency Pruning is an explicit audited data-loss escape hatch, not successful compaction.
-
-Before deletion, Parity Impact Analysis MUST classify every affected group:
-
-- **HEALTHY** — full membership and configured recovery tolerance remain intact;
-- **UNPROTECTED** — required data is presently readable or reconstructable, but original membership/recovery tolerance is no longer intact; a durable repair task is mandatory;
-- **UNRECOVERABLE** — surviving members cannot reconstruct required protected data.
-
-An Emergency Pruning operation MUST:
-
-1. durably record `generation_id`, affected blobs/frames/objects/groups, pre/post health, timestamp, and operator reason;
-2. finish parity and logical-object impact analysis before physical deletion;
-3. mark every affected logical object DEGRADED or UNRECOVERABLE when a referenced extent is missing/unverifiable;
-4. persist every UNPROTECTED group in a repair queue/state;
-5. never advertise original protection until successful repair restores it;
-6. update the active manifest health state before deleting the old generation;
-7. surface integrity failure rather than return a silently truncated object;
-8. refuse Emergency Pruning when the only issue is temporary access to otherwise healthy storage.
-
----
-
-## 14. Legacy v1.21
-
-v1.21 standalone `.sf` files and SUB records are not valid 2.0 syntax.
-
-Migration tooling MAY read v1.21 and produce a valid 2.0 archive.
-
----
-
-## 15. Out of Scope and Encryption Profile
-
-The base profile does not require desktop/edge behavior, tape-specific optimization, sub-block/CDC deduplication, automatic conflict resolution, or implementation-specific KMS APIs. Encryption below is a normative interoperable enterprise profile.
-
-### 15.1 Protected and visible fields
-
-When Archive Header `archive_flags & 0x0001 != 0`, encryption MUST protect payload bytes, paths, versions, and the complete plaintext Pre-Trailer body. Plaintext manifest ADD/DEL/extent records carrying sensitive metadata are forbidden. When the bit is zero, encrypted frame/manifest representations are not valid in the base profile.
-
-The complete 64-byte blob prefix (including `generation_id`, `blob_ordinal`, and `prefix_crc32c`), 96-byte Master Trailer (including `trailer_crc32c`), `pre_trailer_len`, and offset-index placement hints remain visible. Consequently a keyless scanner can classify detached blobs by archive/generation/ordinal and discover and checksum frame geometry, block type, `object_id`, logical range, `frame_ordinal`, payload hash, and parity membership, but cannot recover plaintext paths/versions or PACKED entry maps.
-
-### 15.2 AEAD and stored representation
-
-The reference construction is AES-256-GCM with a fixed 12-byte nonce and 16-byte tag:
-
-```text
-stored_encrypted_representation = nonce[12] || ciphertext || tag[16]
-```
-
-The payload `data_len` includes all three components and `hash_payload` covers the complete stored representation. The encrypted Pre-Trailer body uses the same representation shape under a separate key domain; `pre_trailer_len` is its exact stored length.
-
-Frame payload, Pre-Trailer, and manifest use independently derived AEAD keys with labels:
-
-```text
-STASH-FRAME-V2
-STASH-PRETRAILER-V2
-STASH-MANIFEST-V2
-```
-
-These key domains MUST NOT be collapsed.
-
-### 15.3 Frame and Pre-Trailer nonce construction
-
-For a newly encrypted frame payload:
-
-```text
-payload_nonce = first_12_bytes(
-    BLAKE3(
-        "STASH-FRAME-NONCE-V2" ||
-        archive_id[32] ||
-        uint64_le(generation_id) ||
-        uint8(blob_ordinal) ||
-        uint64_le(frame_ordinal)
-    )
-)
-```
-
-For its encrypted Pre-Trailer body:
-
-```text
-pre_trailer_nonce = first_12_bytes(
-    BLAKE3(
-        "STASH-PRETRAILER-NONCE-V2" ||
-        archive_id[32] ||
-        uint64_le(generation_id) ||
-        uint8(blob_ordinal) ||
-        uint64_le(frame_ordinal)
-    )
-)
-```
-
-The quoted labels are exact ASCII bytes without a terminator. BLAKE3 is used for nonce derivation regardless of archive `hash_id`.
-
-For a given derived AEAD key, no nonce may ever be used for two encryption operations. `generation_id` MUST never be reused under the same archive DEK, and a writer MUST never reuse a `frame_ordinal` in one `(generation_id, blob_ordinal)` namespace. Cold-start ordinal discovery is defined in §6.1.3.
-
-The nonce is stored with each ciphertext. Readers MUST parse the stored nonce and MUST NOT guess or rederive it from current physical position. A reader MAY recompute an expected nonce when the creation namespace is known, but mismatch is validation failure; successful decryption never depends on such recomputation.
-
-Byte-for-byte copying an existing ciphertext during compaction is permitted and required by §13.2; it is not a new encryption operation. The destination MUST retain the stored nonce, ciphertext, and tag unchanged.
-
-### 15.4 Frame AEAD Additional Authenticated Data
-
-Both payload and Pre-Trailer authentication MUST bind immutable visible placement metadata. Canonical frame AAD is the concatenation:
-
-```text
-"STASH-FRAME-AAD-V1" ||
-archive_id[32] ||
-uint16_le(version) ||
-uint8(hash_id) || uint8(codec_id) || uint8(block_type) ||
-uint8(group_index) || uint32_le(group_id) ||
-uint32_le(frame_quanta) || object_id[16] ||
-uint64_le(logical_offset) || uint64_le(logical_length) ||
-uint64_le(frame_ordinal)
-```
-
-Payload AEAD uses that sequence prefixed by exact ASCII `"PAYLOAD"`; Pre-Trailer AEAD uses it prefixed by `"PRETRAILER"`. `data_len`, `hash_payload`, and `trailer_crc32c` are excluded to avoid circular construction. Any authenticated-field mismatch is corruption.
-
-After Pre-Trailer decryption, the reader MUST verify its CRC32C and metadata padding before parsing entries. AEAD success does not waive structural validation.
-
-### 15.5 Envelope encryption
-
-```text
-KEK / KMS key
-  → wrapped archive DEK
-  → domain-separated payload / Pre-Trailer / manifest keys
-```
-
-The wrapped DEK and key identifier are protected deployment metadata and MUST NOT be embedded in the fixed 96-byte Master Trailer.
-
-### 15.6 Encrypted manifest records
-
-A sensitive manifest operation uses an outer record containing only sequence, encrypted operation type, and ciphertext:
-
-```json
-{"seq":123,"op":"ADD_ENC","enc":"<base64(nonce || ciphertext || tag)>"}
-```
-
-ADD, DEL, ADD_BEGIN, ADD_EXTENT, and ADD_COMMIT have corresponding encrypted operation names (`ADD_ENC`, `DEL_ENC`, `ADD_BEGIN_ENC`, `ADD_EXTENT_ENC`, `ADD_COMMIT_ENC`). The decrypted canonical JSON object contains every field that would follow `op` in the plaintext form, including `transaction_id` and `object_id` when applicable.
-
-Manifest AAD is:
-
-```text
-uint64_le(seq) ||
-uint16_le(op_utf8_length) || op_utf8
-```
-
-`transaction_id` remains inside the AEAD plaintext and is therefore authenticated without creating a circular dependency during decryption. A mismatch between outer `seq`/`op` and the supplied AAD MUST fail.
-
-### 15.7 Manifest nonce domain
-
-Manifest records use the `STASH-MANIFEST-V2` key and:
-
-```text
-manifest_nonce = first_12_bytes(
-    BLAKE3(
-        "STASH-MANIFEST-NONCE-V2" ||
-        archive_id[32] ||
-        uint64_le(generation_id) ||
-        uint64_le(seq)
-    )
-)
-```
-
-`seq` is unique within the generation and `generation_id` is never reused under the DEK, so the namespace remains unique across compaction. The nonce is included in `enc`; no sidecar counter is required.
-
-### 15.8 Encryption, recovery, deduplication, and compaction
-
-Without keys, R7 remains physically discoverable, payload-hash-verifiable, parity-group-recoverable, and non-packed logical-range-recoverable by opaque `object_id`; plaintext naming and PACKED extraction remain unavailable.
-
-Because `hash_payload` covers ciphertext, deduplication requires identical stored ciphertext. Independent creation namespaces produce different nonces and normally different ciphertext for equal plaintext. The base encryption profile therefore does not provide convergent cross-writer deduplication. Any convergent profile requires separate security analysis and MUST NOT reuse this nonce namespace.
-
-Compaction MUST NOT decrypt/re-encrypt or nonce-refresh live frames. It copies the complete encrypted frame byte-for-byte as required by §13.2.
-
----
-
-## 16. Normative Invariants
-
-A conformant R7 implementation MUST preserve every invariant below.
-
-### 16.1 Prefix, Header, generation, and mode
-
-- Every blob has a CRC-valid 64-byte prefix: the immutable 48-byte Archive Header at `0x00`, `generation_id` at `0x30`, `blob_ordinal` at `0x38`, three zero reserved bytes at `0x39`, and little-endian `prefix_crc32c` at `0x3C`.
-- `prefix_crc32c` covers all 64 prefix bytes with its own field treated as zero and is validated before any prefix field is trusted.
-- All blobs selected for a generation agree on the immutable Header, `archive_id`, and `generation_id`; their in-range `blob_ordinal` values are unique and agree with normal metadata/filename bindings.
-- The first possible frame byte is `FRAME_REGION_START = 0x40`.
-- `version == 0x0005`; older layouts are parsed only by explicit version dispatch.
-- `frame_size_mode`, `archive_flags`, `MAX_FRAME_SIZE`, archive parameters, and `archive_id` are immutable across the archive lifetime and all generations; unknown flag bits are rejected.
-- `generation_id` is monotonic, unique under the archive key, stored in every blob prefix, and never reused.
-
-### 16.2 Geometry and allocation
-
-- `frame_size = frame_quanta × 4096`, with `1 <= frame_quanta <= MAX_FRAME_QUANTA`.
-- VARIABLE frames may differ in size; FIXED frames always report `MAX_FRAME_QUANTA`.
-- No allocation derived from untrusted size occurs before header/trailer ceilings are validated.
-- `data_len + zero_padding + pre_trailer_len + 4 + 96 == frame_size` exactly.
-- Payload padding and metadata padding are zero; the stored Pre-Trailer start is 8-byte aligned.
-- FIXED slot arithmetic addresses known slot numbers; hash lookup still uses the mandatory index.
-
-### 16.3 Identity, placement, and recovery
-
-- Every non-packed DATA frame carries non-zero `object_id`, aligned `logical_offset`, positive `logical_length`, and matching sole Pre-Trailer metadata.
-- PACKED and PARITY trailer placement fields are zero; PACKED placement exists only per entry.
-- `object_id` is the 16-byte domain-separated digest of canonical path and `file_ver`; rename and version change produce new IDs.
-- Physical order, JSON order, blob order, `frame_ordinal`, and frame size never determine logical order.
-- Non-identical overlapping claims are detected and never resolved by discovery order.
-- A true byte insert/delete cannot retain stale absolute offsets in shifted frames.
-
-### 16.4 Integrity, packing, and parity
-
-- `hash_payload` covers exact stored payload bytes, including stored payload nonce/tag when encrypted, and excludes padding and trailers.
-- `trailer_crc32c` covers all 96 Master Trailer bytes with its own field treated as zero and is validated before any trailer field is trusted.
-- Pre-Trailer AEAD/CRC32C is verified before metadata is trusted.
-- Canonical codec parameters are documented for every enabled writer codec.
-- PACKED entries are canonical-path sorted; a single oversized candidate fails fast into the multi-frame path.
-- Every parity member self-describes `group_id`/`group_index`; group positions are unique and all members have identical `frame_quanta`.
-- Active parity requires at least two blobs, valid non-zero `k/m` with `k + m <= 256`, and the group spread invariant; no-parity archives encode `k = m = 0`.
-
-### 16.5 Manifest and index
-
-- Manifest commits are serialized with strictly increasing `seq`.
-- `loc` contains no physical offset and agrees with validated frame metadata.
-- A line never exceeds 1 MiB; oversized lines are rejected without unbounded buffering.
-- Large extent transactions carry consistent `transaction_id`, `object_id`, contiguous `extent_sequence` and `extent_index`, and become visible only at valid ADD_COMMIT.
-- Every active blob has a generation-bound, integrity-protected, rebuildable, multi-value offset index.
-- Normal lookup uses the index; index loss degrades to scan and rebuild without changing logical correctness.
-- Frames and index state are durable before the manifest can reference them.
-
-### 16.6 Concurrency, compaction, and pruning
-
-- One append allocator serializes physical extent allocation per blob; distinct blobs may write concurrently.
-- Compaction never modifies the active generation, changes size mode, splits a live parity group/object, or switches before new indexes are valid.
-- Encrypted frames are copied byte-for-byte; no decrypt/re-encrypt or nonce refresh occurs.
-- Root switch is atomic; the old generation remains authoritative until durable switch.
-- Emergency Pruning is audited, parity-aware, and preserves explicit HEALTHY/UNPROTECTED/UNRECOVERABLE state.
-
-### 16.7 Cryptography
-
-- Payload, Pre-Trailer, and manifest use distinct key and nonce domains.
-- Every new encryption operation has a unique 12-byte nonce under its derived key.
-- Frame nonces use `(archive_id, generation_id, blob_ordinal, frame_ordinal)`; manifest nonces use `(archive_id, generation_id, seq)`.
-- Nonces are stored with ciphertext and are never inferred from current physical position during recovery.
-- Frame AAD binds visible immutable identity/placement fields; manifest AAD canonically binds outer `seq` and `op`, while `transaction_id` is authenticated inside the ciphertext.
-- Without keys, encrypted archives remain physically and parity recoverable and expose opaque non-packed ranges, but not plaintext naming or PACKED entry maps.
-
----
-
-## 17. Production Readiness Checklist
-
-- [ ] Complete-prefix CRC coverage, Header equality, generation/ordinal binding, encryption/unknown-flag dispatch, three-byte reserved prefix, `0x40` frame start, and R7 version dispatch are tested.
-- [ ] VARIABLE geometry validates 4 KiB through `MAX_FRAME_SIZE`, rejects zero, non-grid, overflow, and above-max values.
-- [ ] FIXED readers reject any `frame_quanta != MAX_FRAME_QUANTA`.
-- [ ] Exact payload-budget arithmetic is checked on write and read, including encrypted overhead.
-- [ ] Master Trailer CRC is calculated with bytes `0x34..0x37` logically zero and is verified before trailer-derived allocation or placement.
-- [ ] Metadata padding makes stored Pre-Trailer placement 8-byte aligned and is CRC/AEAD protected.
-- [ ] Allocation ceilings are enforced before frame-sized buffers are created.
-- [ ] DATA, PACKED, and PARITY block-type zero/non-zero field rules are tested.
-- [ ] `object_id` derivation, version changes, rename changes, and collision handling are tested.
-- [ ] Multi-frame reconstruction succeeds for arbitrary manifest and discovery order.
-- [ ] Overlap, gap, overflow, stale-offset, and trailer/manifest disagreement fail closed.
-- [ ] PACKED works in both modes; FIXED PACKED frames occupy full `MAX_FRAME_SIZE` slots.
-- [ ] Last non-packed fragments use shorter `logical_length` with valid physical padding.
-- [ ] Parity groups reject mixed `frame_quanta` and duplicate/out-of-range `group_index`.
-- [ ] Header parity parameters reject invalid zero/non-zero combinations, `k + m > 256`, and XOR with `m != 1`.
-- [ ] Per-blob indexes preserve equal-hash candidate buckets, reject stale generation/blob binding, and rebuild after deletion/corruption.
-- [ ] Normal access performs no linear hot-path blob scan.
-- [ ] FIXED recovery parallelizes independent slots; VARIABLE recovery finds later frames after a corrupted predecessor.
-- [ ] ADD_EXTENT batching stays below 1 MiB and validates both sequence/count dimensions at commit.
-- [ ] Crash injection covers frame flush, index publication, every extent stage, manifest commit, compaction index build, and root switch.
-- [ ] Blob allocators and manifest serialization are race-tested under sustained concurrency.
-- [ ] Compaction preserves mode, object placement, parity closure, and all live extents.
-- [ ] Encrypted compaction produces byte-identical complete frames before and after Sweep.
-- [ ] Frame/Pre-Trailer/manifest nonce derivation is deterministic, domain-separated, stored, and collision-tested across generations.
-- [ ] AAD tampering of any bound placement or manifest field is rejected.
-- [ ] Key-loss tests document the boundary between opaque frame recovery and plaintext path/PACKED recovery.
-- [ ] Emergency Pruning tests persist collateral HEALTHY/UNPROTECTED/UNRECOVERABLE outcomes and repair work.
-
----
-
-## 18. Required R7 Test Matrix
-
-### 18.1 Geometry
-
-Prefix vectors MUST flip every Header byte, every byte of `generation_id`, `blob_ordinal`, each reserved byte, and the stored Prefix CRC without recomputation; each mutation is rejected before the altered field is trusted. Additional vectors MUST reject duplicate ordinals, out-of-range ordinals, mixed-generation blob sets, and metadata/filename bindings that disagree with a CRC-valid prefix. Trailer vectors MUST flip each field class and the stored trailer CRC without recomputation; each mutation is rejected before the altered field is trusted. A quantum-boundary false `STSH` magic with invalid trailer CRC MUST be skipped rather than accepted as a frame.
-
-For a VARIABLE archive whose `MAX_FRAME_SIZE >= 4196 KiB`, accept:
-
-| Physical size            | `frame_quanta`         | Result                                |
-|-------------------------:|-----------------------:|---------------------------------------|
-| 4 KiB                    | 1                      | valid if payload/metadata budget fits |
-| 8 KiB                    | 2                      | valid                                 |
-| 100 KiB                  | 25                     | valid                                 |
-| 4096 KiB                 | 1024                   | valid traditional 4 MiB boundary      |
-| 4196 KiB                 | 1049                   | valid                                 |
-| `MAX_FRAME_SIZE`         | `MAX_FRAME_QUANTA`     | valid                                 |
-| `MAX_FRAME_SIZE + 4 KiB` | `MAX_FRAME_QUANTA + 1` | corruption                            |
-
-For FIXED mode, validate `frame_start(n) = 0x40 + n × MAX_FRAME_SIZE` and reject every trailer reporting any other quantum count. Verify a last logical fragment shorter than capacity with the remainder zero-padded.
-
-### 18.2 Packing and payload budget
-
-- Run PACKED vectors in VARIABLE and FIXED modes with incompressible and highly compressible inputs.
-- Verify `object_id/logical_offset/logical_length == 0` in the PACKED trailer.
-- Verify a single file that cannot fit at `MAX_FRAME_SIZE` exits packing once and enters the non-packed path.
-- Flip each metadata-padding and payload-padding byte and require rejection.
-
-### 18.3 Object identity and logical placement
-
-- Same canonical path and version produces the same 16-byte object ID.
-- Changing only `file_ver` changes it.
-- Renaming only the path changes it and requires new self-describing placement.
-- Discover frames in order C, A, D, B and reconstruct in logical order A, B, C, D.
-- Make two different frames claim one overlapping range and require `CORRUPTION / CONFLICT`.
-- Test a same-length localized replacement separately from an insert that shifts every following absolute offset; stale later offsets MUST be rejected.
-
-### 18.4 Index and recovery
-
-- Remove all generation-directory and canonical blob filenames, present detached blobs in shuffled order, and recover their exact archive/generation/ordinal grouping solely from CRC-valid prefixes.
-- Map one hash to two physical candidates with different object placement and resolve the correct loc without dropping either candidate.
-- Delete, truncate, corrupt, and stale-bind an index; each case degrades to scan, rebuilds, and returns the same logical bytes.
-- In VARIABLE mode, corrupt one frame trailer and verify quantum-boundary scanning still discovers later valid frames.
-- In FIXED mode, scan slots in shuffled parallel order and obtain identical recovery output.
-
-### 18.5 Manifest transactions
-
-- Crash after ADD_BEGIN and after arbitrary ADD_EXTENT batches: no object becomes visible.
-- Omit or duplicate one `extent_sequence` or `extent_index`: commit is rejected.
-- Mismatch `object_id`, `extent_count`, or `extent_record_count`: commit is rejected.
-- Complete all records plus durable ADD_COMMIT: the object becomes visible atomically.
-
-### 18.6 Parity, compaction, and crypto
-
-- Reject a parity group whose members have different physical sizes.
-- Compact generation 0 → 1 → 2 and verify immutable archive mode, incremented CRC-valid prefix generation identity, unique destination ordinals, logical placement, group closure, and valid new indexes.
-- For encryption, compare every pre/post-compaction frame byte and require identity.
-- Verify that destination prefixes identify the new containing generation while copied frames retain stored nonces and decrypt without reconstructing their historical creation namespace.
-- Verify stored nonce parsing and rejection of payload, Pre-Trailer, frame-AAD, manifest-AAD, and tag tampering.
-- Restart a writer, discover both `max(generation_id)` from valid prefixes and `max(frame_ordinal)` within the active generation, allocate the next values, and verify no nonce tuple reuse.
-- Emergency-prune one protected member and verify the exact resulting HEALTHY, UNPROTECTED, or UNRECOVERABLE state.
-
----
-
-## 19. Terminology
-
-| Deprecated or ambiguous term | R7 term |
-|---|---|
-| fixed frame size (unqualified) | `frame_size_mode = FIXED` |
-| variable block | Grid-Aligned Variable Frame |
-| `BLOCK_STRIDE` | `frame_size` for one extent; `MAX_FRAME_SIZE` for FIXED slot stride |
-| frame size class | `max_frame_size_class` |
-| frame position | `physical_offset` |
-| frame index | FIXED slot number, only when explicitly meant |
-| frame creation counter | `frame_ordinal` |
-| file offset | `logical_offset` |
-| file fragment length | `logical_length` |
-| packed offset/length | `inner_off` / `inner_len` |
-| 4 KiB chunks | Logical Recovery Quanta or Physical Grid Quanta, as context requires |
-| split frame | logical repartition / Copy-on-Write rewrite |
-| hash-to-offset cache | mandatory rebuildable per-blob offset index |
-
----
-
-## 20. Reference Product Architecture
-
-This section defines the official R7 implementation shape, not additional wire fields. The Go library is the authoritative implementation of format semantics. The CLI and FUSE driver are thin clients and MUST NOT independently parse or serialize Headers, frames, manifests, indexes, parity metadata, or encryption representations.
-
-### 20.1 Go library
-
-The public API operates on logical archives, objects, transactions, verification, and maintenance. Wire structs and binary codecs SHOULD remain implementation-internal (for example under `internal/wire`) so callers cannot construct partially valid frames.
-
-The following is the intended compact API surface; exact names and option structs belong to separate API documentation:
-
-```go
-func Create(ctx context.Context, backend Backend, opts CreateOptions) (*Archive, error)
-func Open(ctx context.Context, backend Backend, opts OpenOptions) (*Archive, error)
-
-func (a *Archive) Begin(ctx context.Context) (Transaction, error)
-func (a *Archive) OpenObject(ctx context.Context, path string, opts OpenObjectOptions) (ObjectReader, error)
-func (a *Archive) List(ctx context.Context, prefix string, opts ListOptions) (ObjectIterator, error)
-func (a *Archive) Stat(ctx context.Context, path string) (ObjectInfo, error)
-func (a *Archive) Verify(ctx context.Context, opts VerifyOptions) (VerifyReport, error)
-func (a *Archive) Recover(ctx context.Context, opts RecoverOptions) (RecoveryReport, error)
-func (a *Archive) RebuildIndexes(ctx context.Context, opts IndexOptions) error
-func (a *Archive) Compact(ctx context.Context, opts CompactOptions) (CompactReport, error)
-
-type Transaction interface {
-    Put(ctx context.Context, path string, src io.Reader, opts PutOptions) error
-    Delete(ctx context.Context, path string) error
-    Rename(ctx context.Context, oldPath, newPath string) error
-    Commit(ctx context.Context) error
-    Abort(ctx context.Context) error
-}
-
-type ObjectReader interface {
-    io.Reader
-    io.ReaderAt
-    io.Closer
-}
-```
-
-Enumeration is streaming/iterative rather than an archive-sized in-memory slice. Long-running verify, recovery, index, and compaction options SHOULD likewise expose progress/cancellation hooks through `context.Context` and callbacks/channels defined by the API package.
-
-`Transaction.Rename` implements the R7 §9.2 new-object semantics; it is not a metadata-only stable-UUID alias. The library owns canonical-path validation, Copy-on-Write, frame/index/manifest durability ordering, crash recovery, compaction, encryption, and parity enforcement.
-
-Storage access SHOULD be abstracted behind small backend interfaces for blob I/O, generation/root metadata, index/manifest persistence, and key retrieval. Local files and object storage must exercise the same format engine and conformance tests.
-
-### 20.2 CLI client
-
-The reference executable is `stash`. Archive-creation parameters are accepted only by `create`; immutable Header properties cannot be changed later.
+| AES-256-GCM | `crypto/aes` + `crypto/cipher` |
+| HKDF-SHA-256 | `crypto/hkdf` |
+| CRC32C | `hash/crc32` Castagnoli |
+| Binary little-endian encoding | `encoding/binary` |
+| BLAKE3 | `zeebo/blake3` or equivalent |
+| Zstandard | `klauspost/compress/zstd` or equivalent |
+| Reed-Solomon | `klauspost/reedsolomon` or equivalent |
+
+BASELINE and SECURE payload/compression/AEAD paths do not require Zstandard and do not use BLAKE3 as `hash_payload`. However, the unchanged §6.5 `object_id` derivation still uses BLAKE3, so a full R8 writer retains that dependency. FAST additionally uses BLAKE3 for `hash_payload` and Zstandard for payload compression.
+
+Implementation guidance:
+
+- validate Header and Frame Prefix before frame-sized allocation;
+- pool bounded buffers, never buffers sized directly from unvalidated media values;
+- serialize physical extent allocation per blob while allowing independent blob writers;
+- maintain a single logical manifest commit ordering;
+- batch manifest fsyncs at transaction durability boundaries;
+- maintain/rebuild physical offset indexes;
+- never mutate committed frames;
+- treat encrypted frame bodies as opaque during ordinary compaction;
+- verify parity-group physical-size compatibility before parity encode/decode;
+- stream archive-scale scans and indexes;
+- bound recovery/index-rebuild goroutine counts;
+- use checked arithmetic helpers for all media-derived offsets/sizes;
+- benchmark VARIABLE recovery scan and FIXED direct-slot recovery separately.
+
+## 18.1 Planned CLI creation parameters
+
+Recommended creation surface:
 
 ```text
 stash create ARCHIVE
+    --profile baseline|secure|fast
     --mode variable|fixed
     --max-frame-size SIZE
-    --hash blake3|sha256|sha3-256
-    --codec store|lz4|zstd|lzma|brotli
     --blobs N
     --parity none|xor|rs
     [--parity-k K --parity-m M]
-    [--encrypt --key-provider NAME]
+    [--key-provider NAME]
 ```
 
-Minimum command set:
+Advanced explicit creation parameters MAY expose:
 
-| Command | Purpose / principal parameters |
-|---|---|
-| `stash add ARCHIVE SOURCE... [--dest PATH]` | Append files through one library transaction |
-| `stash remove ARCHIVE PATH...` | Append DEL operations through one library transaction |
-| `stash rename ARCHIVE OLD_PATH NEW_PATH` | Apply R7 new-object rename semantics through the library |
-| `stash extract ARCHIVE [PATH...] --output DIR` | Extract selected or all objects |
-| `stash list ARCHIVE [PREFIX] [--json]` | List current logical state |
-| `stash stat ARCHIVE PATH [--json]` | Show object/version/extent metadata |
-| `stash verify ARCHIVE [--full] [--workers N] [--json]` | Validate structure or all payload/parity content |
-| `stash recover ARCHIVE --output DIR [--rebuild-manifest]` | Run raw recovery without trusting normal metadata |
-| `stash index rebuild ARCHIVE [--blob N]` | Persist rebuilt per-blob offset indexes |
-| `stash compact ARCHIVE [--workers N]` | Run Mark/Sweep/Freeze/Merge/Index/Switch |
-| `stash gc status ARCHIVE [--json]` | Report blocked objects/groups and repair state |
-| `stash gc emergency-prune ARCHIVE --reason TEXT --confirm-data-loss` | Explicit audited emergency path; MUST fail without both parameters |
-| `stash mount ARCHIVE MOUNTPOINT [--generation ID]` | Invoke the mandatory read-only FUSE adapter |
+```text
+--hash blake3|sha256
+--codec store|zstd-fast|zstd-default|zstd-dense
+```
 
-Common read/maintenance commands MAY accept `--generation`, `--workers`, `--json`, and `--key-provider` where meaningful. CLI output formatting and argument parsing are not wire-format semantics.
-
-### 20.3 Read-only FUSE driver
-
-The official R7 FUSE profile is permanently **read-only**. It is an archive-view adapter, not a general writable POSIX filesystem.
-
-Normative behavior:
-
-- `stash mount` MUST request the kernel's read-only mount mode and exposes no writable override;
-- the mount pins one validated `generation_id` for its complete lifetime, providing a stable snapshot even if compaction later switches the archive root;
-- lookup, attribute reads, directory enumeration, open, `read`/`ReaderAt`, release, access checks, and read-only filesystem statistics are served exclusively through the Go library API;
-- directories are synthesized from canonical object paths; empty directories have no independent R7 representation;
-- create, write, truncate, unlink, rename, link, symlink, mkdir, rmdir, ownership/mode mutation, and xattr mutation MUST return `EROFS`;
-- the driver MUST NOT modify blobs, manifests, persistent indexes, generations, or root metadata;
-- when a persistent index is missing/corrupt, the driver MAY use an in-memory scan-built index for the pinned mount; persistent repair is performed explicitly through `stash index rebuild` or the Go maintenance API;
-- CLI and FUSE code MUST NOT import implementation-internal wire packages or duplicate recovery logic.
-
-Hardlinks, symlinks, writable memory mappings, mutable POSIX metadata, and write-back caching are outside the final R7 FUSE profile.
+A profile is a preset and is not stored as a separate wire identifier.
 
 ---
-## License
 
-🌀 STASH is open-source software licensed under the [MIT License](LICENSE).
+# 19. R8 Production Readiness Checklist
 
-**Author:** © 2025-2026 Zbigniew Lipka  
+- [ ] Every blob Archive Header is exactly 64 bytes and begins with `STSH`.
+- [ ] Header wire version is `0x0006`.
+- [ ] All headers in one generation agree on generation and immutable archive parameters.
+- [ ] Version dispatch recognizes `0x0002`, `0x0003`, reserved development `0x0004`, R7 `0x0005`, and R8 `0x0006` correctly.
+- [ ] `frame_size_mode` cannot change through compaction or generation switch.
+- [ ] `BASE_QUANTUM` is exactly 4096 bytes.
+- [ ] VARIABLE frame boundaries remain 4KiB aligned across mixed sizes.
+- [ ] FIXED frames all equal `MAX_FRAME_SIZE` and reject mismatched `frame_quanta` as corruption.
+- [ ] Frame Prefix CRC catches corrupted extent metadata before large allocation.
+- [ ] Mandatory Pre-Trailer CRC catches corruption of `pre_trailer_len` and every Master Trailer bit before those fields are trusted.
+- [ ] Prefix/Trailer `frame_quanta` mismatch is rejected.
+- [ ] `data_len` physical-budget equation is checked exactly with overflow-safe arithmetic.
+- [ ] `object_id` changes on rename by design.
+- [ ] PACKED and non-packed offset semantics are never mixed.
+- [ ] Logical reconstruction is independent of manifest-list/physical discovery order.
+- [ ] Localized VARIABLE edits leave unrelated following frames unchanged where possible.
+- [ ] No committed frame is ever modified in place.
+- [ ] Very large extent sets use batched transactional `ADD_EXTENT` records.
+- [ ] Manifest durability uses group commit, not one fsync per extent.
+- [ ] Incomplete ADD transaction is ignored after crash.
+- [ ] Per-generation physical offset index is maintained, rebuildable, and non-load-bearing for correctness.
+- [ ] Parity algorithms are only NONE/XOR/Reed-Solomon and reserved IDs fail closed.
+- [ ] Parity groups use equal `frame_quanta` and are recoverable without manifest.
+- [ ] Emergency Pruning performs parity-impact analysis.
+- [ ] Hash algorithms are only SHA-256/BLAKE3 and reserved IDs fail closed.
+- [ ] Compression profiles are only STORE/ZSTD_FAST/ZSTD_DEFAULT/ZSTD_DENSE and reserved IDs fail closed.
+- [ ] Every ZSTD payload is independently decodable and bounded by declared logical output limits.
+- [ ] BASELINE, SECURE, and FAST named profiles are supported by the Go reference implementation.
+- [ ] AES-GCM stored nonce is 12 bytes and tag is 16 bytes.
+- [ ] HKDF-SHA-256 derives three distinct exact-label 32-byte keys.
+- [ ] Encrypted `generation_id` and `frame_ordinal` ceilings are enforced before encryption.
+- [ ] Exact numeric nonce layouts match golden vectors.
+- [ ] Nonce namespace reuse/wrap is fatal.
+- [ ] Encrypted compaction preserves nonce/ciphertext/tag/hash/frame_ordinal byte-for-byte.
+- [ ] Disaster recovery reads stored nonce rather than deriving from current placement.
+- [ ] KEK rotation rewraps the unchanged DEK without changing STASH frames.
+- [ ] Archive DEK cannot be rotated in place.
+- [ ] FIXED Hop-and-Read supports direct slot arithmetic; VARIABLE Hop-and-Read advances from validated `frame_quanta`.
+- [ ] All media-derived sizes/offsets are validated before allocation or concurrency creation.
+- [ ] Archive-scale collections are processed streaming rather than materialized as unbounded slices.
+- [ ] Golden vectors are independently constructed rather than emitted by the production encoder.
+- [ ] Every bit in Frame Prefix and Master Trailer corruption tests is rejected by the applicable CRC binding.
+- [ ] Binary decoders and manifest parsers pass fuzzing without panic/OOB/unbounded allocation/uncontrolled concurrency.
+- [ ] Crash injection passes all required durability and compaction boundaries.
+
+---
+
+# 20. Summary of R8 Wire and Semantic Changes
+
+R8 retains the R7 physical structures and storage capabilities but changes current wire semantics sufficiently to require version `0x0006`.
+
+Version dispatch:
+
+```text
+0x0002 = R1/R2
+0x0003 = R3-R5
+0x0004 = reserved R6 development layout
+0x0005 = R7
+0x0006 = R8
+```
+
+Physical layout retained from R7:
+
+```text
+Archive Header   64 bytes
+Frame Prefix     16 bytes
+Master Trailer   96 bytes
+BASE_QUANTUM     4096 bytes
+```
+
+No physical field is added or removed by R8.
+
+R8 changes:
+
+1. current wire version becomes `0x0006`;
+2. hash surface is reduced to SHA-256 and BLAKE3;
+3. compression surface becomes STORE plus three exact Zstandard strength profiles (1/3/9);
+4. parity surface becomes NONE/XOR/Reed-Solomon only;
+5. named BASELINE, SECURE, and FAST deployment/interoperability profiles are defined without adding a `profile_id` field;
+6. detection is explicitly separated from repair;
+7. VARIABLE remains the normal/default enterprise geometry and FIXED remains deterministic direct-slot geometry;
+8. archive encryption uses AES-256-GCM with exact HKDF-SHA-256 key separation;
+9. nonce creation changes from truncated-hash derivation to an injective 4+1+7 numeric frame namespace and 4+8 manifest namespace;
+10. encrypted namespace bounds are explicit and fail before encryption;
+11. stored nonce remains authoritative after byte-preserving compaction;
+12. KEK rewrap is allowed while archive DEK rotation requires migration to a new archive;
+13. untrusted-media resource-exhaustion and checked-arithmetic requirements are normative;
+14. wire golden vectors, exhaustive metadata corruption tests, decoder fuzzing, arithmetic boundaries, crash injection, crypto vectors, parity tests, and compression tests are required;
+15. the existing Pre-Trailer CRC32C scope is strengthened to bind the complete 96-byte Master Trailer without changing physical layout.
+
+## 20.1 Explicitly unchanged in R8
+
+R8 MUST NOT alter:
+
+```text
+64-byte Archive Header size
+16-byte Frame Prefix size
+96-byte Master Trailer size
+4096-byte base quantum
+VARIABLE / FIXED geometry
+DATA / PACKED / PARITY block types
+Pre-Trailer physical layout
+object_id model
+logical placement model
+manifest transaction model
+mandatory rebuildable offset indexes
+raw recovery algorithm
+generation model
+append-only semantics
+compaction model
+read-only FUSE policy
+```
+
+No new compression algorithms, hash algorithms, parity algorithms, frame modes, encryption algorithms, filesystem semantics, IAM/RBAC model, network protocol, recovery UI, or ransomware-vault protocol belong in R8.
+
+## 20.2 Final R8 algorithm surface
+
+```text
+HASH
+    SHA-256
+    BLAKE3
+
+COMPRESSION
+    STORE
+    ZSTD_FAST     level 1
+    ZSTD_DEFAULT  level 3
+    ZSTD_DENSE    level 9
+
+PARITY
+    NONE
+    XOR
+    REED-SOLOMON
+
+ENCRYPTION
+    NONE
+    AES-256-GCM
+
+KDF
+    HKDF-SHA-256
+```
+
+Named profiles:
+
+```text
+BASELINE
+    SHA-256
+    STORE
+    NONE
+
+SECURE
+    SHA-256
+    STORE
+    AES-256-GCM
+
+FAST
+    BLAKE3
+    ZSTD_FAST
+    NONE
+```
+
+# 21. README / Public Specification Requirements
+
+README material describing R8 MUST state:
+
+```text
+STASH 2.0 Revision R8
+wire version 0x0006
+```
+
+Core Design SHOULD call out the deliberately narrow algorithm surface:
+
+- SHA-256/BLAKE3 hashing;
+- STORE/Zstandard compression;
+- XOR/Reed-Solomon parity;
+- AES-256-GCM authenticated encryption.
+
+It MUST include the statement:
+
+> **Checksums and hashes detect corruption; redundancy repairs it.**
+
+It SHOULD present the named profile summary:
+
+```text
+BASELINE  SHA-256 / STORE     / no encryption
+SECURE    SHA-256 / STORE     / AES-256-GCM
+FAST      BLAKE3  / ZSTD_FAST / no encryption
+```
+
+It MUST describe:
+
+```text
+VARIABLE = normal/default enterprise mode
+FIXED    = deterministic slot geometry / maximum recovery parallelism
+```
+
+It MUST state that the R8 required test matrix is part of the specification and is not optional implementation guidance.
+
+# 22. Freeze
+
+> **STASH 2.0 R8 / wire 0x0006 is FROZEN.**
+
+The next milestone is not R9. The next milestone is:
+
+```text
+Go reference implementation
+    ↓
+R8 wire conformance harness
+    ↓
+golden vectors
+    ↓
+fuzzing
+    ↓
+crash injection
+    ↓
+raw recovery torture tests
+    ↓
+performance benchmarks
+```
+
+Further wire-format revisions require evidence from the reference implementation or conformance testing. Speculative feature additions are not sufficient reason to change the format.
