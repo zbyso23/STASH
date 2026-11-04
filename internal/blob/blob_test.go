@@ -2,6 +2,7 @@ package blob
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -155,16 +156,22 @@ func TestCrashDuringCreate(t *testing.T) {
 	}
 }
 
-// committedSet models the manifest: offsets of frames whose commit was
-// reported durable.
-type committedSet map[int64]bool
+// committedSet models the manifest: frames (by offset, for assertions)
+// whose commit was reported durable.
+type committedSet map[int64]FrameKey
 
 func (s committedSet) c() Committed {
-	hi := int64(-1)
-	for off := range s {
-		hi = max(hi, off)
+	refs := map[FrameKey]struct{}{}
+	for _, k := range s {
+		refs[k] = struct{}{}
 	}
-	return Committed{HighestOffset: hi}
+	return Committed{Refs: refs}
+}
+
+// keyOf is the key a manifest loc would use for the frame built from s.
+func keyOf(s *frame.Spec) FrameKey {
+	e := s.Entries[0]
+	return FrameKey{Hash: sha256.Sum256(s.Payload), Path: e.Path, FileVer: e.FileVer, Offset: e.Offset}
 }
 
 // Synced frames survive any crash under the tear model; the unsynced tail is
@@ -179,11 +186,12 @@ func TestCrashTornTail(t *testing.T) {
 		committed := committedSet{}
 		var order []int64
 		for i := 0; i < 1+rng.Intn(4); i++ {
-			off, _, err := w.Append(spec(i, rng.Intn(20000)))
+			sp := spec(i, rng.Intn(20000))
+			off, _, err := w.Append(sp)
 			if err != nil {
 				t.Fatal(err)
 			}
-			committed[off] = true
+			committed[off] = keyOf(sp)
 			order = append(order, off)
 		}
 		w.Sync()
@@ -263,9 +271,9 @@ func TestOutOfOrderPersistence(t *testing.T) {
 	for _, refX := range []bool{false, true} {
 		c, offs := blobWith(t, h, a, b, x)
 		damage(t, c, offs[1]+5000) // inside b's payload: hash fails
-		ref := committedSet{offs[0]: true}
+		ref := committedSet{offs[0]: keyOf(spec(0, 100))}
 		if refX {
-			ref[offs[2]] = true
+			ref[offs[2]] = keyOf(spec(2, 100))
 		}
 		w, res, err := OpenWriter(c, "frames/blob-00.stash", h, nil, ref.c())
 		if len(res.Tail) != 1 || res.Tail[0].Offset != offs[2] {
@@ -298,7 +306,8 @@ func TestTailGroupReference(t *testing.T) {
 	d := build(t, h, spec(2, 100))
 	c, offs := blobWith(t, h, a, d, x)
 	damage(t, c, offs[1]+20)
-	cm := Committed{HighestOffset: offs[0], GroupReferenced: func(g uint32) bool { return g == 42 }}
+	cm := committedSet{offs[0]: keyOf(spec(0, 100))}.c()
+	cm.GroupReferenced = func(g uint32) bool { return g == 42 }
 	if _, _, err := OpenWriter(c, "frames/blob-00.stash", h, nil, cm); !IsSealed(err) {
 		t.Fatal(err)
 	}
@@ -316,7 +325,7 @@ func TestDamagedCommittedFrameSeals(t *testing.T) {
 	h := header(wire.ModeVariable, 8)
 	c, offs := blobWith(t, h, build(t, h, spec(0, 100)), build(t, h, spec(1, 100)))
 	damage(t, c, offs[1]+30)
-	if _, _, err := OpenWriter(c, "frames/blob-00.stash", h, nil, committedSet{offs[0]: true, offs[1]: true}.c()); !IsSealed(err) {
+	if _, _, err := OpenWriter(c, "frames/blob-00.stash", h, nil, committedSet{offs[0]: keyOf(spec(0, 100)), offs[1]: keyOf(spec(1, 100))}.c()); !IsSealed(err) {
 		t.Fatal(err)
 	}
 }
@@ -335,7 +344,7 @@ func TestEmbeddedFrameInPayload(t *testing.T) {
 		t.Fatalf("intact scan %v", got)
 	}
 	damage(t, c, offs[1]+int64(len(outer))-40) // tear the outer trailer
-	w, res, err := OpenWriter(c, "frames/blob-00.stash", h, nil, committedSet{offs[0]: true}.c())
+	w, res, err := OpenWriter(c, "frames/blob-00.stash", h, nil, committedSet{offs[0]: keyOf(spec(0, 10))}.c())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,8 +390,9 @@ func TestCrashGarbageNeverLosesCommitted(t *testing.T) {
 		committed := committedSet{}
 		var last int64
 		for i := 0; i < 3; i++ {
-			last, _, _ = w.Append(spec(i, rng.Intn(9000)))
-			committed[last] = true
+			sp := spec(i, rng.Intn(9000))
+			last, _, _ = w.Append(sp)
+			committed[last] = keyOf(sp)
 		}
 		w.Sync()
 		w.Append(spec(10, rng.Intn(9000)))
@@ -557,3 +567,20 @@ func benchAppendParallel(b *testing.B, pool *bufpool.Pool) {
 
 func BenchmarkAppendParallelPooled(b *testing.B)   { benchAppendParallel(b, bufpool.New(0)) }
 func BenchmarkAppendParallelUnpooled(b *testing.B) { benchAppendParallel(b, noPool()) }
+
+// A payload-identical frame of another object before E does not satisfy a
+// reference: keys include the object metadata (§9.1).
+func TestRefKeyIncludesObject(t *testing.T) {
+	h := header(wire.ModeVariable, 8)
+	same := func(i int) *frame.Spec {
+		s := spec(i, 100)
+		s.Payload = bytes.Repeat([]byte{9}, 100)
+		return s
+	}
+	c, offs := blobWith(t, h, build(t, h, same(0)), build(t, h, spec(1, 100)), build(t, h, same(2)))
+	damage(t, c, offs[1]+30)
+	cm := committedSet{offs[0]: keyOf(same(0)), offs[2]: keyOf(same(2))}.c()
+	if _, _, err := OpenWriter(c, "frames/blob-00.stash", h, nil, cm); !IsSealed(err) {
+		t.Fatal(err)
+	}
+}

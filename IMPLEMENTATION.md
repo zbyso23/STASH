@@ -77,7 +77,28 @@ Tests: the index file equals byte for byte an independent Python encoding (`test
 
 SPEC change E1-19: each `physical_offset` occurs at most once in an index, so `record_count ≤ (blob_size − 64) / 4096` can be checked before allocating.
 
+## Milestone 5 — manifest (done, plaintext archives)
+
+| File | Content | SPEC |
+|---|---|---|
+| `internal/manifest/json.go` | strict JSON parser for one line: valid UTF-8, surrogate pairs only, duplicate keys rejected, any valid whitespace accepted, nesting bound | §10.1.1 |
+| `record.go` | all plaintext operations incl. `ADD_ABORT`, `LINK_MANIFEST`, `PARITY_GROUP`; exact key sets per op plus `ts`; uint64 as decimal strings `0\|[1-9][0-9]*`, bounded integers, lowercase hex hash/tx_id, canonical paths, `submanifests/` rule; `*_ENC` is corruption in an unencrypted archive and "unsupported" (crypto milestone) in an encrypted one; unknown op fails closed | §10.1.1, §10.1.2, §10.6 |
+| `encode.go` | canonical writer form (key order, `ts` last, minimal escaping), validated before writing, 1 MiB line limit | §10.1.1 |
+| `state.go` | live-state fold: ADD/DEL rules, `applied_max` checked at ADD, ADD_BEGIN and ADD_COMMIT, transactions (interleaving, same file, tx_id reuse, ignored on count mismatch or duplicate `extent_sequence`, `ADD_ABORT`), loc coverage and placement (`[0, L)` exactly once, 4 KiB alignment, `MAX_FRAME_SIZE`, blob_count), `MAX_OPEN_TRANSACTIONS` and a staging ceiling as resource errors; a rejected record leaves the state unchanged | §6.6, §9.1, §10.2, §10.3 |
+| `journal.go` | journal reading with bounded memory (over-long lines are never buffered), torn tail = unterminated last line or a line with NUL; `LINK_MANIFEST` verified (digest of exact bytes, line count, final LF, depth 1, linked once, seq after the link) and merged by seq through a heap of cursors; reader snapshot length | §10.1.1, §10.4.1, §10.4.2, §10.6 |
+| `writer.go` | `Journal`: creates the manifest, truncates and fsyncs a torn tail, appends `ADD_ABORT` for every open transaction on cold start, `Add` (one ADD, or a transaction with ADD_EXTENT lines filled up to 1 MiB), `Del`, streaming `Begin/Extent/Commit/Abort`, one uncommitted version per path, automatic abort of a rejected commit, poisoning after an I/O error | §10.2.1, §10.3, §10.3.1, §10.4 |
+| `State.BlobCommitted` | references of all records for `blob.OpenWriter` | §10.4.2 |
+
+`blob.Committed` now holds the referenced frames by identity (`frame_hash` + path + file_ver + logical offset), because `loc` carries no physical offsets: a blob is SEALED when a referenced frame is missing from the valid run before E.
+
+Tests: canonical lines equal byte for byte an independent Python encoder (`testdata/gen/gen_golden_m5.py`), 4 non-canonical valid lines accepted, 46 invalid lines rejected (including invalid, overlong and surrogate UTF-8); fold rules; the E1-4 case `ADD_BEGIN(v8), ADD(v9), ADD_COMMIT(v8)`; 1,100 crashes inside transactions leave the manifest readable (E1-1); 300 torn crash seeds (both torn forms) keep every synced record and only an in-order prefix of the rest; linked manifests merge by seq, 8 kinds of link corruption fail closed; end to end, the manifest decides the blob torn tail and a damaged committed frame seals the blob; fuzz `FuzzDecodeLine` (accepted lines must round-trip canonically).
+
+Performance: appending an ADD with 17 extents about 45 µs (in-memory FS), loading about 65 MB/s of manifest per core. A faster decoder that skips the generic JSON tree is a later optimization.
+
+SPEC changes: E1-18 restated by frame identity; E1-20 a manifest line containing NUL starts the torn tail (found by the crash tests: out-of-order page persistence otherwise bricked the archive after an ordinary crash).
+
+Not yet: encrypted envelopes (`*_ENC`, crypto milestone), HARDENED anchored length on the writer side, spilling staged extents to disk.
+
 ## Next milestones
 
-5. Manifest (strict JSON, canonical writer form, transactions, `ADD_ABORT`, live-state fold); it supplies `blob.Committed`.
-6. Allocator State files and the generation layout (`Create`, root, locks). Then the order of README.
+6. Allocator State files and the generation layout (`Create`, `root.current`, `writer.lock`, allocators for file_ver, seq, ordinals, group ids). Then the order of README.

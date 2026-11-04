@@ -12,25 +12,54 @@ import (
 	"stash/internal/wire"
 )
 
+// FrameKey identifies the frame a manifest loc resolves to (§9.1): its
+// frame_hash plus the object metadata that selects among payload-identical
+// frames. For a PACKED frame Offset is 0 and Path/FileVer name the entry.
+type FrameKey struct {
+	Hash    [32]byte
+	Path    string
+	FileVer uint64
+	Offset  uint64
+}
+
 // Committed describes what the manifest graph (all LF-terminated records,
-// anchored or not) references, for the torn-tail decision of §10.4.2. The
-// manifest layer supplies it. The zero value means "nothing is referenced",
-// which is correct only for a blob that no manifest record can name.
+// anchored or not) references in this blob, for the torn-tail decision of
+// §10.4.2. The manifest layer supplies it. The zero value means "nothing is
+// referenced", which is correct only for a blob no manifest record names.
 type Committed struct {
-	// HighestOffset is the largest frame offset in this blob referenced by
-	// a loc, or -1 (or 0) if none. A referenced offset at or beyond E means
-	// committed data lies in the damaged region, whether or not the frame
-	// there still validates.
-	HighestOffset int64
+	// Refs holds every frame of this blob that a loc references, whether
+	// the record is committed, live, dead, or inside an open transaction.
+	Refs map[FrameKey]struct{}
 	// GroupReferenced reports whether a loc anywhere references a frame
 	// carrying groupID (non-zero). nil means no group is referenced.
 	GroupReferenced func(groupID uint32) bool
 }
 
-// protects reports why the tail starting at E may not be truncated.
-func (c *Committed) protects(E int64, tail []TailFrame) error {
-	if c.HighestOffset >= E && c.HighestOffset > 0 {
-		return fmt.Errorf("%w: committed frame at %d lies at or beyond damaged region at %d", ErrSealed, c.HighestOffset, E)
+// keysOf returns the keys under which a validated frame satisfies locs.
+func keysOf(f *frame.Frame) []FrameKey {
+	switch f.Trailer.BlockType {
+	case wire.BlockData:
+		if len(f.Entries) == 1 {
+			e := f.Entries[0]
+			return []FrameKey{{Hash: f.Trailer.HashPayload, Path: e.Path, FileVer: e.FileVer, Offset: e.Offset}}
+		}
+	case wire.BlockPacked:
+		ks := make([]FrameKey, len(f.Entries))
+		for i, e := range f.Entries {
+			ks[i] = FrameKey{Hash: f.Trailer.HashPayload, Path: e.Path, FileVer: e.FileVer}
+		}
+		return ks
+	}
+	return nil
+}
+
+// protects reports why the tail starting at E may not be truncated: a
+// referenced frame is not among the valid frames before E (it lies in the
+// damaged region, valid or not), or a valid frame beyond E carries a
+// referenced group_id.
+func (c *Committed) protects(E int64, satisfied int, tail []TailFrame) error {
+	if satisfied < len(c.Refs) {
+		return fmt.Errorf("%w: %d referenced frame(s) are not in the valid run before %d", ErrSealed, len(c.Refs)-satisfied, E)
 	}
 	if c.GroupReferenced == nil {
 		return nil
@@ -70,9 +99,9 @@ type Writer struct {
 // OpenWriter opens a blob for appending. It scans the blob, applies the
 // torn-tail rules of §10.4.2 and returns a writer positioned at E:
 //
-//   - a loc references an offset >= E, or a valid frame there carries a
-//     referenced group_id: the blob is SEALED; ErrSealed is returned
-//     together with the OpenResult and no writer;
+//   - a referenced frame is not in the valid run before E, or a valid frame
+//     beyond E carries a referenced group_id: the blob is SEALED; ErrSealed
+//     is returned together with the OpenResult and no writer;
 //   - otherwise (no valid frame there, or only uncommitted ones): truncate
 //     to E and sync.
 //
@@ -104,15 +133,35 @@ func OpenWriter(fsys vfs.FS, name string, h *wire.ArchiveHeader, pool *bufpool.P
 		}
 		size = wire.FrameAreaStart
 	}
-	if res.Scan, err = scan(f, h, pool, wire.FrameAreaStart, size, nil); err != nil {
+	satisfied := map[FrameKey]struct{}{}
+	collect := func(_ int64, fr *frame.Frame) error {
+		if len(committed.Refs) == 0 {
+			return nil
+		}
+		for _, k := range keysOf(fr) {
+			if _, ok := committed.Refs[k]; ok {
+				satisfied[k] = struct{}{}
+			}
+		}
+		return nil
+	}
+	if res.Scan, err = scan(f, h, pool, wire.FrameAreaStart, size, collect); err != nil {
 		return fail(err)
 	}
 	E := res.Scan.End
+	if len(satisfied) < len(committed.Refs) {
+		// Committed data lies at or beyond E even if nothing validates
+		// there (damage of §3.1.1 item 4); the blob is sealed either way.
+		if E < size {
+			res.Tail, _ = probeTail(f, h, pool, E, size)
+		}
+		return fail(committed.protects(E, len(satisfied), res.Tail))
+	}
 	if E < size {
 		if res.Tail, err = probeTail(f, h, pool, E, size); err != nil {
 			return fail(err)
 		}
-		if err := committed.protects(E, res.Tail); err != nil {
+		if err := committed.protects(E, len(satisfied), res.Tail); err != nil {
 			return fail(err)
 		}
 		if err := f.Truncate(E); err != nil {
