@@ -60,7 +60,24 @@ Benchmarks (`go test ./internal/blob ./internal/frame -bench . -benchmem`): `App
 
 The crash tests found a gap in §10.4.2: a committed frame damaged by a non-atomic shared-page write did not validate and would have been truncated as a torn tail. SPEC now says a `loc` at or beyond E seals the blob (Erratum row E1-18).
 
+## Milestone 4 — physical offset index (done)
+
+| Package | Content | SPEC |
+|---|---|---|
+| `internal/index` | in-memory multimap `frame_hash` → records, sorted by (hash, offset), batched merge of new records | §10.5 |
+| | `Build` from an uninterrupted blob scan; `CatchUp` for a lagging index (valid frame at I → scan forward from I) | §10.5.1 |
+| | `Load`: identity, exact file size, `record_count` bound before allocation, record checks (block type, reserved, grid, quanta, end ≤ blob size), sort order, unique offsets; any violation → `ErrDiscard` | §10.5.1 |
+| | `Open`: load or rebuild by scan, then catch up; read-only openers do not write | §10.5 |
+| | `Write`: streamed through `vfs.ReplaceFileStream` (tmp, fsync, rename, dir fsync) | §10.5 |
+| | `Find`: candidates validated against the actual frame (full parse plus hash, quanta, type, ordinal), caller predicate picks among payload-identical frames, streaming fallback scan before "missing", result says whether the index was defective | §9.1, §10.5.1 |
+| `internal/blob` | `Writer.AppendIndexed` returns the index record of the frame just written; `Reader.ScanFrom` | §10.5 |
+| `internal/vfs` | `ReplaceFileStream` for content that should not sit in memory at once | §10.5 |
+
+Tests: the index file equals byte for byte an independent Python encoding (`testdata/gen/gen_golden_m4.py`, own sorting); 22 kinds of structural corruption each discard the index; missing and stale (other generation) indexes are rebuilt; lagging index catches up; a writer-maintained index of 2,500 frames equals a rebuild byte for byte; duplicate payloads resolved by predicate; a wrong candidate is rejected and the fallback scan finds the frame; fuzz `FuzzLoad`. Lookup over 100,000 records takes about 0.7 µs.
+
+SPEC change E1-19: each `physical_offset` occurs at most once in an index, so `record_count ≤ (blob_size − 64) / 4096` can be checked before allocating.
+
 ## Next milestones
 
-4. Physical index files.
-5. Manifest (strict JSON, transactions, `ADD_ABORT`, live-state fold); it supplies `blob.Committed`. Then the order of README.
+5. Manifest (strict JSON, canonical writer form, transactions, `ADD_ABORT`, live-state fold); it supplies `blob.Committed`.
+6. Allocator State files and the generation layout (`Create`, root, locks). Then the order of README.

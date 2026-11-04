@@ -104,7 +104,7 @@ func OpenWriter(fsys vfs.FS, name string, h *wire.ArchiveHeader, pool *bufpool.P
 		}
 		size = wire.FrameAreaStart
 	}
-	if res.Scan, err = scan(f, h, pool, size, nil); err != nil {
+	if res.Scan, err = scan(f, h, pool, wire.FrameAreaStart, size, nil); err != nil {
 		return fail(err)
 	}
 	E := res.Scan.End
@@ -153,14 +153,33 @@ func (w *Writer) End() int64 {
 // it at the next free offset. The frame is NOT durable until Sync returns
 // nil (§10.4). It returns the frame's offset and size.
 func (w *Writer) Append(s *frame.Spec) (off int64, size int64, err error) {
+	rec, err := w.AppendIndexed(s)
+	if err != nil {
+		return 0, 0, err
+	}
+	return int64(rec.PhysicalOffset), int64(wire.FrameSize(rec.FrameQuanta)), nil
+}
+
+// AppendIndexed is Append returning the frame's physical index record
+// (§10.5), ready for index.Index.Add.
+func (w *Writer) AppendIndexed(s *frame.Spec) (wire.IndexRecord, error) {
 	buf := w.pool.Get(estimateFrameSize(w.h, s))
 	b, err := frame.AppendFrame(buf[:0], w.h, s)
 	if err != nil {
 		w.pool.Put(buf)
-		return 0, 0, err
+		return wire.IndexRecord{}, err
 	}
 	defer w.pool.Put(b) // b may have grown past the estimate
-	return w.write(b)
+	t, err := wire.DecodeMasterTrailer(b[len(b)-wire.MasterTrailerSize:])
+	if err != nil {
+		return wire.IndexRecord{}, err
+	}
+	off, _, err := w.write(b)
+	if err != nil {
+		return wire.IndexRecord{}, err
+	}
+	return wire.IndexRecord{FrameHash: t.HashPayload, PhysicalOffset: uint64(off), FrameQuanta: t.FrameQuanta,
+		BlockType: t.BlockType, FrameOrdinal: t.FrameOrdinal}, nil
 }
 
 // estimateFrameSize returns an upper bound of the encoded frame size,

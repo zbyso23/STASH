@@ -1466,7 +1466,7 @@ On HARDENED open, the reader requires `manifest.jsonl` to be at least `manifest_
 
 **Manifest.** A final line that lacks its terminating LF is a torn tail and is ignored by readers. Before its next append, a writer MUST truncate the file to the end of the last LF-terminated line. A complete LF-terminated line that fails validation is corruption, not a torn tail, and fails closed; this holds for the last line too. Under HARDENED, a writer MUST NOT truncate below the anchored `manifest_length`.
 
-**Blob.** Let `E` be the end of the last frame that is valid in an uninterrupted scan from `FRAME_AREA_START` (§11.2). Bytes in `[E, EOF)` are a torn tail **only if** no valid frame starts at any frame-grid offset inside them. In that case the writer MUST truncate the blob to `E` before appending, and durably flush the truncation. If a valid frame exists at a frame-grid offset `>= E`, the writer still MAY truncate to `E` when no frame at or beyond `E` is referenced by a `loc` of the manifest graph (all LF-terminated records, anchored or not) and none of them carries the `group_id` of a frame, in any blob, that a `loc` references. Such frames were never committed, because §10.4 makes every referenced frame durable before its commit; they typically come from pages persisted out of order, or from payload bytes that contain an embedded 🌀 STASH archive.
+**Blob.** Let `E` be the end of the last frame that is valid in an uninterrupted scan from `FRAME_AREA_START` (§11.2). If a `loc` of the manifest graph references an offset `>= E`, committed data lies in `[E, EOF)`, whether or not the frame there still validates (it may have been damaged as described in §3.1.1 item 4), and the blob is SEALED as described below. Otherwise, bytes in `[E, EOF)` are a torn tail **only if** no valid frame starts at any frame-grid offset inside them. In that case the writer MUST truncate the blob to `E` before appending, and durably flush the truncation. If a valid frame exists at a frame-grid offset `>= E`, the writer still MAY truncate to `E` when no frame at or beyond `E` is referenced by a `loc` of the manifest graph (all LF-terminated records, anchored or not) and none of them carries the `group_id` of a frame, in any blob, that a `loc` references. Such frames were never committed, because §10.4 makes every referenced frame durable before its commit; they typically come from pages persisted out of order, or from payload bytes that contain an embedded 🌀 STASH archive.
 
 Otherwise the blob is damaged in the middle and becomes **SEALED**: the writer MUST NOT truncate it or append to it in this generation and records the sealed state in its health metadata; writes continue on other blobs; and the next compaction rewrites the blob's live frames, repaired by parity where needed (§7.3.1), into the destination generation. If no blob remains writable, or parity spread (§7.4) can no longer be met, writes fail until compaction completes.
 
@@ -1502,7 +1502,7 @@ It is followed by exactly `record_count` canonical 64-byte records:
 | `0x30` | 8 | frame_ordinal |
 | `0x38` | 8 | reserved, MUST be zero |
 
-Records MUST be sorted lexicographically by `frame_hash`, then by `physical_offset`; duplicate hashes are valid. Header identity MUST match the blob/generation before any record is trusted. Every looked-up candidate is still validated against the actual frame; the index is never authoritative for correctness.
+Records MUST be sorted lexicographically by `frame_hash`, then by `physical_offset`; duplicate hashes are valid. Each `physical_offset` occurs in at most one record, because one frame starts at a given offset; therefore `record_count` never exceeds `(blob_size - 64) / 4096`, and a reader checks that bound before allocating. Header identity MUST match the blob/generation before any record is trusted. Every looked-up candidate is still validated against the actual frame; the index is never authoritative for correctness.
 
 Index rebuild/update MUST write a complete temporary file, durably flush it, atomically replace the destination, and durably flush the containing directory, or use equivalent atomic durable replacement. A missing, malformed, stale, identity-mismatched, or corrupt index is discarded and rebuilt by scan.
 
@@ -1512,6 +1512,7 @@ The index container has no checksum. A reader MUST therefore validate structural
 
 - file size equals `64 + record_count * 64` exactly;
 - header magic, version, `header_size`, `record_size`, `generation_id`, `archive_id`, `blob_ordinal`, `hash_id` match;
+- `record_count <= (blob_size - 64) / 4096`, and no `physical_offset` occurs twice;
 - records are sorted as required, reserved bytes are zero, `block_type` is valid, `frame_quanta` is valid for the archive mode, and every `physical_offset` lies on the frame grid with `physical_offset + frame_quanta * 4096 <= blob size`;
 - any violation discards the whole index.
 
@@ -2827,6 +2828,8 @@ E1 was applied in 2026-11, before any implementation existed. It fixes defects f
 | E1-15 | Canonical writer JSON form | §10.1.1 | Encoder golden vectors could not be exact |
 | E1-16 | Keyed `object_id` in encrypted archives; size leakage documented | §0.2, §6.5, §15.2 | An unkeyed `object_id` let anyone confirm guessed paths |
 | E1-17 | 112-byte parity padding, `ceil` in placement rule, PARITY ordinals, legacy recognition bytes, orphan-version label, editorial "R8" wording | §7.2, §7.4, §12.2, §14, §11.2.2 | Implicit or ambiguous |
+| E1-18 | A `loc` at or beyond `E` seals the blob even when that frame no longer validates | §10.4.2 | A committed frame damaged by a non-atomic shared-page write (§3.1.1) could be truncated as a torn tail |
+| E1-19 | Unique `physical_offset` in the index, `record_count` bounded by blob size | §10.5, §10.5.1 | A forged index could declare many records and force a large allocation before rejection |
 
 # 21. README / Public Specification Requirements
 

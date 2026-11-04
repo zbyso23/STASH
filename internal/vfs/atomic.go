@@ -1,6 +1,8 @@
 package vfs
 
 import (
+	"bufio"
+	"io"
 	"os"
 	"path"
 )
@@ -10,27 +12,54 @@ import (
 // fsync the directory. After a crash, name holds either the old or the new
 // content in full, never a mix.
 func ReplaceFile(fsys FS, name string, data []byte) error {
+	return ReplaceFileStream(fsys, name, func(w io.Writer) error {
+		_, err := w.Write(data)
+		return err
+	})
+}
+
+// ReplaceFileStream is ReplaceFile for content produced by fill, which may
+// be larger than memory should hold at once (index rebuilds, §10.5). If
+// fill fails, the temporary file is removed and name is untouched.
+func ReplaceFileStream(fsys FS, name string, fill func(io.Writer) error) error {
 	dir := path.Dir(name)
 	tmp := name + ".tmp"
 	f, err := fsys.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
-	if _, err := f.WriteAt(data, 0); err != nil {
-		f.Close()
-		return err
+	fw := &fileWriter{f: f}
+	bw := bufio.NewWriterSize(fw, 1<<20)
+	err = fill(bw)
+	if err == nil {
+		err = bw.Flush()
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
+	if err == nil {
+		err = f.Sync()
 	}
-	if err := f.Close(); err != nil {
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		fsys.Remove(tmp)
 		return err
 	}
 	if err := fsys.Rename(tmp, name); err != nil {
 		return err
 	}
 	return fsys.SyncDir(dir)
+}
+
+// fileWriter adapts positional writes to io.Writer.
+type fileWriter struct {
+	f   File
+	off int64
+}
+
+func (w *fileWriter) Write(p []byte) (int, error) {
+	n, err := w.f.WriteAt(p, w.off)
+	w.off += int64(n)
+	return n, err
 }
 
 // ReadFile reads a whole small file (root, allocator, index header). max

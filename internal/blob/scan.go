@@ -1,6 +1,7 @@
 package blob
 
 import (
+	"fmt"
 	"io"
 
 	"stash/internal/bufpool"
@@ -80,14 +81,28 @@ func (r *Reader) Scan(fn func(off int64, f *frame.Frame) error) (ScanResult, err
 	if err != nil {
 		return ScanResult{}, err
 	}
-	return scan(r.f, r.h, r.pool, size, fn)
+	return scan(r.f, r.h, r.pool, wire.FrameAreaStart, size, fn)
 }
 
-func scan(f vfs.File, h *wire.ArchiveHeader, pool *bufpool.Pool, size int64, fn func(int64, *frame.Frame) error) (ScanResult, error) {
+// ScanFrom is Scan starting at a known frame boundary from (for example the
+// end of the frames a lagging index covers, §10.5.1). End and Frames count
+// from there.
+func (r *Reader) ScanFrom(from int64, fn func(off int64, f *frame.Frame) error) (ScanResult, error) {
+	if from < wire.FrameAreaStart || !wire.OnFrameGrid(uint64(from)) {
+		return ScanResult{}, fmt.Errorf("%w: scan start %d is not on the frame grid", wire.ErrInvalid, from)
+	}
+	size, err := r.f.Size()
+	if err != nil {
+		return ScanResult{}, err
+	}
+	return scan(r.f, r.h, r.pool, from, size, fn)
+}
+
+func scan(f vfs.File, h *wire.ArchiveHeader, pool *bufpool.Pool, from, size int64, fn func(int64, *frame.Frame) error) (ScanResult, error) {
 	w := &window{f: f, size: size, pool: pool}
 	defer w.release()
-	res := ScanResult{End: wire.FrameAreaStart, Size: size}
-	off := int64(wire.FrameAreaStart)
+	res := ScanResult{End: from, Size: size}
+	off := from
 	for off < size {
 		fr, fsz, err := parseAt(w, h, off)
 		if err != nil {
