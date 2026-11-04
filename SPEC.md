@@ -928,7 +928,7 @@ The format requires physical frame boundaries to lie on the frame grid (§3.1.1)
 
 A canonical path is valid UTF-8 normalized to Unicode NFC, uses `/` as the only separator, is relative (no leading `/`), contains no empty component, `.` component, `..` component, NUL, or backslash, and is at most 4096 UTF-8 bytes.
 
-Additionally, a canonical path MUST NOT contain C0 control characters (`U+0000..U+001F`), `U+007F`, C1 control characters (`U+0080..U+009F`), surrogate code points, or code points that are unassigned in Unicode 15.0. NFC is evaluated against Unicode 15.0 normalization data. Pinning the Unicode version and rejecting unassigned code points keeps canonicalization stable across library versions: Unicode guarantees that NFC of assigned characters never changes.
+Additionally, a canonical path MUST NOT contain C0 control characters (`U+0000..U+001F`), `U+007F`, C1 control characters (`U+0080..U+009F`), surrogate code points, or code points that are unassigned in Unicode 15.0. Unassigned means General_Category `Cn` in Unicode 15.0.0, which includes the 66 noncharacters; private-use code points are assigned. NFC is evaluated against Unicode 15.0 normalization data. Pinning the Unicode version and rejecting unassigned code points keeps canonicalization stable across library versions: Unicode guarantees that NFC of assigned characters never changes.
 
 Path ordering anywhere in this specification (for example PACKED entry order, §8) is **bytewise** comparison of the canonical UTF-8 bytes, shorter prefix first.
 
