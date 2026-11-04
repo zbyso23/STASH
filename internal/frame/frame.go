@@ -10,6 +10,7 @@ package frame
 import (
 	"encoding/binary"
 	"fmt"
+	"slices"
 
 	"stash/internal/canonpath"
 	"stash/internal/checked"
@@ -76,52 +77,40 @@ func RequiredQuanta(dataLen, preTrailerLen uint64, parity bool) (uint32, error) 
 	return uint32(q), nil
 }
 
-// Build encodes a complete plaintext frame. The archive must be
-// unencrypted; encrypted frames are built by the crypto layer.
-func Build(h *wire.ArchiveHeader, s *Spec) ([]byte, error) {
+// Build encodes a complete plaintext frame into a new slice.
+func Build(h *wire.ArchiveHeader, s *Spec) ([]byte, error) { return AppendFrame(nil, h, s) }
+
+// AppendFrame appends a complete plaintext frame to dst and returns the
+// extended slice. With enough capacity in dst (for example a pooled buffer
+// of FrameSize bytes) it performs no heap allocation for DATA and PARITY
+// frames. Every byte of the frame is written explicitly, including zero
+// padding, so a reused buffer never leaks old content. On error dst is
+// returned with its original length.
+//
+// The archive must be unencrypted; encrypted frames are built by the
+// crypto layer.
+func AppendFrame(dst []byte, h *wire.ArchiveHeader, s *Spec) ([]byte, error) {
 	if h.Encrypted() {
-		return nil, errf(wire.ErrInvalid, "", "encrypted frames are built by the crypto layer")
+		return dst, errf(wire.ErrInvalid, "", "encrypted frames are built by the crypto layer")
 	}
 	if err := checkEntriesForBuild(h, s); err != nil {
-		return nil, err
+		return dst, err
 	}
-	body, err := wire.AppendEntries(nil, s.Entries)
+	start := len(dst)
+	// The entry list is encoded in place at the end of dst first; once the
+	// layout is known it is moved to its final position.
+	out, err := wire.AppendEntries(dst, s.Entries)
 	if err != nil {
-		return nil, err
+		return dst[:start], err
 	}
-	ptLen := uint64(len(body)) + 4
-	q := s.FrameQuanta
-	if h.Mode == wire.ModeFixed {
-		if q != 0 && q != h.MaxFrameQuanta {
-			return nil, errf(wire.ErrInvalid, "frame_quanta", "FIXED archive needs %d", h.MaxFrameQuanta)
-		}
-		q = h.MaxFrameQuanta
-	}
-	if s.BlockType == wire.BlockParity {
-		// PARITY payload length defines the frame size exactly (§7.1).
-		pq, err := RequiredQuanta(uint64(len(s.Payload)), ptLen, false)
-		if err != nil {
-			return nil, err
-		}
-		if q == 0 {
-			q = pq
-		}
-		if uint64(len(s.Payload)) != wire.ParityShardLen(q) {
-			return nil, errf(wire.ErrInvalid, "payload", "parity shard %d bytes, frame of %d quanta needs %d", len(s.Payload), q, wire.ParityShardLen(q))
-		}
-	}
-	minQ, err := RequiredQuanta(uint64(len(s.Payload)), ptLen, s.GroupID != 0 && s.BlockType != wire.BlockParity)
+	bodyLen := uint64(len(out) - start)
+	ptLen := bodyLen + 4
+	q, err := chooseQuanta(h, s, ptLen)
 	if err != nil {
-		return nil, err
-	}
-	if q == 0 {
-		q = minQ
-	}
-	if q < minQ || q > h.MaxFrameQuanta {
-		return nil, errf(wire.ErrInvalid, "frame_quanta", "%d outside %d..%d", q, minQ, h.MaxFrameQuanta)
+		return dst[:start], err
 	}
 	if uint64(len(s.Payload)) > 0xFFFFFFFF {
-		return nil, errf(wire.ErrInvalid, "data_len", "payload too large")
+		return dst[:start], errf(wire.ErrInvalid, "data_len", "payload too large")
 	}
 	t := wire.MasterTrailer{
 		HashID: h.HashID, CodecID: s.Codec, BlockType: s.BlockType,
@@ -132,38 +121,76 @@ func Build(h *wire.ArchiveHeader, s *Spec) ([]byte, error) {
 		e := s.Entries[0]
 		t.LogicalOffset, t.LogicalLength = e.Offset, e.Length
 		if t.ObjectID, err = ident.ObjectID(h.HashID, e.Path, e.FileVer); err != nil {
-			return nil, err
+			return dst[:start], err
 		}
 	}
 	if t.HashPayload, err = ident.Hash(h.HashID, s.Payload); err != nil {
-		return nil, err
+		return dst[:start], err
 	}
 	p := wire.FramePrefix{FrameQuanta: q}
 	if err := wire.ValidateTrailer(&t, h, p); err != nil {
-		return nil, err
+		return dst[:start], err
 	}
 	lay, err := wire.ComputeLayout(q, uint64(len(s.Payload)), ptLen)
 	if err != nil {
-		return nil, err
+		return dst[:start], err
 	}
-	out := make([]byte, 0, lay.FrameSize)
-	if out, err = p.AppendBinary(out); err != nil {
-		return nil, err
+	fsz := int(lay.FrameSize)
+	out = slices.Grow(out, start+fsz-len(out))[:start+fsz]
+	f := out[start:]
+	// body: currently at f[0:bodyLen], moves to PreTrailerStart (>= 16 +
+	// bodyLen is not guaranteed, so copy handles the overlap).
+	copy(f[lay.PreTrailerStart:lay.PreTrailerStart+bodyLen], f[:bodyLen])
+	pb, err := p.AppendBinary(f[:0])
+	if err != nil || len(pb) != wire.FramePrefixSize {
+		return dst[:start], errf(wire.ErrInvalid, "", "prefix encode: %v", err)
 	}
-	out = append(out, s.Payload...)
-	out = append(out, make([]byte, lay.PaddingLen)...)
-	tb, err := t.AppendBinary(nil)
-	if err != nil {
-		return nil, err
+	copy(f[lay.PayloadStart:lay.PayloadEnd], s.Payload)
+	clear(f[lay.PayloadEnd:lay.PreTrailerStart])
+	tb, err := t.AppendBinary(f[lay.TrailerStart:lay.TrailerStart])
+	if err != nil || len(tb) != wire.MasterTrailerSize {
+		return dst[:start], errf(wire.ErrInvalid, "", "trailer encode: %v", err)
 	}
-	out = append(out, body...)
-	out = binary.LittleEndian.AppendUint32(out, wire.OuterCRC(body, uint32(ptLen), tb))
-	out = binary.LittleEndian.AppendUint32(out, uint32(ptLen))
-	out = append(out, tb...)
-	if uint64(len(out)) != lay.FrameSize {
-		return nil, errf(wire.ErrInvalid, "", "internal size mismatch %d != %d", len(out), lay.FrameSize)
-	}
+	body := f[lay.PreTrailerStart : lay.PreTrailerStart+bodyLen]
+	crcAt := lay.PreTrailerStart + bodyLen
+	binary.LittleEndian.PutUint32(f[crcAt:], wire.OuterCRC(body, uint32(ptLen), tb))
+	binary.LittleEndian.PutUint32(f[lay.TrailerStart-4:], uint32(ptLen))
 	return out, nil
+}
+
+// chooseQuanta picks frame_quanta for a frame (§6.3, §7.1).
+func chooseQuanta(h *wire.ArchiveHeader, s *Spec, ptLen uint64) (uint32, error) {
+	q := s.FrameQuanta
+	if h.Mode == wire.ModeFixed {
+		if q != 0 && q != h.MaxFrameQuanta {
+			return 0, errf(wire.ErrInvalid, "frame_quanta", "FIXED archive needs %d", h.MaxFrameQuanta)
+		}
+		q = h.MaxFrameQuanta
+	}
+	if s.BlockType == wire.BlockParity {
+		// PARITY payload length defines the frame size exactly (§7.1).
+		pq, err := RequiredQuanta(uint64(len(s.Payload)), ptLen, false)
+		if err != nil {
+			return 0, err
+		}
+		if q == 0 {
+			q = pq
+		}
+		if uint64(len(s.Payload)) != wire.ParityShardLen(q) {
+			return 0, errf(wire.ErrInvalid, "payload", "parity shard %d bytes, frame of %d quanta needs %d", len(s.Payload), q, wire.ParityShardLen(q))
+		}
+	}
+	minQ, err := RequiredQuanta(uint64(len(s.Payload)), ptLen, s.GroupID != 0 && s.BlockType != wire.BlockParity)
+	if err != nil {
+		return 0, err
+	}
+	if q == 0 {
+		q = minQ
+	}
+	if q < minQ || q > h.MaxFrameQuanta {
+		return 0, errf(wire.ErrInvalid, "frame_quanta", "%d outside %d..%d", q, minQ, h.MaxFrameQuanta)
+	}
+	return q, nil
 }
 
 func checkEntriesForBuild(h *wire.ArchiveHeader, s *Spec) error {

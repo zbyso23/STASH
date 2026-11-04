@@ -44,3 +44,10 @@ func (e *Error) Unwrap() error { return e.Class }
 func errf(class error, st, field, format string, args ...any) error {
 	return &Error{Struct: st, Field: field, Class: class, Detail: fmt.Sprintf(format, args...)}
 }
+
+// IsFormatError reports whether err says that bytes violate the format (as
+// opposed to an I/O or resource failure). Scanners treat such bytes as "no
+// valid frame here".
+func IsFormatError(err error) bool {
+	return errors.Is(err, ErrCorrupt) || errors.Is(err, ErrUnsupported) || errors.Is(err, ErrLegacyVersion)
+}

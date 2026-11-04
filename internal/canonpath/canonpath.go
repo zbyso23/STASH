@@ -51,7 +51,11 @@ func Validate(p string) error {
 	if p[0] == '/' {
 		return invalid("absolute")
 	}
+	ascii := true
 	for i, r := range p {
+		if r >= utf8.RuneSelf {
+			ascii = false
+		}
 		switch {
 		case r < 0x20, r == 0x7F, r >= 0x80 && r <= 0x9F:
 			return invalid("control character U+%04X at byte %d", r, i)
@@ -61,15 +65,21 @@ func Validate(p string) error {
 			return invalid("code point U+%04X unassigned in Unicode 15.0", r)
 		}
 	}
-	for _, c := range strings.Split(p, "/") {
+	for rest := p; ; {
+		c, tail, more := strings.Cut(rest, "/")
 		switch c {
 		case "":
 			return invalid("empty component")
 		case ".", "..":
 			return invalid("%q component", c)
 		}
+		if !more {
+			break
+		}
+		rest = tail
 	}
-	if !norm.NFC.IsNormalString(p) {
+	// ASCII text is always NFC; the check costs an allocation otherwise.
+	if !ascii && !norm.NFC.IsNormalString(p) {
 		return invalid("not NFC")
 	}
 	return nil

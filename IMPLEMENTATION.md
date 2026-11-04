@@ -42,8 +42,25 @@ Not yet in this milestone: encrypted frames (built by the crypto milestone; pars
 
 Dependencies: `golang.org/x/text`, `github.com/zeebo/blake3` (run `go mod download` once with network access).
 
+## Milestone 3 — blob I/O, buffer pool, crash simulation (done)
+
+| Package | Content | SPEC |
+|---|---|---|
+| `internal/vfs` | `FS`/`File` interface with positional I/O (pread/pwrite); `OS` implementation (POSIX directory fsync); `ReplaceFile` (tmp → fsync → rename → fsync dir); bounded `ReadFile` | §2.1.1, §18 |
+| | `CrashFS`: in-memory FS with an explicit durability model (data durable on `Sync`, names on `SyncDir`) and three crash models: drop unsynced, tear unsynced pages at 512-byte sectors in any order, and tear with garbage sectors (storage without atomic writes) | §3.1.1, §17 |
+| `internal/bufpool` | power-of-two size classes 4 KiB–16 MiB, bounded free lists, total retained-bytes cap (default 256 MiB); sizes only from validated values | §16.1 |
+| `internal/frame` | `AppendFrame(dst, …)`: encodes into a caller buffer with no heap allocation; padding zeroed explicitly so a reused buffer never leaks | §6 |
+| `internal/blob` | `Create` (durable header), `Open`/`Reader.ReadFrame`, `Scan` through a pooled 1 MiB read-ahead window (VARIABLE and FIXED), `ProbeTail` (every grid offset, also inside found frames), `OpenWriter` with the torn-tail rules (truncate, or SEALED when a `loc` offset ≥ E or a referenced `group_id` lies beyond E), `Writer.Append` with serialized allocation and parallel build/write, `Sync` that waits for in-flight writes below it (no holes before durable frames), poisoning after a write or fsync failure | §2.4, §3, §10.4, §10.4.2, §11.1–§11.3, §12.2 |
+
+The torn-tail decision takes `blob.Committed` (highest referenced offset in the blob, and a group predicate); the manifest milestone will supply it.
+
+Tests: synced frames survive 300 seeds of torn crashes and the tail is truncated; pages persisted out of order; an embedded archive frame in a payload; a referenced group beyond E; a damaged committed frame seals the blob; on garbage-writing storage no committed frame is ever silently truncated (some seeds seal, as §3.1.1 predicts); shared page with the previous frame stays unchanged; crash at every step of `ReplaceFile` yields old or new content; 8 concurrent appenders under `-race`; injected I/O error poisons the writer.
+
+Benchmarks (`go test ./internal/blob ./internal/frame -bench . -benchmem`): `AppendFrame` 0 allocations per frame (`Build` 4), append and scan with and without the pool. Throughput is bound by SHA-256 (about 1 GB/s per core here) and by the filesystem, so the pool mainly removes per-frame garbage (64 KiB to 16 MiB per frame) and GC pauses under load rather than raising single-thread throughput.
+
+The crash tests found a gap in §10.4.2: a committed frame damaged by a non-atomic shared-page write did not validate and would have been truncated as a torn tail. SPEC now says a `loc` at or beyond E seals the blob (Erratum row E1-18).
+
 ## Next milestones
 
-3. Blob I/O with a crash-injection filesystem abstraction.
 4. Physical index files.
-5. Manifest (strict JSON, transactions, `ADD_ABORT`, live-state fold). Then the order of README.
+5. Manifest (strict JSON, transactions, `ADD_ABORT`, live-state fold); it supplies `blob.Committed`. Then the order of README.

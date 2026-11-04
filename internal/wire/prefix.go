@@ -16,11 +16,16 @@ func (p FramePrefix) AppendBinary(dst []byte) ([]byte, error) {
 	if p.FrameQuanta == 0 || p.FrameQuanta > MaxMaxFrameQuanta {
 		return dst, errf(ErrInvalid, "FramePrefix", "frame_quanta", "%d", p.FrameQuanta)
 	}
-	var b [FramePrefixSize]byte
+	// Encoded in place in dst: a local array would escape through the CRC
+	// call and cost an allocation per frame.
+	n := len(dst)
+	dst = append(dst, make([]byte, FramePrefixSize)...)
+	b := dst[n:]
 	copy(b[0:4], MagicFramePrefix[:])
 	binary.LittleEndian.PutUint32(b[4:8], p.FrameQuanta)
-	binary.LittleEndian.PutUint32(b[8:12], prefixCRC(b[:]))
-	return append(dst, b[:]...), nil
+	clear(b[8:16])
+	binary.LittleEndian.PutUint32(b[8:12], prefixCRC(b))
+	return dst, nil
 }
 
 // DecodeFramePrefix validates magic, CRC, flags and the quanta bound against

@@ -1,14 +1,27 @@
 package wire
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"hash/crc32"
+)
 
 // OuterCRC computes the outer Pre-Trailer CRC32C (§6.4.3) over the stored
 // Pre-Trailer body without its final four CRC bytes, the uint32
 // pre_trailer_len, and the complete 96-byte Master Trailer.
 func OuterCRC(bodyWithoutCRC []byte, preTrailerLen uint32, trailer []byte) uint32 {
-	var l [4]byte
-	binary.LittleEndian.PutUint32(l[:], preTrailerLen)
-	return CRC32C(bodyWithoutCRC, l[:], trailer)
+	c := crc32.Update(0, castagnoli, bodyWithoutCRC)
+	c = crcUint32LE(c, preTrailerLen)
+	return crc32.Update(c, castagnoli, trailer)
+}
+
+// crcUint32LE extends a CRC32C by the four little-endian bytes of v without
+// passing a slice to crc32 (a local array would escape to the heap).
+func crcUint32LE(c, v uint32) uint32 {
+	c = ^c
+	for i := 0; i < 4; i++ {
+		c = castagnoli[byte(c)^byte(v>>(8*i))] ^ (c >> 8)
+	}
+	return ^c
 }
 
 // FrameTail is the tail of a frame: stored Pre-Trailer body, its length and
