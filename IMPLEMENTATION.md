@@ -99,6 +99,20 @@ SPEC changes: E1-18 restated by frame identity; E1-20 a manifest line containing
 
 Not yet: encrypted envelopes (`*_ENC`, crypto milestone), HARDENED anchored length on the writer side, spilling staged extents to disk.
 
+## Milestone 6 — allocators, generation layout, writer lock, first end-to-end archive (done, STANDARD, unencrypted, no parity)
+
+| Package | Content | SPEC |
+|---|---|---|
+| `internal/alloc` | Allocator State files of all five kinds: `Create`, `Open` (strict identity: kind, generation, blob, archive), `Next` that durably extends `reserved_through` by at most `MAX_RESERVATION_BLOCK` before handing out a value, cold start at `reserved_through`, `Check` against committed state (fails closed with `ErrRolledBack`), `Reinit` (explicit, logged, `max + SKIP`, saturating to fail-closed exhaustion), namespace limits (encrypted `generation_id` 2^32, `frame_ordinal` 2^56, `group_id` 2^32), `OnReserve` hook for the HARDENED anchor | §2.1.3 |
+| `internal/vfs` | `Lock`: `flock(LOCK_EX\|LOCK_NB)` on POSIX, in-memory for CrashFS | §12.1 |
+| `internal/archive` | normative names (`generation-` + 16 uppercase hex, strict parsing), `Create` (CSPRNG `archive_id`, generation 0 durable, `root.current` last), `OpenWriter` (lock, root, header vs. root, allocator checks: generation ids of directories and root, every `file_ver` and `seq` of the manifest graph; manifest torn tail and cold-start `ADD_ABORT` with `seq` from `manifest.alloc`; blob torn tails decided by manifest references or SEALED; truncated blobs get a fresh index; indexes validated, caught up or rebuilt and persisted), `Put` (file_ver and frame ordinals from allocators, DATA/STORE frames across blobs round-robin skipping sealed blobs, blobs synced before the manifest record), `Get` (every extent resolved through the index and checked against path, file_ver and placement; missing data is an error, never zeros), `Delete`, `List`, `OpenReader` (lock-free snapshot) | §2.1, §9, §10.4, §11.1, §12 |
+
+Tests: allocator values are always below a durable `reserved_through`, never reused across 200 torn-crash seeds, identity mismatches and a missing file fail closed, rollback detected, re-initialization saturates; a crash at each of 60 steps of `Create` leaves a complete archive or `ErrIncomplete`, never a half-valid one; crashes at hundreds of points of a Put/Delete workload: every returned operation is durable, an in-flight one is all or nothing, the writer reopens without sealing and continues; a rolled-back `filever.alloc` is refused; a damaged committed frame seals its blob, the object reports `ErrMissingData`, writes continue on other blobs; 8 concurrent writers under `-race`; the same suite on the real filesystem with `flock`.
+
+Performance note: `Put` of 64 KiB on the real filesystem is about 1.5 ms, dominated by two fsyncs per commit (blob, then manifest). Group commit (several Puts per fsync pair, §10.4) is the planned fix.
+
+SPEC change E1-21: creation order and the incomplete STANDARD creation; the `file_ver` cold-start check covers every record, not only live versions.
+
 ## Next milestones
 
-6. Allocator State files and the generation layout (`Create`, `root.current`, `writer.lock`, allocators for file_ver, seq, ordinals, group ids). Then the order of README.
+7. Parity (XOR and Reed-Solomon groups, PARITY frames durable before commit, `groups.alloc`) or group commit and the public API, whichever comes first by priority. Then PACKED, recovery (hop-and-read, resync), compaction, HARDENED anchor, encryption, zstd, CLI, FUSE.

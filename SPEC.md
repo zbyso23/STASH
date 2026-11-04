@@ -205,7 +205,7 @@ A root update MUST be performed by writing a complete temporary root file in the
 
 The root CRC detects corruption; it does not prevent rollback to an older valid root. See §0.2.
 
-Every byte of `root.current` is determined by `generation_id` and `archive_id`. An implementation can therefore rebuild the exact root bytes for a known generation; §2.1.2.1 uses this for HARDENED recovery.
+Every byte of `root.current` is determined by `generation_id` and `archive_id`. `root.current` is written last when an archive is created, after generation 0, its Allocator State files, blobs, and empty `manifest.jsonl` are durable. Under STANDARD policy, a directory that holds generation data but no `root.current` is an incomplete creation that was never opened: a writer reports it and MUST NOT adopt it; the operator deletes it and creates the archive again. Under HARDENED policy, §2.1.2.1 root reconstruction applies. An implementation can therefore rebuild the exact root bytes for a known generation; §2.1.2.1 uses this for HARDENED recovery.
 
 ### 2.1.2 Optional Generation Anchor — external, non-wire state
 
@@ -322,7 +322,7 @@ kinds 1, 2, 3                               MAX_RESERVATION_BLOCK = 2^16
 
 On every cold start, the writer MUST set `next = reserved_through` read from the file, never a value derived from scanning media. Values between the last value actually used and `reserved_through` are permanently skipped. Skipping is always safe; reuse is not.
 
-On every cold start the writer MUST also check that `reserved_through` is greater than every value of its kind present in committed state: generation IDs of existing generation directories and `root.current`, `file_ver` values in the live-state fold, `seq` values in the manifest graph, frame ordinals of the namespace, and `group_id` values, found through the index plus the lagging-tail scan (§10.5.1), including frames that no manifest record references. In an unencrypted archive whose writer derives `frame_ordinal` from committed state, the frame-ordinal check is skipped, because copied frames cannot be told apart from native ones without a nonce. A failed check means the Allocator State was rolled back or corrupted, and the writer MUST fail closed. This check cannot see identifiers used only by torn writes; protection against a targeted rollback is defined in §2.1.3.5.
+On every cold start the writer MUST also check that `reserved_through` is greater than every value of its kind present in committed state: generation IDs of existing generation directories and `root.current`, `file_ver` values named by any record of the manifest graph (live, dead, aborted, or still open), `seq` values in the manifest graph, frame ordinals of the namespace, and `group_id` values, found through the index plus the lagging-tail scan (§10.5.1), including frames that no manifest record references. In an unencrypted archive whose writer derives `frame_ordinal` from committed state, the frame-ordinal check is skipped, because copied frames cannot be told apart from native ones without a nonce. A failed check means the Allocator State was rolled back or corrupted, and the writer MUST fail closed. This check cannot see identifiers used only by torn writes; protection against a targeted rollback is defined in §2.1.3.5.
 
 #### 2.1.3.2 Required allocators
 
@@ -2831,6 +2831,7 @@ E1 was applied in 2026-11, before any implementation existed. It fixes defects f
 | E1-18 | A referenced frame (by `frame_hash` and object metadata) missing from the valid run before `E` seals the blob, even when it no longer validates | §10.4.2 | A committed frame damaged by a non-atomic shared-page write (§3.1.1) could be truncated as a torn tail; `loc` carries no offsets, so the rule is stated by frame identity |
 | E1-19 | Unique `physical_offset` in the index, `record_count` bounded by blob size | §10.5, §10.5.1 | A forged index could declare many records and force a large allocation before rejection |
 | E1-20 | A manifest line containing NUL starts the torn tail | §10.4.2 | Pages of an unsynced append persisted out of order left an LF-terminated line of zeros plus a record; the archive failed closed after an ordinary crash |
+| E1-21 | Creation order and incomplete STANDARD creation; `file_ver` cold-start check covers every record | §2.1.1, §2.1.3.1 | A crash inside creation under STANDARD was undefined; "live-state fold" omitted dead and aborted versions whose `file_ver` was already used |
 
 # 21. README / Public Specification Requirements
 
