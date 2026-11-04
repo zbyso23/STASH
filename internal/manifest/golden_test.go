@@ -221,3 +221,36 @@ func FuzzDecodeLine(f *testing.F) {
 		}
 	})
 }
+
+// FuzzFastPath: whenever the canonical fast path accepts a line, the
+// strict generic decoder accepts it too and yields the same record; and
+// every canonical line of the golden set takes the fast path when its op
+// has one.
+func FuzzFastPath(f *testing.F) {
+	g := loadGolden(f)
+	for _, c := range g.Records {
+		f.Add([]byte(c.Line))
+	}
+	for _, c := range g.Reject {
+		b, _ := hex.DecodeString(c.Hex)
+		f.Add(b)
+	}
+	f.Fuzz(func(t *testing.T, b []byte) {
+		fast, ok := decodeCanonical(b)
+		slow, err := decodeGeneric(b, false)
+		if ok && (err != nil || !reflect.DeepEqual(fast, slow)) {
+			t.Fatalf("fast path accepted what the generic path decodes as %v / %+v", err, slow)
+		}
+		if err == nil && !ok {
+			switch slow.Op {
+			case OpLinkManifest, OpParityGroup:
+				return
+			}
+			if line, _ := AppendLine(nil, slow); bytes.Equal(line[:len(line)-1], b) && !utf8HasEscape(b) {
+				t.Fatalf("canonical %v line missed the fast path", slow.Op)
+			}
+		}
+	})
+}
+
+func utf8HasEscape(b []byte) bool { return bytes.IndexByte(b, '\\') >= 0 }

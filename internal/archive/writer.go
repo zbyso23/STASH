@@ -36,7 +36,11 @@ type Options struct {
 	// PACKED frames by the group commit (§8). 0 means
 	// DefaultPackThreshold, negative disables packing.
 	PackThreshold int
-	Limits        manifest.Limits
+	// VerifyAll makes the open hash every frame even below a verified
+	// checkpoint of a clean close (E1-23), so payload damage seals its blob
+	// at open instead of being reported on read.
+	VerifyAll bool
+	Limits    manifest.Limits
 }
 
 // Health reports conditions found when opening (§13.9).
@@ -51,6 +55,9 @@ type Health struct {
 	AbortedOnStart []manifest.TxID
 	// RebuiltIndexes lists blobs whose index was rebuilt by scan.
 	RebuiltIndexes []uint8
+	// Checkpointed counts frames below verified checkpoints whose payload
+	// hashes were not recomputed at open (E1-23).
+	Checkpointed int
 	// ParityWarning is set when the writable blobs cannot hold a parity
 	// group so that losing one whole blob is survivable (§7.4).
 	ParityWarning string
@@ -77,6 +84,7 @@ type Writer struct {
 	busy    map[string]bool
 	rr      atomic.Uint32
 	health  Health
+	opened  bool // OpenWriter completed
 }
 
 // OpenWriter takes the writer lock and opens the current generation for
@@ -189,28 +197,60 @@ func OpenWriter(fsys vfs.FS, opt Options) (w *Writer, err error) {
 		groupRef = func(g uint32) bool { return refd[g] }
 		tailHold = incomplete
 	}
+	// blobs are scanned in parallel; results are merged in ordinal order
+	type blobOpen struct {
+		bw  *blob.Writer
+		br  blob.OpenResult
+		err error
+	}
+	opens := make([]blobOpen, h.BlobCount)
 	for b := 0; b < int(h.BlobCount); b++ {
 		if w.ordAlloc[b], err = per(wire.AllocFrameOrdinal, uint8(b)); err != nil {
 			return nil, err
 		}
-		// unencrypted: the frame-ordinal check is skipped (§2.1.3.1)
-		name, _ := blob.Name(uint8(b))
-		committed := st.BlobCommitted(uint8(b), groupRef)
-		committed.TailMayHoldCommitted = tailHold
-		bw, br, err := blob.OpenWriter(fsys, path.Join(gen, name), h, opt.Pool, committed)
-		maxGroup = max(maxGroup, br.MaxGroupID)
+	}
+	var cps []blob.Checkpoint
+	if !opt.VerifyAll {
+		cps = readCheckpoints(fsys, gen, h)
+	}
+	var wg sync.WaitGroup
+	for b := 0; b < int(h.BlobCount); b++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// unencrypted: the frame-ordinal check is skipped (§2.1.3.1)
+			name, _ := blob.Name(uint8(b))
+			committed := st.BlobCommitted(uint8(b), groupRef)
+			committed.TailMayHoldCommitted = tailHold
+			if cps != nil {
+				committed.Verified = cps[b]
+			}
+			bw, br, err := blob.OpenWriter(fsys, path.Join(gen, name), h, opt.Pool, committed)
+			opens[b] = blobOpen{bw, br, err}
+		}()
+	}
+	wg.Wait()
+	var openErr error
+	for b, o := range opens {
+		maxGroup = max(maxGroup, o.br.MaxGroupID)
 		switch {
-		case blob.IsSealed(err):
-			w.health.Sealed[uint8(b)] = err
-		case err != nil:
-			return nil, fmt.Errorf("blob %02X: %w", b, err)
+		case blob.IsSealed(o.err):
+			w.health.Sealed[uint8(b)] = o.err
+		case o.err != nil:
+			if openErr == nil {
+				openErr = fmt.Errorf("blob %02X: %w", b, o.err)
+			}
 		default:
-			w.writers[b] = bw
-			if br.Truncated > 0 {
-				w.health.TornBlobBytes[uint8(b)] = br.Truncated
+			w.health.Checkpointed += o.br.Checkpointed
+			w.writers[b] = o.bw // closed by Close on failure
+			if o.br.Truncated > 0 {
+				w.health.TornBlobBytes[uint8(b)] = o.br.Truncated
 				truncated[b] = true
 			}
 		}
+	}
+	if openErr != nil {
+		return nil, openErr
 	}
 	if w.groupAlloc != nil {
 		// group_id cold-start check over every frame found (§2.1.3.1, §7)
@@ -246,6 +286,7 @@ func OpenWriter(fsys vfs.FS, opt Options) (w *Writer, err error) {
 			w.health.RebuiltIndexes = append(w.health.RebuiltIndexes, uint8(b))
 		}
 	}
+	w.opened = true
 	return w, nil
 }
 
@@ -510,6 +551,9 @@ func (w *Writer) Close() error {
 		if err != nil && first == nil {
 			first = err
 		}
+	}
+	if w.opened {
+		keep(w.writeCheckpoints())
 	}
 	for b, bv := range w.blobs {
 		if bv == nil {

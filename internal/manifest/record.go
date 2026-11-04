@@ -125,6 +125,16 @@ func DecodeLine(line []byte, encrypted bool) (*Record, error) {
 	if len(line) > MaxLineBytes {
 		return nil, corrupt("line of %d bytes exceeds MAX_MANIFEST_LINE_BYTES", len(line))
 	}
+	if !encrypted {
+		if r, ok := decodeCanonical(line); ok {
+			return r, nil
+		}
+	}
+	return decodeGeneric(line, encrypted)
+}
+
+// decodeGeneric is the strict path for every valid form (§10.1.1).
+func decodeGeneric(line []byte, encrypted bool) (*Record, error) {
 	v, err := parseJSON(line)
 	if err != nil {
 		return nil, err

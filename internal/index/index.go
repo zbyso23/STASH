@@ -273,3 +273,18 @@ func Load(fsys vfs.FS, name string, h *wire.ArchiveHeader, ordinal uint8, blobSi
 }
 
 func isDiscard(err error) bool { return errors.Is(err, ErrDiscard) }
+
+// Last returns the record with the highest physical offset (the frame
+// that ends the indexed region), if any.
+func (x *Index) Last() (wire.IndexRecord, bool) {
+	var best wire.IndexRecord
+	found := false
+	for _, rs := range [][]wire.IndexRecord{x.recs, x.pending} {
+		for _, r := range rs {
+			if !found || r.PhysicalOffset > best.PhysicalOffset {
+				best, found = r, true
+			}
+		}
+	}
+	return best, found
+}

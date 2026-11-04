@@ -328,6 +328,25 @@ func TestPublicParity(t *testing.T) {
 	}
 }
 
+// streaming a 64 MiB object through the lazy reader (read-ahead)
+func BenchmarkObjectCopy64M(b *testing.B) {
+	_, a := newArchive(b, stash.CreateOptions{})
+	defer a.Close()
+	a.Put("x", rnd(1, 64<<20))
+	b.SetBytes(64 << 20)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		o, err := a.OpenObject("x")
+		if err != nil {
+			b.Fatal(err)
+		}
+		if n, err := io.Copy(io.Discard, o); err != nil || n != 64<<20 {
+			b.Fatal(n, err)
+		}
+		o.Close()
+	}
+}
+
 // reading through parity with one of six blobs missing
 func BenchmarkGet64MRS42LostBlob(b *testing.B) {
 	dir, a := newArchive(b, rs42)
@@ -345,5 +364,80 @@ func BenchmarkGet64MRS42LostBlob(b *testing.B) {
 		if _, err := r.Get("x"); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// Opening an archive with 256 MiB in 64 large objects and 20,000 small
+// ones (writer: torn-tail scan of every blob, manifest replay, indexes).
+var openDir struct {
+	once sync.Once
+	dir  string
+}
+
+func openFixture(b *testing.B) string {
+	openDir.once.Do(func() {
+		dir, err := os.MkdirTemp("", "stash-open-bench")
+		if err != nil {
+			b.Fatal(err)
+		}
+		stash.Create(dir, stash.CreateOptions{})
+		a, err := stash.Open(dir, stash.Options{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		big := rnd(1, 4<<20)
+		for i := 0; i < 64; i++ {
+			a.Put(fmt.Sprintf("big/%d", i), big)
+		}
+		var wg sync.WaitGroup
+		for g := 0; g < 50; g++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := 0; i < 400; i++ {
+					a.Put(fmt.Sprintf("small/%d/%d", g, i), big[:1000+i])
+				}
+			}()
+		}
+		wg.Wait()
+		a.Close()
+		openDir.dir = dir
+	})
+	return openDir.dir
+}
+
+func BenchmarkOpenWriter(b *testing.B) {
+	dir := openFixture(b)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		a, err := stash.Open(dir, stash.Options{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		a.Close()
+	}
+}
+
+func BenchmarkOpenWriterVerifyAll(b *testing.B) {
+	dir := openFixture(b)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		a, err := stash.Open(dir, stash.Options{VerifyAll: true})
+		if err != nil {
+			b.Fatal(err)
+		}
+		a.Close()
+	}
+}
+
+func BenchmarkOpenReader(b *testing.B) {
+	dir := openFixture(b)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		r, err := stash.OpenReadOnly(dir)
+		if err != nil {
+			b.Fatal(err)
+		}
+		r.Close()
 	}
 }

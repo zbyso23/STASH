@@ -180,6 +180,24 @@ Benchmarks (4 cores, this container's disk): 64 KiB Puts with 64 writers about 3
 
 No SPEC change in this milestone.
 
+## Milestone 10 — performance (done)
+
+| Change | Where | Effect (4 cores, this container's disk) |
+|---|---|---|
+| canonical fast path for manifest lines: parses the writer form directly into a `Record` and accepts it only if `AppendLine` reproduces the line byte for byte, otherwise the strict generic parser decides (fuzz `FuzzFastPath`: the fast path never accepts what the generic path rejects or decodes differently); JSON parser builds arrays and objects through scratch stacks | `internal/manifest/fast.go`, `json.go` | manifest load 59 → about 200 MB/s per core |
+| read-ahead with parallel decoding of manifest lines (apply stays sequential) | `journal.go` | about 310 MB/s on 4 cores |
+| blobs and indexes opened and scanned in parallel | `archive/writer.go`, `view.go` | |
+| verified checkpoint (SPEC E1-23): a clean `Close` syncs the blobs and records per blob the end and the frame that ends there in `<generation>/health/verified.bin` (CRC32C, archive and generation identity); the next writer open walks frames below it by Prefix and tail without hashing and validates the last frame completely; any mismatch falls back to the full scan; `Options.VerifyAll` restores the full scan | `archive/checkpoint.go`, `blob.useCheckpoint` | writer open of a 256 MiB / 20,064-object archive 491 → 60 ms (with `VerifyAll` 200 ms); it no longer grows with the stored bytes |
+| `Get` fetches and verifies extents in parallel | `view.read` | 64 MiB Get 570-760 → 1,400-2,000 MB/s; with a lost blob (RS 4+2) 400 → 650-780 MB/s |
+| lazy objects fetch the next extent in the background | `Object.load` | 64 MiB `io.Copy` from `OpenObject` about 900 MB/s |
+| reader open | | 120 → 33 ms |
+
+Tried and dropped: `fdatasync` instead of `fsync` for blobs and the manifest gave no measurable gain on this filesystem. A sequential small Put stays at about 1.1-1.3 ms: two ordered syncs (blob, then manifest) are what §10.4 requires; concurrent writers share them (group commit).
+
+Tests: checkpoint used and advanced, payload damage below it reported on read (not sealed) and sealed with `VerifyAll`, damaged tail below it, damaged or foreign checkpoint file ignored, crashes after a clean close (every returned Put durable, nothing sealed, checkpoint still applied); fuzz `FuzzFastPath`; the whole suite under `-race`.
+
+SPEC change E1-23 (approved by the user): verified checkpoint in §10.4.2.
+
 ## Next milestones
 
-10. Performance (profiling of Put/Get paths, manifest decoder, fsync batching). Then recovery tooling (resync and full raw recovery), compaction with parity repair and regrouping, HARDENED anchor, encryption, zstd, CLI, FUSE.
+11. Recovery tooling (resync per §11.2.1 and full raw recovery). Then compaction with parity repair and regrouping, HARDENED anchor, encryption, zstd, CLI, FUSE.

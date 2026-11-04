@@ -45,6 +45,10 @@ type member struct {
 type parser struct {
 	b   []byte
 	pos int
+	// scratch stacks: elements are collected here and copied once into an
+	// exactly sized slice when the array or object closes
+	vals []value
+	mems []member
 }
 
 func corrupt(format string, args ...any) error {
@@ -124,6 +128,8 @@ func (p *parser) object(depth int) (value, error) {
 		p.pos++
 		return v, nil
 	}
+	mark := len(p.mems)
+	defer func() { p.mems = p.mems[:mark] }()
 	for {
 		p.ws()
 		if p.pos >= len(p.b) || p.b[p.pos] != '"' {
@@ -133,7 +139,7 @@ func (p *parser) object(depth int) (value, error) {
 		if err != nil {
 			return value{}, err
 		}
-		for _, m := range v.obj {
+		for _, m := range p.mems[mark:] {
 			if m.key == k {
 				return value{}, corrupt("duplicate key %q", k)
 			}
@@ -148,7 +154,7 @@ func (p *parser) object(depth int) (value, error) {
 		if err != nil {
 			return value{}, err
 		}
-		v.obj = append(v.obj, member{k, val})
+		p.mems = append(p.mems, member{k, val})
 		p.ws()
 		if p.pos >= len(p.b) {
 			return value{}, p.errAt("unterminated object")
@@ -158,6 +164,7 @@ func (p *parser) object(depth int) (value, error) {
 			p.pos++
 		case '}':
 			p.pos++
+			v.obj = append(make([]member, 0, len(p.mems)-mark), p.mems[mark:]...)
 			return v, nil
 		default:
 			return value{}, p.errAt("expected ',' or '}'")
@@ -173,13 +180,15 @@ func (p *parser) array(depth int) (value, error) {
 		p.pos++
 		return v, nil
 	}
+	mark := len(p.vals)
+	defer func() { p.vals = p.vals[:mark] }()
 	for {
 		p.ws()
 		e, err := p.value(depth + 1)
 		if err != nil {
 			return value{}, err
 		}
-		v.arr = append(v.arr, e)
+		p.vals = append(p.vals, e)
 		p.ws()
 		if p.pos >= len(p.b) {
 			return value{}, p.errAt("unterminated array")
@@ -189,6 +198,7 @@ func (p *parser) array(depth int) (value, error) {
 			p.pos++
 		case ']':
 			p.pos++
+			v.arr = append(make([]value, 0, len(p.vals)-mark), p.vals[mark:]...)
 			return v, nil
 		default:
 			return value{}, p.errAt("expected ',' or ']'")

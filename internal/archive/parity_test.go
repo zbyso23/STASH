@@ -216,7 +216,9 @@ func TestParityRepairsDamagedFrames(t *testing.T) {
 					}
 				}
 				r.Close()
-				// the writer seals the damaged blobs and still reads everything
+				// without the checkpoint the writer seals the damaged blobs
+				// and still reads everything
+				dropCheckpoints(t, fsys)
 				w := mustOpen(t, fsys)
 				if len(w.Health().Sealed) == 0 {
 					t.Fatal("damaged committed frames did not seal")

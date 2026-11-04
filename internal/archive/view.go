@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -55,30 +56,48 @@ func (v *view) openBlobs(writeIndexes, tolerate bool) (statuses []index.Status, 
 	v.blobs = make([]*blobView, v.h.BlobCount)
 	v.unavailable = map[uint8]error{}
 	statuses = make([]index.Status, v.h.BlobCount)
+	errs := make([]error, len(v.blobs))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
 	for b := range v.blobs {
-		name, _ := blob.Name(uint8(b))
-		r, err := blob.Open(v.fsys, path.Join(v.gen, name), v.h, v.pool)
-		if err != nil {
-			if tolerate && !errors.Is(err, wire.ErrUnsupported) {
-				v.unavailable[uint8(b)] = err
-				continue
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			name, _ := blob.Name(uint8(b))
+			r, err := blob.Open(v.fsys, path.Join(v.gen, name), v.h, v.pool)
+			if err != nil {
+				if tolerate && !errors.Is(err, wire.ErrUnsupported) {
+					mu.Lock()
+					v.unavailable[uint8(b)] = err
+					mu.Unlock()
+					return
+				}
+				errs[b] = fmt.Errorf("blob %02X: %w", b, err)
+				return
 			}
-			return nil, fmt.Errorf("blob %02X: %w", b, err)
-		}
-		iname, _ := index.Name(uint8(b))
-		x, st, err := index.Open(v.fsys, path.Join(v.gen, iname), r, v.h, uint8(b), v.pool)
-		if err != nil {
-			r.Close()
-			return nil, fmt.Errorf("index %02X: %w", b, err)
-		}
-		if writeIndexes && (st.Rebuilt || st.CaughtUp > 0) {
-			if err := x.Write(v.fsys, path.Join(v.gen, iname)); err != nil {
+			iname, _ := index.Name(uint8(b))
+			x, st, err := index.Open(v.fsys, path.Join(v.gen, iname), r, v.h, uint8(b), v.pool)
+			if err != nil {
 				r.Close()
-				return nil, err
+				errs[b] = fmt.Errorf("index %02X: %w", b, err)
+				return
 			}
+			if writeIndexes && (st.Rebuilt || st.CaughtUp > 0) {
+				if err := x.Write(v.fsys, path.Join(v.gen, iname)); err != nil {
+					r.Close()
+					errs[b] = err
+					return
+				}
+			}
+			statuses[b] = st
+			v.blobs[b] = &blobView{r: r, idx: x}
+		}()
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
 		}
-		statuses[b] = st
-		v.blobs[b] = &blobView{r: r, idx: x}
 	}
 	return statuses, nil
 }
@@ -168,15 +187,52 @@ func slicePacked(ref *blob.Ref, p string, fileVer uint64, l manifest.Loc) {
 }
 
 // read assembles a whole version (§9.2: order by logical_offset only).
+// Extents are fetched and verified in parallel.
 func (v *view) read(p string, ver *manifest.Version) ([]byte, error) {
 	out := make([]byte, ver.Length)
-	for _, l := range ver.Loc {
+	one := func(l manifest.Loc) error {
 		ref, err := v.fetch(p, ver, l)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		copy(out[l.Offset:], ref.Payload)
 		ref.Release()
+		return nil
+	}
+	workers := min(runtime.GOMAXPROCS(0), len(ver.Loc))
+	if workers <= 1 {
+		for _, l := range ver.Loc {
+			if err := one(l); err != nil {
+				return nil, err
+			}
+		}
+		return out, nil
+	}
+	next := make(chan manifest.Loc)
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			var first error
+			for l := range next {
+				if first == nil {
+					first = one(l)
+				}
+			}
+			errs <- first
+		}()
+	}
+	for _, l := range ver.Loc {
+		next <- l
+	}
+	close(next)
+	var first error
+	for i := 0; i < workers; i++ {
+		if err := <-errs; err != nil && first == nil {
+			first = err
+		}
+	}
+	if first != nil {
+		return nil, first
 	}
 	return out, nil
 }
@@ -189,9 +245,63 @@ type Object struct {
 	path string
 	ver  *manifest.Version
 
-	mu  sync.Mutex
-	cur *blob.Ref // last frame read (sequential reads hit it)
-	at  int       // its extent index
+	mu    sync.Mutex
+	cur   *blob.Ref // last frame read (sequential reads hit it)
+	at    int       // its extent index
+	ahead *prefetch // the next extent, fetched in the background
+}
+
+// prefetch is a background fetch of extent i.
+type prefetch struct {
+	i   int
+	ch  chan fetched
+	got *fetched
+}
+
+type fetched struct {
+	ref *blob.Ref
+	err error
+}
+
+func (f *prefetch) wait() fetched {
+	if f.got == nil {
+		r := <-f.ch
+		f.got = &r
+	}
+	return *f.got
+}
+
+// drop releases a prefetch that will not be used.
+func (f *prefetch) drop() {
+	if r := f.wait(); r.ref != nil {
+		r.ref.Release()
+	}
+}
+
+// load returns extent i: the prefetched one when it matches, and starts
+// fetching i+1 so sequential reads overlap I/O and hashing. o.mu is held.
+func (o *Object) load(i int) (*blob.Ref, error) {
+	var r fetched
+	if o.ahead != nil && o.ahead.i == i {
+		r = o.ahead.wait()
+		o.ahead = nil
+	} else {
+		if o.ahead != nil {
+			o.ahead.drop()
+			o.ahead = nil
+		}
+		r.ref, r.err = o.v.fetch(o.path, o.ver, o.ver.Loc[i])
+	}
+	if r.err == nil && i+1 < len(o.ver.Loc) {
+		f := &prefetch{i: i + 1, ch: make(chan fetched, 1)}
+		l := o.ver.Loc[i+1]
+		go func() {
+			ref, err := o.v.fetch(o.path, o.ver, l)
+			f.ch <- fetched{ref, err}
+		}()
+		o.ahead = f
+	}
+	return r.ref, r.err
 }
 
 func (v *view) object(p string, ver *manifest.Version) *Object {
@@ -225,7 +335,7 @@ func (a objectAt) ReadAt(b []byte, off int64) (int, error) {
 				o.cur.Release()
 				o.cur = nil
 			}
-			ref, err := o.v.fetch(o.path, o.ver, l)
+			ref, err := o.load(i)
 			if err != nil {
 				o.at = -1
 				o.mu.Unlock()
@@ -246,6 +356,10 @@ func (o *Object) Close() error {
 	if o.cur != nil {
 		o.cur.Release()
 		o.cur, o.at = nil, -1
+	}
+	if o.ahead != nil {
+		o.ahead.drop()
+		o.ahead = nil
 	}
 	return nil
 }

@@ -3,6 +3,7 @@ package blob
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 
@@ -37,20 +38,34 @@ type Committed struct {
 	// member that no blob holds intact: such a member may lie in this
 	// blob's [E, EOF), so the tail is not truncated (§10.4.2, E1-22).
 	TailMayHoldCommitted bool
+	// Verified is an optional checkpoint from a clean close (E1-23).
+	Verified Checkpoint
+}
+
+// Checkpoint records that every frame below End was validated completely
+// and durably flushed; the frame [LastOff, End) carries LastHash. Below
+// End the open scan checks Prefixes and tails only (no payload hashing);
+// the frame ending at End is validated completely. A checkpoint that does
+// not match the blob is ignored.
+type Checkpoint struct {
+	End, LastOff int64
+	LastHash     [32]byte
 }
 
 // keysOf returns the keys under which a validated frame satisfies locs.
-func keysOf(f *frame.Frame) []FrameKey {
-	switch f.Trailer.BlockType {
+func keysOf(f *frame.Frame) []FrameKey { return keysOfTail(&f.Trailer, f.Entries) }
+
+func keysOfTail(t *wire.MasterTrailer, entries []wire.Entry) []FrameKey {
+	switch t.BlockType {
 	case wire.BlockData:
-		if len(f.Entries) == 1 {
-			e := f.Entries[0]
-			return []FrameKey{{Hash: f.Trailer.HashPayload, Path: e.Path, FileVer: e.FileVer, Offset: e.Offset}}
+		if len(entries) == 1 {
+			e := entries[0]
+			return []FrameKey{{Hash: t.HashPayload, Path: e.Path, FileVer: e.FileVer, Offset: e.Offset}}
 		}
 	case wire.BlockPacked:
-		ks := make([]FrameKey, len(f.Entries))
-		for i, e := range f.Entries {
-			ks[i] = FrameKey{Hash: f.Trailer.HashPayload, Path: e.Path, FileVer: e.FileVer}
+		ks := make([]FrameKey, len(entries))
+		for i, e := range entries {
+			ks[i] = FrameKey{Hash: t.HashPayload, Path: e.Path, FileVer: e.FileVer}
 		}
 		return ks
 	}
@@ -90,6 +105,9 @@ type OpenResult struct {
 	Tail []TailFrame
 	// Truncated is the number of torn bytes removed.
 	Truncated int64
+	// Checkpointed is the number of frames below a matching checkpoint
+	// whose payloads were not hashed (E1-23).
+	Checkpointed int
 	// MaxGroupID and MaxOrdinal are the largest group_id and frame_ordinal
 	// over every valid frame found (valid run and tail), for the allocator
 	// cold-start checks (§2.1.3.1); HasFrames is false when there are none.
@@ -169,9 +187,26 @@ func OpenWriter(fsys vfs.FS, name string, h *wire.ArchiveHeader, pool *bufpool.P
 		}
 		return nil
 	}
-	if res.Scan, err = scan(f, h, pool, wire.FrameAreaStart, size, collect); err != nil {
+	start := int64(wire.FrameAreaStart)
+	if n, ok, err := useCheckpoint(f, h, pool, committed.Verified, size, func(hf HopFrame) {
+		res.see(&hf.Trailer)
+		for _, k := range keysOfTail(&hf.Trailer, hf.Entries) {
+			if _, ok := committed.Refs[k]; ok {
+				satisfied[k] = struct{}{}
+			}
+		}
+	}); err != nil {
+		return fail(err)
+	} else if ok {
+		start, res.Checkpointed = committed.Verified.End, n
+	} else {
+		clear(satisfied)
+		res = OpenResult{}
+	}
+	if res.Scan, err = scan(f, h, pool, start, size, collect); err != nil {
 		return fail(err)
 	}
+	res.Scan.Frames += res.Checkpointed
 	E := res.Scan.End
 	if len(satisfied) < len(committed.Refs) {
 		// Committed data lies at or beyond E even if nothing validates
@@ -386,3 +421,45 @@ func (w *Writer) Close() error { return w.f.Close() }
 
 // IsSealed reports whether err is ErrSealed.
 func IsSealed(err error) bool { return errors.Is(err, ErrSealed) }
+
+// useCheckpoint walks [FRAME_AREA_START, cp.End) by Prefix and tail
+// (hop-and-read without payload hashing) and validates the frame ending at
+// cp.End completely. ok is false when the checkpoint does not match the
+// blob exactly (a gap, another last frame, a different length); the
+// caller then scans everything. see receives every frame walked.
+func useCheckpoint(f vfs.File, h *wire.ArchiveHeader, pool *bufpool.Pool, cp Checkpoint, size int64, see func(HopFrame)) (int, bool, error) {
+	if cp.End <= wire.FrameAreaStart || cp.End > size || cp.LastOff < wire.FrameAreaStart || cp.LastOff >= cp.End {
+		return 0, false, nil
+	}
+	var buf []byte
+	var seen []HopFrame
+	off := int64(wire.FrameAreaStart)
+	for off < cp.End {
+		hf, ok, err := tailAt(f, h, off, cp.End, &buf)
+		if err != nil {
+			return 0, false, err
+		}
+		if !ok {
+			return 0, false, nil
+		}
+		seen = append(seen, hf)
+		off += int64(wire.FrameSize(hf.Quanta))
+	}
+	last := seen[len(seen)-1]
+	if off != cp.End || last.Offset != cp.LastOff || last.Trailer.HashPayload != cp.LastHash {
+		return 0, false, nil
+	}
+	w := &window{f: f, size: cp.End, pool: pool}
+	_, _, err := parseAt(w, h, cp.LastOff) // full validation, hash included
+	w.release()
+	if err != nil {
+		if !wire.IsFormatError(err) && err != io.ErrUnexpectedEOF {
+			return 0, false, err
+		}
+		return 0, false, nil
+	}
+	for _, hf := range seen {
+		see(hf)
+	}
+	return len(seen), true, nil
+}

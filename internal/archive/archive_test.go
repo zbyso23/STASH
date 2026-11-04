@@ -317,11 +317,13 @@ func TestSealedBlob(t *testing.T) {
 		w.Put(fmt.Sprintf("p%d", i), data(i, 5000))
 	}
 	w.Close()
-	// damage the first frame of blob 01: committed data before E
+	// damage the first frame of blob 01: committed data before E; without
+	// the clean-close checkpoint the open hashes every frame (E1-23)
 	f, _ := c.OpenFile(path.Join(GenDir(0), "frames/blob-01.stash"), os.O_RDWR, 0)
 	f.WriteAt([]byte{0xFF, 0xFF, 0xFF}, 0x40+200)
 	f.Sync()
 	f.Close()
+	dropCheckpoints(t, c)
 	w = mustOpen(t, c)
 	if _, ok := w.Health().Sealed[1]; !ok {
 		t.Fatalf("health %+v", w.Health())
@@ -496,5 +498,12 @@ func TestCrashDuringGroupCommit(t *testing.T) {
 			w2.Close()
 		}
 		t.Logf("seed %d: %d records in %d batches, %d crash points", seed, records, batches, len(s.snaps))
+	}
+}
+
+func dropCheckpoints(t testing.TB, fsys vfs.FS) {
+	t.Helper()
+	if err := fsys.Remove(path.Join(GenDir(0), checkpointName)); err != nil {
+		t.Fatal(err)
 	}
 }

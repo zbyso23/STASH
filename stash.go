@@ -166,6 +166,10 @@ type Options struct {
 	// the other small objects written at the same time (default 64 KiB;
 	// negative disables packing).
 	PackThreshold int
+	// VerifyAll hashes every frame when opening, even data that was
+	// verified before the last clean close (slower; payload damage is then
+	// found at open instead of on read).
+	VerifyAll bool
 }
 
 // Archive is an archive opened for writing. Its methods are safe for
@@ -177,7 +181,7 @@ type Archive struct {
 // Open opens the archive in dir for writing, taking the writer lock and
 // running crash recovery (torn tails, open transactions, indexes).
 func Open(dir string, o Options) (*Archive, error) {
-	w, err := archive.OpenWriter(vfs.OS{Root: dir}, archive.Options{MaxExtent: o.MaxExtent, PackThreshold: o.PackThreshold})
+	w, err := archive.OpenWriter(vfs.OS{Root: dir}, archive.Options{MaxExtent: o.MaxExtent, PackThreshold: o.PackThreshold, VerifyAll: o.VerifyAll})
 	if err != nil {
 		return nil, err
 	}

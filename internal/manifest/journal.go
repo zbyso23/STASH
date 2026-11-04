@@ -9,6 +9,8 @@ import (
 	"io"
 	"os"
 	"path"
+	"runtime"
+	"sync"
 
 	"crypto/sha256"
 
@@ -144,6 +146,82 @@ type cursor struct {
 	main   bool
 	torn   *LoadInfo
 	minSeq uint64 // records must be greater (LINK seq for linked files)
+
+	// read-ahead: lines decoded in parallel, consumed in order
+	ahead []lineItem
+	next  int
+	arena []byte
+	batch int
+}
+
+// lineItem is one read-ahead result of lineReader.next plus its decoding.
+type lineItem struct {
+	line      []byte
+	at, tail  int64
+	err       error
+	nul       bool
+	rec       *Record
+	decodeErr error
+}
+
+// fill reads the next lines (stopping after the first non-line event or a
+// line with NUL) and decodes them in parallel. DecodeLine is a pure
+// function of the line, so only Apply has to stay sequential.
+func (c *cursor) fill(encrypted bool) {
+	if c.batch == 0 {
+		c.batch = 64
+	} else if c.batch < 4096 {
+		c.batch *= 2
+	}
+	c.ahead, c.next, c.arena = c.ahead[:0], 0, c.arena[:0]
+	for len(c.ahead) < c.batch && len(c.arena) < 8<<20 {
+		line, at, tail, err := c.lr.next()
+		it := lineItem{at: at, tail: tail, err: err}
+		if err == nil {
+			start := len(c.arena)
+			c.arena = append(c.arena, line...)
+			it.line = c.arena[start:len(c.arena):len(c.arena)]
+			it.nul = c.main && bytes.IndexByte(line, 0) >= 0
+		}
+		c.ahead = append(c.ahead, it)
+		if err != nil || it.nul {
+			break
+		}
+	}
+	// arena may have moved while growing: re-slice the lines
+	off := 0
+	for i := range c.ahead {
+		if c.ahead[i].err == nil {
+			n := len(c.ahead[i].line)
+			c.ahead[i].line = c.arena[off : off+n : off+n]
+			off += n
+		}
+	}
+	decode := func(lo, hi int) {
+		for i := lo; i < hi; i++ {
+			it := &c.ahead[i]
+			if it.err == nil && !it.nul {
+				it.rec, it.decodeErr = DecodeLine(it.line, encrypted)
+			}
+		}
+	}
+	n := len(c.ahead)
+	w := min(runtime.GOMAXPROCS(0), n/32)
+	if w <= 1 {
+		decode(0, n)
+		return
+	}
+	var wg sync.WaitGroup
+	chunk := (n + w - 1) / w
+	for lo := 0; lo < n; lo += chunk {
+		hi := min(lo+chunk, n)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			decode(lo, hi)
+		}()
+	}
+	wg.Wait()
 }
 
 func (c *cursor) corrupt(at int64, format string, args ...any) error {
@@ -153,7 +231,12 @@ func (c *cursor) corrupt(at int64, format string, args ...any) error {
 // advance reads the next record into c.rec (nil at the end).
 func (c *cursor) advance(encrypted bool) error {
 	c.rec = nil
-	line, at, tail, err := c.lr.next()
+	if c.next >= len(c.ahead) {
+		c.fill(encrypted)
+	}
+	it := &c.ahead[c.next]
+	c.next++
+	at, tail, err := it.at, it.tail, it.err
 	switch {
 	case err == io.EOF:
 		if tail > 0 {
@@ -170,14 +253,14 @@ func (c *cursor) advance(encrypted bool) error {
 	case err != nil:
 		return err
 	}
-	if c.main && bytes.IndexByte(line, 0) >= 0 {
+	if it.nul {
 		// A writer never emits NUL (JSON escapes it); NUL bytes are pages
 		// of an append that never reached storage (§10.4.2).
 		size, _ := c.f.Size()
 		c.torn.ValidEnd, c.torn.Torn, c.torn.TornReason = at, min(size, c.lr.limit)-at, "NUL"
 		return nil
 	}
-	r, err := DecodeLine(line, encrypted)
+	r, err := it.rec, it.decodeErr
 	if err != nil {
 		return fmt.Errorf("%s offset %d: %w", c.name, at, err)
 	}
