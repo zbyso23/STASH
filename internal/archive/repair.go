@@ -34,8 +34,26 @@ type hopMember struct {
 }
 
 func (m *hopMember) matches(p string, ver uint64, l manifest.Loc) bool {
-	return m.t.BlockType == wire.BlockData && m.t.HashPayload == l.Hash && len(m.entries) == 1 &&
-		m.entries[0].Path == p && m.entries[0].FileVer == ver && m.entries[0].Offset == l.Offset
+	if m.t.HashPayload != l.Hash {
+		return false
+	}
+	switch m.t.BlockType {
+	case wire.BlockData:
+		return len(m.entries) == 1 && m.entries[0].Path == p && m.entries[0].FileVer == ver && m.entries[0].Offset == l.Offset
+	case wire.BlockPacked:
+		return l.Offset == 0 && m.holds(p, ver)
+	}
+	return false
+}
+
+// holds reports whether the frame carries an entry of (p, ver).
+func (m *hopMember) holds(p string, ver uint64) bool {
+	for _, e := range m.entries {
+		if e.Path == p && e.FileVer == ver {
+			return true
+		}
+	}
+	return false
 }
 
 // frameDir is the raw directory of every frame found by hopping all
@@ -171,7 +189,7 @@ func (v *view) recover(p string, ver *manifest.Version, l manifest.Loc, accept f
 	add(d.rebuiltAs[key])
 	for _, o := range ver.Loc {
 		for _, m := range d.byHash[o.Hash] {
-			if len(m.entries) == 1 && m.entries[0].Path == p && m.entries[0].FileVer == ver.FileVer {
+			if m.holds(p, ver.FileVer) {
 				add(m.t.GroupID)
 			}
 		}
@@ -280,14 +298,19 @@ func (v *view) rebuildFrom(d *frameDir, g uint32, key blob.FrameKey, accept func
 			ref.Release()
 			continue
 		}
-		if ref.Trailer.BlockType == wire.BlockData && len(ref.Entries) == 1 {
-			e := ref.Entries[0]
-			rk := blob.FrameKey{Hash: t.HashPayload, Path: e.Path, FileVer: e.FileVer, Offset: e.Offset}
-			d.rebuiltAs[rk] = g
-			if found == nil && rk == key && accept(ref) {
-				found = ref
-				continue
+		hit := false
+		for _, e := range ref.Entries {
+			off := e.Offset
+			if t.BlockType == wire.BlockPacked {
+				off = 0 // §9.1: a PACKED loc names offset 0
 			}
+			rk := blob.FrameKey{Hash: t.HashPayload, Path: e.Path, FileVer: e.FileVer, Offset: off}
+			d.rebuiltAs[rk] = g
+			hit = hit || rk == key
+		}
+		if found == nil && hit && accept(ref) {
+			found = ref
+			continue
 		}
 		ref.Release()
 	}

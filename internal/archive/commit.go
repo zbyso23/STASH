@@ -22,6 +22,10 @@ type commitReq struct {
 	fileVer uint64
 	locs    []manifest.Loc
 	blobs   map[int]bool
+	// pack: the leader writes small into a PACKED frame (§8)
+	pack   bool
+	small  []byte
+	packed bool // the packing stage handled it
 
 	done bool
 	err  error
@@ -33,9 +37,14 @@ type commitReq struct {
 // touched blob and one manifest sync. No timer, no added latency: batches
 // form exactly while a sync is in progress.
 type groupCommit struct {
-	qMu     sync.Mutex
-	queue   []*commitReq
-	leader  sync.Mutex
+	qMu    sync.Mutex
+	queue  []*commitReq
+	leader sync.Mutex
+	// packing stage: small objects of concurrent Puts are packed by one
+	// leader while the previous batch syncs (§8)
+	pMu     sync.Mutex
+	pQueue  []*commitReq
+	pLeader sync.Mutex
 	batches int // statistics
 	records int
 }
@@ -45,6 +54,35 @@ func (w *Writer) CommitStats() (batches, records int) {
 	w.gc.qMu.Lock()
 	defer w.gc.qMu.Unlock()
 	return w.gc.batches, w.gc.records
+}
+
+// commitPacked runs a small-object request through the packing stage,
+// then through the group commit. Packing of one batch overlaps the syncs
+// of the previous one.
+func (w *Writer) commitPacked(r *commitReq) error {
+	g := &w.gc
+	g.pMu.Lock()
+	g.pQueue = append(g.pQueue, r)
+	g.pMu.Unlock()
+
+	g.pLeader.Lock()
+	g.pMu.Lock()
+	if !r.packed {
+		batch := g.pQueue
+		g.pQueue = nil
+		g.pMu.Unlock()
+		w.writePacked(batch)
+		g.pMu.Lock()
+		for _, b := range batch {
+			b.packed = true
+		}
+	}
+	g.pMu.Unlock()
+	g.pLeader.Unlock()
+	if r.err != nil {
+		return r.err
+	}
+	return w.commit(r)
 }
 
 func (w *Writer) commit(r *commitReq) error {

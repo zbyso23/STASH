@@ -32,7 +32,11 @@ type Options struct {
 	// MaxExtent caps the logical bytes per DATA frame (default 4 MiB, never
 	// more than the frame can hold).
 	MaxExtent int
-	Limits    manifest.Limits
+	// PackThreshold: objects up to this size are packed into shared
+	// PACKED frames by the group commit (§8). 0 means
+	// DefaultPackThreshold, negative disables packing.
+	PackThreshold int
+	Limits        manifest.Limits
 }
 
 // Health reports conditions found when opening (§13.9).
@@ -276,9 +280,12 @@ func (w *Writer) groupCensus(st *manifest.State) (referenced map[uint32]bool, in
 				groups[g] = gi
 			}
 			gi.idx[f.Trailer.GroupIndex] = true
-			if f.Trailer.BlockType == wire.BlockData && len(f.Entries) == 1 {
-				e := f.Entries[0]
-				if _, ok := refs[blob.FrameKey{Hash: f.Trailer.HashPayload, Path: e.Path, FileVer: e.FileVer, Offset: e.Offset}]; ok {
+			for _, e := range f.Entries {
+				off := e.Offset
+				if f.Trailer.BlockType == wire.BlockPacked {
+					off = 0
+				}
+				if _, ok := refs[blob.FrameKey{Hash: f.Trailer.HashPayload, Path: e.Path, FileVer: e.FileVer, Offset: off}]; ok {
 					referenced[g] = true
 				}
 			}
@@ -351,6 +358,9 @@ func (w *Writer) Put(p string, data []byte) (uint64, error) {
 		return 0, err
 	}
 	defer w.release(p)
+	if len(data) <= w.packMax(p) {
+		return w.putPacked(p, data)
+	}
 	src := func(off int) ([]byte, func(), error) {
 		if off >= len(data) && !(off == 0 && len(data) == 0) {
 			return nil, nil, errDone
@@ -429,8 +439,28 @@ func (w *Writer) PutReader(ctx context.Context, p string, r io.Reader) (uint64, 
 		return 0, err
 	}
 	defer w.release(p)
-	eof := false
+	// the first chunk decides between a PACKED object and extents
+	first := w.pool.Get(chunk)
+	n, err := io.ReadFull(r, first)
+	eof := err == io.EOF || err == io.ErrUnexpectedEOF
+	if err != nil && !eof {
+		w.pool.Put(first)
+		return 0, err
+	}
+	if eof && n <= w.packMax(p) {
+		defer w.pool.Put(first)
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		return w.putPacked(p, first[:n])
+	}
+	pre := first[:n]
 	src := func(off int) ([]byte, func(), error) {
+		if pre != nil {
+			b := pre
+			pre = nil
+			return b, func() { w.pool.Put(first) }, nil
+		}
 		if eof {
 			return nil, nil, errDone
 		}
@@ -450,6 +480,19 @@ func (w *Writer) PutReader(ctx context.Context, p string, r io.Reader) (uint64, 
 		return buf[:n], func() { w.pool.Put(buf) }, nil
 	}
 	return w.writeAndCommit(ctx, p, src)
+}
+
+// putPacked commits a small object; the group commit leader packs it
+// with the other small objects of its batch (§8).
+func (w *Writer) putPacked(p string, data []byte) (uint64, error) {
+	ver, err := w.verAlloc.Next()
+	if err != nil {
+		return 0, err
+	}
+	if err := w.commitPacked(&commitReq{path: p, fileVer: ver, pack: true, small: data}); err != nil {
+		return 0, err
+	}
+	return ver, nil
 }
 
 // List returns the live paths.

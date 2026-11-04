@@ -3,7 +3,7 @@
 //
 // Current scope: STANDARD security policy, unencrypted archives, STORE
 // codec, VARIABLE and FIXED frame modes, optional XOR or Reed-Solomon
-// parity with repair on read. One writer per
+// parity with repair on read, small objects packed into shared frames. One writer per
 // archive (an exclusive lock on writer.lock); any number of readers.
 //
 //	err := stash.Create(dir, stash.CreateOptions{})
@@ -162,6 +162,10 @@ func Create(dir string, o CreateOptions) error {
 type Options struct {
 	// MaxExtent caps the bytes per frame of one object (default 4 MiB).
 	MaxExtent int
+	// PackThreshold: objects up to this size share PACKED frames with
+	// the other small objects written at the same time (default 64 KiB;
+	// negative disables packing).
+	PackThreshold int
 }
 
 // Archive is an archive opened for writing. Its methods are safe for
@@ -173,7 +177,7 @@ type Archive struct {
 // Open opens the archive in dir for writing, taking the writer lock and
 // running crash recovery (torn tails, open transactions, indexes).
 func Open(dir string, o Options) (*Archive, error) {
-	w, err := archive.OpenWriter(vfs.OS{Root: dir}, archive.Options{MaxExtent: o.MaxExtent})
+	w, err := archive.OpenWriter(vfs.OS{Root: dir}, archive.Options{MaxExtent: o.MaxExtent, PackThreshold: o.PackThreshold})
 	if err != nil {
 		return nil, err
 	}

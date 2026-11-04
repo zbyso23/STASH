@@ -179,7 +179,7 @@ func TestParityRepairsDamagedFrames(t *testing.T) {
 				hit := 0
 				for _, ms := range groups {
 					for _, mem := range ms {
-						if mem.t.BlockType != wire.BlockData {
+						if mem.t.BlockType == wire.BlockParity {
 							continue
 						}
 						off := mem.off + 16 // first payload byte
@@ -363,7 +363,7 @@ func TestParityGroupConflict(t *testing.T) {
 	var dataMem, parMem *hopMember
 	for _, ms := range groups {
 		for _, m := range ms {
-			if m.t.BlockType == wire.BlockData {
+			if m.t.BlockType != wire.BlockParity {
 				dataMem = m
 			} else {
 				parMem = m

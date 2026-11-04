@@ -163,6 +163,23 @@ SPEC change E1-22: the torn-tail rule did not protect PARITY frames, because no 
 
 Not yet: regrouping and repair by compaction (§7.3.1, §13.7), Emergency Pruning (§13.9), encrypted opaque shards (crypto milestone), `PARITY_GROUP` records (optional; discovery is by frame metadata).
 
+## Milestone 9 — PACKED small objects (done)
+
+| Where | Content | SPEC |
+|---|---|---|
+| `internal/archive/pack.go` | objects up to `Options.PackThreshold` (default 64 KiB, never more than an otherwise empty frame holds, negative disables) go through a packing stage: one leader takes every small object queued by concurrent Puts, sorts by canonical path, fills PACKED frames (dense `inner_offset`, at most 65535 entries, frame capacity), spreads the batch over one frame per core, or over `parity_k` (or a multiple) similar frames with parity so groups are full, writes them in parallel and hands the requests to the group commit with one `loc` `[blob, frame_hash, 0, length]` each | §8, §9.1 |
+| `commit.go` | two pipelined leaders: packing of batch N+1 runs while batch N syncs | §10.4 |
+| `groupwrite.go` | `writeGroupFrames`: one parity group of any DATA or PACKED frames (shared by both paths) | §7 |
+| `view.go`, `repair.go` | reads resolve a PACKED `loc` by block type and the entry with the record's path and `file_ver` (binary search, entries are sorted) and slice the payload; hop-and-read and parity reconstruction match PACKED entries; torn-tail group census counts PACKED members | §9.1, §10.4.2, §11.5 |
+
+`PutReader` reads the first chunk and packs the object when the stream ends within the threshold.
+
+Tests: concurrent small Puts land in multi-entry PACKED frames (no DATA frames) and read back through `Get`, lazy objects, a reader and after reopening, without parity, RS 3+2 and XOR in FIXED mode; threshold boundaries for `Put` and `PutReader`, empty objects, packing disabled, the largest object an 8 KiB frame can pack and one byte more routed to DATA; one batch of 65,545 objects split into frames of at most 65,535 entries; crash at every mutating step (181 and 281 points) of concurrent packed writers with and without parity: every returned Put durable, nothing sealed; damaged or lost PACKED frames rebuilt from parity (the M8 parity tests now run on PACKED members).
+
+Benchmarks (4 cores, this container's disk): 64 KiB Puts with 64 writers about 340-375 MB/s (M8 349), with RS 4+2 about 180-200 MB/s (M8 130); 4 KiB Puts with RS 4+2 about 40 MB/s packed vs 25 unpacked. Disk bytes per logical byte for 3,200 objects of 1-3.5 KiB written by 64 writers: 1.39 packed vs 1.84 unpacked, with RS 4+2 2.42 vs 5.52.
+
+No SPEC change in this milestone.
+
 ## Next milestones
 
-9. PACKED small objects. Then recovery tooling (hop-and-read exists; resync and full raw recovery), compaction with parity repair and regrouping, HARDENED anchor, encryption, zstd, CLI, FUSE.
+10. Performance (profiling of Put/Get paths, manifest decoder, fsync batching). Then recovery tooling (resync and full raw recovery), compaction with parity repair and regrouping, HARDENED anchor, encryption, zstd, CLI, FUSE.

@@ -204,7 +204,18 @@ func TestSingleWriter(t *testing.T) {
 func benchPut(b *testing.B, size, par int) { benchPutOpt(b, size, par, stash.CreateOptions{}) }
 
 func benchPutOpt(b *testing.B, size, par int, o stash.CreateOptions) {
-	_, a := newArchive(b, o)
+	benchPutOpen(b, size, par, o, stash.Options{})
+}
+
+func benchPutOpen(b *testing.B, size, par int, o stash.CreateOptions, oo stash.Options) {
+	dir := b.TempDir()
+	if err := stash.Create(dir, o); err != nil {
+		b.Fatal(err)
+	}
+	a, err := stash.Open(dir, oo)
+	if err != nil {
+		b.Fatal(err)
+	}
 	defer a.Close()
 	d := rnd(1, size)
 	b.SetBytes(int64(size))
@@ -243,6 +254,16 @@ var rs42 = stash.CreateOptions{Blobs: 6, Parity: stash.Parity{Scheme: stash.Reed
 
 func BenchmarkPut64KParallelRS42(b *testing.B) { benchPutOpt(b, 64<<10, 16, rs42) }
 func BenchmarkPut64MRS42(b *testing.B)         { benchPutOpt(b, 64<<20, 0, rs42) }
+
+// 4 KiB objects, 16 goroutines per CPU: PACKED vs one DATA frame each
+func BenchmarkPut4KParallelPacked(b *testing.B) { benchPutOpt(b, 4<<10, 16, stash.CreateOptions{}) }
+func BenchmarkPut4KParallelUnpacked(b *testing.B) {
+	benchPutOpen(b, 4<<10, 16, stash.CreateOptions{}, stash.Options{PackThreshold: -1})
+}
+func BenchmarkPut4KParallelPackedRS42(b *testing.B) { benchPutOpt(b, 4<<10, 16, rs42) }
+func BenchmarkPut4KParallelUnpackedRS42(b *testing.B) {
+	benchPutOpen(b, 4<<10, 16, rs42, stash.Options{PackThreshold: -1})
+}
 
 func BenchmarkGet64M(b *testing.B) {
 	_, a := newArchive(b, stash.CreateOptions{})

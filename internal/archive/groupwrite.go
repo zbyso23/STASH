@@ -177,7 +177,6 @@ func (w *Writer) placement(n int) ([]int, error) {
 // writeGroup writes the DATA members and PARITY frames of one group. It
 // releases the members' source buffers. The frames are not durable yet.
 func (w *Writer) writeGroup(p string, ver uint64, members []pending, q uint32) ([]manifest.Loc, map[int]bool, error) {
-	k, m := len(members), int(w.h.ParityM)
 	defer func() {
 		for _, e := range members {
 			if e.release != nil {
@@ -185,6 +184,36 @@ func (w *Writer) writeGroup(p string, ver uint64, members []pending, q uint32) (
 			}
 		}
 	}()
+	specs := make([]*frame.Spec, len(members))
+	for i, e := range members {
+		specs[i] = &frame.Spec{BlockType: wire.BlockData, Codec: wire.CodecStore, Payload: e.payload,
+			Entries: []wire.Entry{{Path: p, Offset: uint64(e.off), Length: uint64(len(e.payload)), FileVer: ver}}}
+	}
+	placed, touched, err := w.writeGroupFrames(specs, q)
+	if err != nil {
+		return nil, nil, err
+	}
+	locs := make([]manifest.Loc, len(members))
+	for i, pl := range placed {
+		e := specs[i].Entries[0]
+		locs[i] = manifest.Loc{Blob: uint8(pl.blob), Hash: pl.rec.FrameHash, Offset: e.Offset, Length: e.Length}
+	}
+	return locs, touched, nil
+}
+
+// placedFrame is where a frame was written.
+type placedFrame struct {
+	blob int
+	rec  wire.IndexRecord
+}
+
+// writeGroupFrames writes the given DATA or PACKED frames as one parity
+// group of frame size q (group fields, ordinals and placement are filled
+// in here), computes and writes its PARITY frames, and indexes everything.
+// It returns where each member went and every blob touched. The frames
+// are not durable yet.
+func (w *Writer) writeGroupFrames(specs []*frame.Spec, q uint32) ([]placedFrame, map[int]bool, error) {
+	k, m := len(specs), int(w.h.ParityM)
 	code, err := parity.New(w.h.ParityScheme, k, m)
 	if err != nil {
 		return nil, nil, err
@@ -217,13 +246,10 @@ func (w *Writer) writeGroup(p string, ver uint64, members []pending, q uint32) (
 			w.pool.Put(b)
 		}
 	}()
-	spec := func(i int) *frame.Spec {
-		return &frame.Spec{GroupID: uint32(gid), GroupIndex: uint8(i), GroupK: uint8(k), GroupM: uint8(m), FrameQuanta: q}
-	}
-	locs := make([]manifest.Loc, k)
-	var wg sync.WaitGroup
+	placed := make([]placedFrame, k)
 	errs := make([]error, k+m)
 	write := func(i int, s *frame.Spec) {
+		s.GroupID, s.GroupIndex, s.GroupK, s.GroupM, s.FrameQuanta = uint32(gid), uint8(i), uint8(k), uint8(m), q
 		b := place[i]
 		ord, err := w.ordAlloc[b].Next()
 		if err != nil {
@@ -251,18 +277,15 @@ func (w *Writer) writeGroup(p string, ver uint64, members []pending, q uint32) (
 		bv.mu.Lock()
 		bv.idx.Add(rec)
 		bv.mu.Unlock()
-		if s.BlockType == wire.BlockData {
-			e := s.Entries[0]
-			locs[i] = manifest.Loc{Blob: uint8(b), Hash: rec.FrameHash, Offset: e.Offset, Length: e.Length}
+		if i < k {
+			placed[i] = placedFrame{b, rec}
 		}
 	}
-	for i, e := range members {
+	var wg sync.WaitGroup
+	for i, s := range specs {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			s := spec(i)
-			s.BlockType, s.Codec, s.Payload = wire.BlockData, wire.CodecStore, e.payload
-			s.Entries = []wire.Entry{{Path: p, Offset: uint64(e.off), Length: uint64(len(e.payload)), FileVer: ver}}
 			write(i, s)
 		}()
 	}
@@ -282,9 +305,7 @@ func (w *Writer) writeGroup(p string, ver uint64, members []pending, q uint32) (
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			s := spec(k + j)
-			s.BlockType, s.Codec, s.Payload = wire.BlockParity, wire.CodecStore, shards[k+j]
-			write(k+j, s)
+			write(k+j, &frame.Spec{BlockType: wire.BlockParity, Codec: wire.CodecStore, Payload: shards[k+j]})
 		}()
 	}
 	wg.Wait()
@@ -297,5 +318,5 @@ func (w *Writer) writeGroup(p string, ver uint64, members []pending, q uint32) (
 	for _, b := range place {
 		touched[b] = true
 	}
-	return locs, touched, nil
+	return placed, touched, nil
 }

@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"slices"
 	"sort"
+	"strings"
 	"sync"
 
 	"stash/internal/blob"
@@ -97,12 +99,11 @@ func (v *view) fetch(p string, ver *manifest.Version, l manifest.Loc) (*blob.Ref
 		return nil, fmt.Errorf("%w: blob %02X out of range", ErrMissingData, l.Blob)
 	}
 	accept := func(ref *blob.Ref) bool {
-		if ref.Trailer.BlockType != wire.BlockData || len(ref.Entries) != 1 {
+		if ref.Trailer.HashPayload != l.Hash || ref.Trailer.CodecID != wire.CodecStore {
 			return false
 		}
-		e := ref.Entries[0]
-		return ref.Trailer.HashPayload == l.Hash && e.Path == p && e.FileVer == ver.FileVer &&
-			e.Offset == l.Offset && e.Length == l.Length && ref.Trailer.CodecID == wire.CodecStore
+		_, ok := packedEntry(ref, p, ver.FileVer, l)
+		return ok
 	}
 	if bv := v.blobs[l.Blob]; bv != nil {
 		bv.mu.Lock()
@@ -115,6 +116,7 @@ func (v *view) fetch(p string, ver *manifest.Version, l manifest.Loc) (*blob.Ref
 			return nil, err
 		}
 		if how != index.NotFound {
+			slicePacked(ref, p, ver.FileVer, l)
 			return ref, nil
 		}
 		bv.mu.Lock()
@@ -129,7 +131,40 @@ func (v *view) fetch(p string, ver *manifest.Version, l manifest.Loc) (*blob.Ref
 	if ref == nil {
 		return nil, fmt.Errorf("%w: %s v%d extent at %d (blob %02X)", ErrMissingData, p, ver.FileVer, l.Offset, l.Blob)
 	}
+	slicePacked(ref, p, ver.FileVer, l)
 	return ref, nil
+}
+
+// packedEntry finds the payload range of extent l of (p, fileVer) in a
+// frame: the single entry of a DATA frame, or the one entry of a PACKED
+// frame with this path and file_ver (§9.1, offset 0, whole object).
+func packedEntry(ref *blob.Ref, p string, fileVer uint64, l manifest.Loc) (wire.Entry, bool) {
+	switch ref.Trailer.BlockType {
+	case wire.BlockData:
+		if len(ref.Entries) == 1 {
+			e := ref.Entries[0]
+			return e, e.Path == p && e.FileVer == fileVer && e.Offset == l.Offset && e.Length == l.Length
+		}
+	case wire.BlockPacked:
+		if l.Offset != 0 {
+			return wire.Entry{}, false
+		}
+		// entries are sorted by path and paths are unique (§8)
+		i, found := slices.BinarySearchFunc(ref.Entries, p, func(e wire.Entry, p string) int { return strings.Compare(e.Path, p) })
+		if found {
+			e := ref.Entries[i]
+			return e, e.FileVer == fileVer && e.Length == l.Length
+		}
+	}
+	return wire.Entry{}, false
+}
+
+// slicePacked narrows a PACKED Ref's Payload to the object's bytes.
+func slicePacked(ref *blob.Ref, p string, fileVer uint64, l manifest.Loc) {
+	if ref.Trailer.BlockType == wire.BlockPacked {
+		e, _ := packedEntry(ref, p, fileVer, l)
+		ref.Payload = ref.Payload[e.Offset : e.Offset+e.Length]
+	}
 }
 
 // read assembles a whole version (§9.2: order by logical_offset only).
