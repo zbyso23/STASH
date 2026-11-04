@@ -109,6 +109,16 @@ type LoadOptions struct {
 	Limits Limits
 	// TrackRefs records loc references for State.BlobCommitted (writers).
 	TrackRefs bool
+
+	// Writer options (OpenJournal only).
+
+	// SeqSource allocates seq values (from manifest.alloc, §2.1.3); nil
+	// derives seq from the last committed state (allowed for unencrypted
+	// archives).
+	SeqSource func() (uint64, error)
+	// BeforeAppend runs after the graph is loaded and before the writer
+	// appends anything (cold-start allocator checks, §2.1.3.1).
+	BeforeAppend func(*State) error
 }
 
 // LoadInfo describes the main journal after Load.

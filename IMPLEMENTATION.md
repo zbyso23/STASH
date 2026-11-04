@@ -113,6 +113,35 @@ Performance note: `Put` of 64 KiB on the real filesystem is about 1.5 ms, domina
 
 SPEC change E1-21: creation order and the incomplete STANDARD creation; the `file_ver` cold-start check covers every record, not only live versions.
 
+## Milestone 7 — group commit and the public API (done)
+
+Public package `stash` (module root):
+
+```go
+err := stash.Create(dir, stash.CreateOptions{})        // Variable/Fixed, SHA256/BLAKE3, Blobs, MaxFrameSize
+a, err := stash.Open(dir, stash.Options{})             // writer lock + crash recovery
+defer a.Close()
+ver, err := a.Put("photos/a.jpg", data)                // durable when it returns
+ver, err  = a.PutReader(ctx, "big.iso", file)          // streaming, bounded memory, cancellable
+data, err := a.Get("photos/a.jpg")
+obj, err  := a.OpenObject("big.iso")                   // io.ReaderAt + io.Reader + io.Seeker, lazy
+err = a.Delete("photos/a.jpg")
+info, err := a.Stat(p); paths := a.List(); h := a.Health()
+r, err := stash.OpenReadOnly(dir)                      // lock-free snapshot
+```
+
+Paths are normalized to NFC; anything that is not a clean relative path is rejected with `ErrInvalid`. Errors: `ErrNotFound`, `ErrMissingData`, `ErrLocked`, `ErrPathBusy`, `ErrNoWritableBlob`, `ErrIncomplete`, `ErrCorrupt`, `ErrUnsupported`, `ErrInvalid`, `ErrResource` (use `errors.Is`).
+
+Internals (`internal/archive`):
+
+- **group commit** (§10.4): leader/follower without timers; the leader syncs the union of touched blobs in parallel, appends every queued record, and syncs the manifest once. A request whose blob sync failed is never referenced. Batches form exactly while a sync runs, so a lone writer pays no extra latency.
+- **parallel extents**: the frames of one object are built, hashed and written by up to `min(GOMAXPROCS, 2 x blobs)` workers across blobs; `PutReader` reads into pooled buffers.
+- **lazy object reader**: binary search over extents, one cached frame per object, frames validated on every fetch.
+
+Tests: public round trip in VARIABLE/FIXED/BLAKE3, NFC equivalence and path rejection, streaming with short reads, random `ReadAt`/`Seek`, failing source and cancelled context leave the object unchanged and the path free, 16 concurrent writers, the single-writer lock; crash test of group commit (6 concurrent writers, batches of up to 3, every returned Put durable at every crash point).
+
+Benchmarks on this container's disk (`go test . -bench .`): 64 KiB Put sequential about 56 MB/s (1.2 ms, two fsyncs), with 64 concurrent writers about 215 MB/s (group commit, about 4x); 64 MiB Put about 400 MB/s; 64 MiB Get about 800 MB/s. Numbers depend heavily on the disk's fsync latency.
+
 ## Next milestones
 
-7. Parity (XOR and Reed-Solomon groups, PARITY frames durable before commit, `groups.alloc`) or group commit and the public API, whichever comes first by priority. Then PACKED, recovery (hop-and-read, resync), compaction, HARDENED anchor, encryption, zstd, CLI, FUSE.
+8. Parity (XOR and Reed-Solomon groups, `groups.alloc`, PARITY frames durable before the commit, repair on read). Then PACKED small objects, recovery tooling (hop-and-read, resync), compaction, HARDENED anchor, encryption, zstd, CLI, FUSE.

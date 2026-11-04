@@ -7,6 +7,7 @@
 package vfs
 
 import (
+	"errors"
 	"io"
 	"io/fs"
 	"os"
@@ -35,7 +36,14 @@ type FS interface {
 	SyncDir(dir string) error
 	Stat(name string) (fs.FileInfo, error)
 	ReadDir(name string) ([]fs.DirEntry, error)
+	// Lock takes an exclusive, non-blocking lock on name (created if
+	// absent) for the single-writer rule (§12.1). It fails with ErrLocked
+	// when another holder exists. The returned function releases it.
+	Lock(name string) (unlock func() error, err error)
 }
+
+// ErrLocked reports a lock held by another writer.
+var ErrLocked = errors.New("lock held by another writer")
 
 // OS is an FS on the host filesystem below Root.
 type OS struct{ Root string }

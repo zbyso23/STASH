@@ -69,6 +69,7 @@ type State struct {
 	closed     map[TxID]struct{}
 	refs       map[FrameRef]struct{} // nil unless tracking (writers)
 	staged     int
+	maxFileVer uint64
 	lastSeq    uint64
 	records    uint64
 
@@ -102,6 +103,10 @@ func (s *State) resource(r *Record, format string, args ...any) error {
 	return &wire.Error{Struct: "Manifest", Field: r.Op.String(), Class: wire.ErrResource,
 		Detail: fmt.Sprintf("seq %d: ", r.Seq) + fmt.Sprintf(format, args...)}
 }
+
+// MaxFileVer returns the largest file_ver named by any applied record
+// (ADD, DEL, ADD_BEGIN), committed or not; 0 if none.
+func (s *State) MaxFileVer() uint64 { return s.maxFileVer }
 
 // LastSeq returns the largest seq applied (0 if none).
 func (s *State) LastSeq() uint64 { return s.lastSeq }
@@ -371,6 +376,10 @@ func (s *State) Apply(r *Record, file int) error {
 		}
 	default:
 		return s.corrupt(r, "unknown op")
+	}
+	switch r.Op {
+	case OpAdd, OpDel, OpAddBegin:
+		s.maxFileVer = max(s.maxFileVer, r.FileVer)
 	}
 	s.lastSeq = r.Seq
 	s.records++

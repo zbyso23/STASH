@@ -79,6 +79,18 @@ type OpenResult struct {
 	Tail []TailFrame
 	// Truncated is the number of torn bytes removed.
 	Truncated int64
+	// MaxGroupID and MaxOrdinal are the largest group_id and frame_ordinal
+	// over every valid frame found (valid run and tail), for the allocator
+	// cold-start checks (§2.1.3.1); HasFrames is false when there are none.
+	MaxGroupID uint32
+	MaxOrdinal uint64
+	HasFrames  bool
+}
+
+func (r *OpenResult) see(t *wire.MasterTrailer) {
+	r.HasFrames = true
+	r.MaxGroupID = max(r.MaxGroupID, t.GroupID)
+	r.MaxOrdinal = max(r.MaxOrdinal, t.FrameOrdinal)
 }
 
 // Writer appends frames to one blob. Methods are safe for concurrent use:
@@ -135,6 +147,7 @@ func OpenWriter(fsys vfs.FS, name string, h *wire.ArchiveHeader, pool *bufpool.P
 	}
 	satisfied := map[FrameKey]struct{}{}
 	collect := func(_ int64, fr *frame.Frame) error {
+		res.see(&fr.Trailer)
 		if len(committed.Refs) == 0 {
 			return nil
 		}
@@ -160,6 +173,9 @@ func OpenWriter(fsys vfs.FS, name string, h *wire.ArchiveHeader, pool *bufpool.P
 	if E < size {
 		if res.Tail, err = probeTail(f, h, pool, E, size); err != nil {
 			return fail(err)
+		}
+		for i := range res.Tail {
+			res.see(&res.Tail[i].Trailer)
 		}
 		if err := committed.protects(E, len(satisfied), res.Tail); err != nil {
 			return fail(err)

@@ -32,6 +32,7 @@ type Journal struct {
 	st       *State
 	end      int64
 	busy     map[string]TxID // paths with an open transaction
+	nextSeq  func() (uint64, error)
 	poisoned error
 	buf      []byte
 }
@@ -87,7 +88,13 @@ func OpenJournal(fsys vfs.FS, genDir string, h *wire.ArchiveHeader, opt LoadOpti
 			return nil, nil, res, err
 		}
 	}
-	j := &Journal{f: f, h: h, st: st, end: info.ValidEnd, busy: map[string]TxID{}}
+	if opt.BeforeAppend != nil {
+		if err := opt.BeforeAppend(st); err != nil {
+			f.Close()
+			return nil, nil, res, err
+		}
+	}
+	j := &Journal{f: f, h: h, st: st, end: info.ValidEnd, busy: map[string]TxID{}, nextSeq: opt.SeqSource}
 	if open := st.OpenTransactions(); len(open) > 0 {
 		for _, id := range open {
 			if err := j.appendLocked(&Record{Op: OpAddAbort, TxID: id}); err != nil {
@@ -117,7 +124,15 @@ func (j *Journal) appendLocked(r *Record) error {
 	if j.poisoned != nil {
 		return j.poisoned
 	}
-	r.Seq = j.st.LastSeq() + 1
+	if j.nextSeq != nil {
+		v, err := j.nextSeq()
+		if err != nil {
+			return err
+		}
+		r.Seq = v // Apply rejects a value not above the last seq
+	} else {
+		r.Seq = j.st.LastSeq() + 1
+	}
 	b, err := AppendLine(j.buf[:0], r)
 	if err != nil {
 		return err

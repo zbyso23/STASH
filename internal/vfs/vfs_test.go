@@ -201,3 +201,21 @@ func TestCrashFSErrors(t *testing.T) {
 		t.Fatalf("%v", ents)
 	}
 }
+
+func TestLocks(t *testing.T) {
+	for _, fsys := range []FS{NewCrashFS(), OS{Root: t.TempDir()}} {
+		u, err := fsys.Lock("writer.lock")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fsys.Lock("writer.lock"); !errors.Is(err, ErrLocked) {
+			t.Fatalf("%T: second lock: %v", fsys, err)
+		}
+		u()
+		u2, err := fsys.Lock("writer.lock")
+		if err != nil {
+			t.Fatal(err)
+		}
+		u2()
+	}
+}

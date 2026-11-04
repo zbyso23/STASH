@@ -1,0 +1,393 @@
+package archive
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"path"
+	"sync"
+	"sync/atomic"
+
+	"stash/internal/alloc"
+	"stash/internal/blob"
+	"stash/internal/bufpool"
+	"stash/internal/index"
+	"stash/internal/manifest"
+	"stash/internal/vfs"
+	"stash/internal/wire"
+)
+
+// ErrNoWritableBlob reports that every blob of the generation is SEALED
+// (§10.4.2): writes fail until compaction.
+var ErrNoWritableBlob = errors.New("no writable blob (all sealed)")
+
+// ErrPathBusy reports a concurrent write to the same path (§10.2.1).
+var ErrPathBusy = manifest.ErrPathBusy
+
+// Options configures OpenWriter.
+type Options struct {
+	Pool *bufpool.Pool
+	// MaxExtent caps the logical bytes per DATA frame (default 4 MiB, never
+	// more than the frame can hold).
+	MaxExtent int
+	Limits    manifest.Limits
+}
+
+// Health reports conditions found when opening (§13.9).
+type Health struct {
+	// Sealed lists blobs that may not be appended to in this generation,
+	// with the reason.
+	Sealed map[uint8]error
+	// TornManifestBytes and TornBlobBytes count truncated torn tails.
+	TornManifestBytes int64
+	TornBlobBytes     map[uint8]int64
+	// AbortedOnStart lists transactions closed by the cold start.
+	AbortedOnStart []manifest.TxID
+	// RebuiltIndexes lists blobs whose index was rebuilt by scan.
+	RebuiltIndexes []uint8
+}
+
+// Writer is the single writer of an archive (§12.1). Put, Delete and Get
+// are safe for concurrent use; writes to different blobs proceed in
+// parallel, commits go through one manifest stream.
+type Writer struct {
+	view
+	unlock  func() error
+	journal *manifest.Journal
+	opt     Options
+
+	genAlloc, verAlloc, seqAlloc *alloc.Allocator
+	ordAlloc                     []*alloc.Allocator
+	writers                      []*blob.Writer // nil: sealed
+
+	stateMu sync.RWMutex // journal state vs. readers
+	gc      groupCommit
+	busyMu  sync.Mutex
+	busy    map[string]bool
+	rr      atomic.Uint32
+	health  Health
+}
+
+// OpenWriter takes the writer lock and opens the current generation for
+// writing, applying every cold-start rule: allocator validation and
+// rollback checks (§2.1.3), manifest torn tail and ADD_ABORT of open
+// transactions (§10.3.1, §10.4.2), blob torn tails decided by manifest
+// references or SEALED (§10.4.2), and index validation or rebuild (§10.5).
+func OpenWriter(fsys vfs.FS, opt Options) (w *Writer, err error) {
+	if opt.Pool == nil {
+		opt.Pool = bufpool.Default
+	}
+	if opt.MaxExtent <= 0 {
+		opt.MaxExtent = 4 << 20
+	}
+	unlock, err := fsys.Lock(LockName)
+	if err != nil {
+		return nil, err
+	}
+	w = &Writer{unlock: unlock, opt: opt, busy: map[string]bool{},
+		health: Health{Sealed: map[uint8]error{}, TornBlobBytes: map[uint8]int64{}}}
+	opened := w
+	defer func() {
+		if err != nil {
+			opened.Close()
+			w = nil
+		}
+	}()
+	root, err := readRoot(fsys)
+	if err != nil {
+		return nil, err
+	}
+	gen := GenDir(root.GenerationID)
+	h, err := readHeader(fsys, gen, root)
+	if err != nil {
+		return nil, err
+	}
+	if h.Encrypted() || h.ParityScheme != wire.ParityNone {
+		return nil, fmt.Errorf("%w: encrypted and parity archives need later milestones", wire.ErrUnsupported)
+	}
+	w.view = view{fsys: fsys, gen: gen, h: h, pool: opt.Pool}
+
+	// archive-wide allocators
+	ga := alloc.Identity{Kind: wire.AllocGeneration, ArchiveID: h.ArchiveID, Encrypted: h.Encrypted()}
+	if w.genAlloc, err = alloc.Open(fsys, alloc.FileName(wire.AllocGeneration, 0), ga, 0); err != nil {
+		return nil, err
+	}
+	gens, err := generations(fsys)
+	if err != nil {
+		return nil, err
+	}
+	maxGen := root.GenerationID
+	for _, g := range gens {
+		maxGen = max(maxGen, g)
+	}
+	if err := w.genAlloc.Check(maxGen, true); err != nil {
+		return nil, err
+	}
+	fa := alloc.Identity{Kind: wire.AllocFileVer, ArchiveID: h.ArchiveID}
+	if w.verAlloc, err = alloc.Open(fsys, alloc.FileName(wire.AllocFileVer, 0), fa, 0); err != nil {
+		return nil, err
+	}
+	per := func(kind wire.AllocKind, b uint8) (*alloc.Allocator, error) {
+		return alloc.Open(fsys, path.Join(gen, alloc.FileName(kind, b)),
+			alloc.Identity{Kind: kind, Blob: b, GenerationID: h.GenerationID, ArchiveID: h.ArchiveID, Encrypted: h.Encrypted()}, 0)
+	}
+	if w.seqAlloc, err = per(wire.AllocManifestSeq, 0); err != nil {
+		return nil, err
+	}
+
+	// manifest: torn tail, allocator checks against the fold, cold-start aborts
+	j, st, res, err := manifest.OpenJournal(fsys, gen, h, manifest.LoadOptions{
+		Limits:    opt.Limits,
+		SeqSource: w.seqAlloc.Next,
+		BeforeAppend: func(st *manifest.State) error {
+			if err := w.verAlloc.Check(st.MaxFileVer(), st.MaxFileVer() > 0); err != nil {
+				return err
+			}
+			return w.seqAlloc.Check(st.LastSeq(), st.Records() > 0)
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	w.journal = j
+	w.health.TornManifestBytes = res.Load.Torn
+	w.health.AbortedOnStart = res.Aborted
+
+	// blobs: torn tails decided by the manifest's references
+	w.writers = make([]*blob.Writer, h.BlobCount)
+	w.ordAlloc = make([]*alloc.Allocator, h.BlobCount)
+	truncated := make([]bool, h.BlobCount)
+	for b := 0; b < int(h.BlobCount); b++ {
+		if w.ordAlloc[b], err = per(wire.AllocFrameOrdinal, uint8(b)); err != nil {
+			return nil, err
+		}
+		// unencrypted: the frame-ordinal check is skipped (§2.1.3.1)
+		name, _ := blob.Name(uint8(b))
+		bw, br, err := blob.OpenWriter(fsys, path.Join(gen, name), h, opt.Pool, st.BlobCommitted(uint8(b), nil))
+		switch {
+		case blob.IsSealed(err):
+			w.health.Sealed[uint8(b)] = err
+		case err != nil:
+			return nil, fmt.Errorf("blob %02X: %w", b, err)
+		default:
+			w.writers[b] = bw
+			if br.Truncated > 0 {
+				w.health.TornBlobBytes[uint8(b)] = br.Truncated
+				truncated[b] = true
+			}
+		}
+	}
+	// indexes: a truncated blob gets a fresh index (stale records could
+	// otherwise collide with frames appended at the same offsets)
+	for b, t := range truncated {
+		if t {
+			iname, _ := index.Name(uint8(b))
+			fsys.Remove(path.Join(gen, iname))
+		}
+	}
+	stats, err := w.openBlobs(true)
+	if err != nil {
+		return nil, err
+	}
+	for b, s := range stats {
+		if s.Rebuilt {
+			w.health.RebuiltIndexes = append(w.health.RebuiltIndexes, uint8(b))
+		}
+	}
+	return w, nil
+}
+
+// Header returns the archive header.
+func (w *Writer) Header() *wire.ArchiveHeader { return w.h }
+
+// Health returns what the cold start found.
+func (w *Writer) Health() Health { return w.health }
+
+// maxPayload is the largest DATA payload for path in one frame.
+func (w *Writer) maxExtent(p string) int {
+	pt := 4 + 2 + len(p) + 24 + 4 // entry list + outer CRC
+	n := int(w.h.MaxFrameSize()) - wire.FrameOverhead - pt
+	n = n / wire.BaseQuantum * wire.BaseQuantum
+	return min(n, w.opt.MaxExtent/wire.BaseQuantum*wire.BaseQuantum)
+}
+
+func (w *Writer) pickBlob() (int, error) {
+	n := len(w.writers)
+	start := int(w.rr.Add(1))
+	for i := 0; i < n; i++ {
+		b := (start + i) % n
+		if w.writers[b] != nil {
+			return b, nil
+		}
+	}
+	return 0, ErrNoWritableBlob
+}
+
+func (w *Writer) claim(p string) error {
+	w.busyMu.Lock()
+	defer w.busyMu.Unlock()
+	if w.busy[p] {
+		return fmt.Errorf("%w: %s", ErrPathBusy, p)
+	}
+	w.busy[p] = true
+	return nil
+}
+
+func (w *Writer) release(p string) {
+	w.busyMu.Lock()
+	delete(w.busy, p)
+	w.busyMu.Unlock()
+}
+
+// Put writes data as a new version of p and commits it durably (§9.5,
+// §10.4). It returns the new file_ver. See PutReader for streaming input.
+func (w *Writer) Put(p string, data []byte) (uint64, error) {
+	chunk, err := w.prepare(p)
+	if err != nil {
+		return 0, err
+	}
+	defer w.release(p)
+	src := func(off int) ([]byte, func(), error) {
+		if off >= len(data) && !(off == 0 && len(data) == 0) {
+			return nil, nil, errDone
+		}
+		return data[off:min(off+chunk, len(data))], nil, nil
+	}
+	return w.writeAndCommit(context.Background(), p, src)
+}
+
+// prepare validates p, claims it and returns the extent size.
+func (w *Writer) prepare(p string) (int, error) {
+	if err := checkPath(p); err != nil {
+		return 0, err
+	}
+	chunk := w.maxExtent(p)
+	if chunk <= 0 {
+		return 0, fmt.Errorf("%w: path too long for one frame", wire.ErrInvalid)
+	}
+	if err := w.claim(p); err != nil {
+		return 0, err
+	}
+	return chunk, nil
+}
+
+// Delete commits removal of the current version of p.
+func (w *Writer) Delete(p string) error {
+	if err := w.claim(p); err != nil {
+		return err
+	}
+	defer w.release(p)
+	return w.commit(&commitReq{del: true, path: p})
+}
+
+// Get returns the content of the current version of p.
+func (w *Writer) Get(p string) ([]byte, error) {
+	w.stateMu.RLock()
+	v, ok := w.journal.State().Lookup(p)
+	w.stateMu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, p)
+	}
+	return w.read(p, v)
+}
+
+// Open returns a lazy reader of the current version of p. The object stays
+// readable after later writes to p (versions are immutable, §9.5) until
+// compaction, which does not exist yet.
+func (w *Writer) Open(p string) (*Object, error) {
+	w.stateMu.RLock()
+	v, ok := w.journal.State().Lookup(p)
+	w.stateMu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, p)
+	}
+	return w.object(p, v), nil
+}
+
+// Stat returns the current version of p.
+func (w *Writer) Stat(p string) (*manifest.Version, error) {
+	w.stateMu.RLock()
+	defer w.stateMu.RUnlock()
+	v, ok := w.journal.State().Lookup(p)
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, p)
+	}
+	return v, nil
+}
+
+// PutReader streams r into a new version of p: chunks are read into pooled
+// buffers and written as frames in parallel; memory use is bounded by the
+// number of workers times the extent size. Cancelling ctx stops the write
+// before the commit (frames written so far stay unreferenced).
+func (w *Writer) PutReader(ctx context.Context, p string, r io.Reader) (uint64, error) {
+	chunk, err := w.prepare(p)
+	if err != nil {
+		return 0, err
+	}
+	defer w.release(p)
+	eof := false
+	src := func(off int) ([]byte, func(), error) {
+		if eof {
+			return nil, nil, errDone
+		}
+		buf := w.pool.Get(chunk)
+		n, err := io.ReadFull(r, buf)
+		switch {
+		case err == io.EOF || err == io.ErrUnexpectedEOF:
+			eof = true
+			if n == 0 && off > 0 {
+				w.pool.Put(buf)
+				return nil, nil, errDone
+			}
+		case err != nil:
+			w.pool.Put(buf)
+			return nil, nil, err
+		}
+		return buf[:n], func() { w.pool.Put(buf) }, nil
+	}
+	return w.writeAndCommit(ctx, p, src)
+}
+
+// List returns the live paths.
+func (w *Writer) List() []string {
+	w.stateMu.RLock()
+	defer w.stateMu.RUnlock()
+	return w.journal.State().Paths()
+}
+
+// Close persists the indexes, closes files and releases the writer lock.
+// It does not commit anything: every Put is already durable.
+func (w *Writer) Close() error {
+	var first error
+	keep := func(err error) {
+		if err != nil && first == nil {
+			first = err
+		}
+	}
+	for b, bv := range w.blobs {
+		if bv == nil {
+			continue
+		}
+		if w.writers != nil && w.writers[b] != nil {
+			iname, _ := index.Name(uint8(b))
+			bv.mu.Lock()
+			keep(bv.idx.Write(w.fsys, path.Join(w.gen, iname)))
+			bv.mu.Unlock()
+		}
+	}
+	w.close()
+	for _, bw := range w.writers {
+		if bw != nil {
+			keep(bw.Close())
+		}
+	}
+	if w.journal != nil {
+		keep(w.journal.Close())
+	}
+	if w.unlock != nil {
+		keep(w.unlock())
+		w.unlock = nil
+	}
+	return first
+}

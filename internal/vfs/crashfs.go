@@ -49,8 +49,32 @@ type CrashFS struct {
 	ns    map[string]*inode
 	durNS map[string]*inode
 	dirs  map[string]bool
+	locks map[string]bool
 	// SyncCount counts File.Sync and SyncDir calls (for tests).
 	SyncCount int
+}
+
+// Lock takes an in-memory exclusive lock; a crash releases every lock.
+func (c *CrashFS) Lock(name string) (func() error, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	name = clean(name)
+	if c.locks[name] {
+		return nil, ErrLocked
+	}
+	if c.locks == nil {
+		c.locks = map[string]bool{}
+	}
+	c.locks[name] = true
+	if _, ok := c.ns[name]; !ok && c.dirs[dirOf(name)] {
+		c.ns[name] = &inode{}
+	}
+	return func() error {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		delete(c.locks, name)
+		return nil
+	}, nil
 }
 
 // NewCrashFS returns an empty filesystem with a root directory.
