@@ -20,6 +20,9 @@ type Config struct {
 	HashID         wire.HashID
 	BlobCount      uint8
 	MaxFrameQuanta uint32
+	// Parity scheme and code (§7); zero values mean no parity.
+	ParityScheme     wire.ParityScheme
+	ParityK, ParityM uint8
 }
 
 // Create creates a new STANDARD archive in an empty directory (§2.1,
@@ -39,7 +42,7 @@ func Create(fsys vfs.FS, cfg Config) (*wire.ArchiveHeader, error) {
 		}
 	}
 	h := &wire.ArchiveHeader{Mode: cfg.Mode, HashID: cfg.HashID, CodecID: wire.CodecStore,
-		ParityScheme: wire.ParityNone, BlobCount: cfg.BlobCount, MaxFrameQuanta: cfg.MaxFrameQuanta}
+		ParityScheme: cfg.ParityScheme, ParityK: cfg.ParityK, ParityM: cfg.ParityM, BlobCount: cfg.BlobCount, MaxFrameQuanta: cfg.MaxFrameQuanta}
 	if h.MaxFrameQuanta < 2 {
 		return nil, fmt.Errorf("%w: a writer must not create max_frame_quanta < 2 (§3.1)", wire.ErrInvalid)
 	}

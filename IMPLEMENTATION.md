@@ -142,6 +142,27 @@ Tests: public round trip in VARIABLE/FIXED/BLAKE3, NFC equivalence and path reje
 
 Benchmarks on this container's disk (`go test . -bench .`): 64 KiB Put sequential about 56 MB/s (1.2 ms, two fsyncs), with 64 concurrent writers about 215 MB/s (group commit, about 4x); 64 MiB Put about 400 MB/s; 64 MiB Get about 800 MB/s. Numbers depend heavily on the disk's fsync latency.
 
+## Milestone 8 — parity (done, XOR and Reed-Solomon)
+
+| Package | Content | SPEC |
+|---|---|---|
+| `internal/parity` | GF(2^8) with `0x11D`, systematic Vandermonde encoding matrix `E = V x T^-1`, `Encode` and `Reconstruct` for any `k + m <= 256` (decode matrices cached), XOR through `crypto/subtle.XORBytes`; large shards split across cores; reserved schemes refused | §7, §7.2.1 |
+| `internal/frame` | `AppendRecoveryShard` (canonical recovery shard, refuses frames with less than 112 bytes of padding), `AppendFromRecoveryShard` (Prefix regenerated, padding zero, non-canonical shard refused; the caller validates with `Parse`) | §7.2, §7.3 |
+| `internal/wire` | `DecodeTail`/`TailLen`: validate a frame's tail (outer CRC) from its last bytes only | §6.4.3 |
+| `internal/blob` | `Hop`/`HopFrom`: hop-and-read over Prefixes and tails without reading payloads, resynchronizing on the frame grid after damage; `AppendBuilt`; `Ref.Bytes`, `NewRef` for rebuilt frames; torn-tail rule E1-22 | §10.4.2, §11.2 |
+| `internal/archive` | writer: groups per Put (consecutive extents of equal frame size, up to `parity_k`, a remainder is a short group), `group_id` from `groups.alloc` with the cold-start check over every frame found, members on consecutive writable blobs from a rotating start (distinct blobs, at most `ceil(n / blobs)` per blob), PARITY frames written before the commit and synced with the data in the same group commit, `Health.ParityWarning` when one lost blob would not be survivable; fewer than 2 writable blobs: writes fail | §7, §7.4, §10.4 |
+| | reader: an extent that the index and the streaming scan cannot deliver goes to hop-and-read (an intact frame behind damage), then to parity: groups by frame-local metadata, conflicting `group_id`s unused, members validated completely, missing DATA members rebuilt and validated, rebuilt identities remembered; header read from any intact blob copy (copies must agree); `OpenReader` continues without a missing blob; `Repairs()` counts hops, rebuilds and failures | §7, §7.3, §11.6 |
+
+Public API: `CreateOptions.Parity = stash.Parity{Scheme: stash.XOR or stash.ReedSolomon, K, M}`, `Archive.Repairs()`, `Reader.Repairs()`, `Reader.Unavailable()`.
+
+Tests: field products and inverses, encoding matrices, XOR and RS parity, complete groups (canonical shards, DATA and PARITY frames byte for byte, VARIABLE/FIXED, PACKED member, short group, 112-byte boundary) from `testdata/gen/gen_golden_m8.py` (independent: bitwise GF multiply, Gauss-Jordan); the generator's RS output was also checked once against `github.com/klauspost/reedsolomon` v1.12.4, which the SPEC names as the reference construction (not a dependency); every erasure pattern up to `m` rebuilt, `m+1` refused; RS with `m=1` differs from XOR; well-formed groups on disk; damaged payload and damaged tail rebuilt byte-identically through `Get` and lazy objects; every single lost blob survivable where the configuration allows; too many losses reported as `ErrMissingData`; hop-and-read past damage without parity; a duplicated `group_index` makes the group unusable instead of guessing; crash test with parity (group ids never reused, nothing sealed after ordinary crashes); rolled-back `groups.alloc` refused; spread warning and the 2-writable-blob rule; concurrent Puts under `-race`; fuzz `FuzzFromRecoveryShard`.
+
+Benchmarks (`go test . -bench .`, 4 cores, this container's disk): RS 4+2 encoding about 2.2 GB/s, RS 10+4 about 0.9 GB/s, XOR about 20 GB/s; 64 MiB Put with RS 4+2 about 215 MB/s (without parity about 310 MB/s, the parity frames add 50 % of bytes); 64 KiB Puts with 64 writers and RS 4+2 about 130 MB/s (each small object is a short group k=1 and is written 3 times; PACKED will fix this); 64 MiB Get with one of six blobs missing about 400 MB/s (intact about 600-750 MB/s).
+
+SPEC change E1-22: the torn-tail rule did not protect PARITY frames, because no `loc` names them; a committed PARITY frame damaged at the end of a blob was truncated and its group silently lost protection. Now the blob is sealed when the frame at E carries a referenced `group_id`, or when a referenced group lacks a member anywhere.
+
+Not yet: regrouping and repair by compaction (§7.3.1, §13.7), Emergency Pruning (§13.9), encrypted opaque shards (crypto milestone), `PARITY_GROUP` records (optional; discovery is by frame metadata).
+
 ## Next milestones
 
-8. Parity (XOR and Reed-Solomon groups, `groups.alloc`, PARITY frames durable before the commit, repair on read). Then PACKED small objects, recovery tooling (hop-and-read, resync), compaction, HARDENED anchor, encryption, zstd, CLI, FUSE.
+9. PACKED small objects. Then recovery tooling (hop-and-read exists; resync and full raw recovery), compaction with parity repair and regrouping, HARDENED anchor, encryption, zstd, CLI, FUSE.

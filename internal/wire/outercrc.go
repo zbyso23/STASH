@@ -37,18 +37,43 @@ type FrameTail struct {
 // trailer byte, and only then decodes the trailer. frame must be exactly
 // frame_size bytes of a frame whose prefix was already validated.
 func DecodeFrameTail(frame []byte) (FrameTail, error) {
+	return DecodeTail(frame, uint64(len(frame)))
+}
+
+// TailLen returns how many trailing bytes of a frame of frameSize bytes
+// DecodeTail needs, given the last 100 bytes (pre_trailer_len and Master
+// Trailer). It fails when pre_trailer_len is out of range.
+func TailLen(last100 []byte, frameSize uint64) (int, error) {
+	if len(last100) < MasterTrailerSize+PreTrailerLenSize || frameSize < BaseQuantum {
+		return 0, errf(ErrCorrupt, "PreTrailer", "", "short tail")
+	}
+	ptl := uint64(binary.LittleEndian.Uint32(last100[len(last100)-MasterTrailerSize-PreTrailerLenSize:]))
+	if ptl < 8 || ptl > frameSize-FrameOverhead {
+		return 0, errf(ErrCorrupt, "PreTrailer", "pre_trailer_len", "%d outside 8..%d", ptl, frameSize-FrameOverhead)
+	}
+	return int(ptl) + MasterTrailerSize + PreTrailerLenSize, nil
+}
+
+// DecodeTail is DecodeFrameTail on the last len(tail) bytes of a frame of
+// frameSize bytes, so a scanner can validate a frame's tail without reading
+// its payload. tail must hold at least TailLen bytes.
+func DecodeTail(tail []byte, frameSize uint64) (FrameTail, error) {
 	const st = "PreTrailer"
-	n := uint64(len(frame))
-	if n < BaseQuantum || n%BaseQuantum != 0 {
+	n := frameSize
+	if n < BaseQuantum || n%BaseQuantum != 0 || uint64(len(tail)) > n {
 		return FrameTail{}, errf(ErrCorrupt, st, "", "frame size %d", n)
 	}
-	trailer := frame[n-MasterTrailerSize:]
-	ptl := uint64(binary.LittleEndian.Uint32(frame[n-MasterTrailerSize-PreTrailerLenSize:]))
-	if ptl < 8 || ptl > n-FrameOverhead {
-		return FrameTail{}, errf(ErrCorrupt, st, "pre_trailer_len", "%d outside 8..%d", ptl, n-FrameOverhead)
+	need, err := TailLen(tail, n)
+	if err != nil {
+		return FrameTail{}, err
 	}
-	start := n - MasterTrailerSize - PreTrailerLenSize - ptl
-	body := frame[start : n-MasterTrailerSize-PreTrailerLenSize]
+	if len(tail) < need {
+		return FrameTail{}, errf(ErrCorrupt, st, "", "tail of %d bytes, need %d", len(tail), need)
+	}
+	tl := uint64(len(tail))
+	trailer := tail[tl-MasterTrailerSize:]
+	ptl := uint64(need - MasterTrailerSize - PreTrailerLenSize)
+	body := tail[tl-uint64(need) : tl-MasterTrailerSize-PreTrailerLenSize]
 	stored := binary.LittleEndian.Uint32(body[len(body)-4:])
 	if got := OuterCRC(body[:len(body)-4], uint32(ptl), trailer); got != stored {
 		return FrameTail{}, errf(ErrCorrupt, st, "outer_crc32c", "got %08x stored %08x", got, stored)

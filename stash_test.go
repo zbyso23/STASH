@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"testing/iotest"
@@ -199,8 +201,10 @@ func TestSingleWriter(t *testing.T) {
 	}
 }
 
-func benchPut(b *testing.B, size, par int) {
-	_, a := newArchive(b, stash.CreateOptions{})
+func benchPut(b *testing.B, size, par int) { benchPutOpt(b, size, par, stash.CreateOptions{}) }
+
+func benchPutOpt(b *testing.B, size, par int, o stash.CreateOptions) {
+	_, a := newArchive(b, o)
 	defer a.Close()
 	d := rnd(1, size)
 	b.SetBytes(int64(size))
@@ -235,6 +239,11 @@ func BenchmarkPut64KSequential(b *testing.B) { benchPut(b, 64<<10, 0) }
 func BenchmarkPut64KParallel(b *testing.B)   { benchPut(b, 64<<10, 16) }
 func BenchmarkPut64MSequential(b *testing.B) { benchPut(b, 64<<20, 0) }
 
+var rs42 = stash.CreateOptions{Blobs: 6, Parity: stash.Parity{Scheme: stash.ReedSolomon, K: 4, M: 2}}
+
+func BenchmarkPut64KParallelRS42(b *testing.B) { benchPutOpt(b, 64<<10, 16, rs42) }
+func BenchmarkPut64MRS42(b *testing.B)         { benchPutOpt(b, 64<<20, 0, rs42) }
+
 func BenchmarkGet64M(b *testing.B) {
 	_, a := newArchive(b, stash.CreateOptions{})
 	defer a.Close()
@@ -243,6 +252,76 @@ func BenchmarkGet64M(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if _, err := a.Get("x"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestPublicParity(t *testing.T) {
+	for _, o := range []stash.CreateOptions{
+		{Blobs: 3, Parity: stash.Parity{Scheme: stash.XOR, K: 2}},
+		{Blobs: 4, MaxFrameSize: 64 << 10, Parity: stash.Parity{Scheme: stash.ReedSolomon, K: 2, M: 2}},
+	} {
+		dir, a := newArchive(t, o)
+		files := map[string][]byte{"a": nil, "b": []byte("hello"), "big": rnd(3, 700<<10+5)}
+		for p, d := range files {
+			if _, err := a.Put(p, d); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if w := a.Health().ParityWarning; w != "" {
+			t.Fatal(w)
+		}
+		a.Close()
+		// lose one whole blob: the snapshot reader rebuilds from parity
+		if err := os.Remove(filepath.Join(dir, "generation-0000000000000000", "frames", "blob-01.stash")); err != nil {
+			t.Fatal(err)
+		}
+		r, err := stash.OpenReadOnly(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(r.Unavailable()) != 1 {
+			t.Fatalf("unavailable %v", r.Unavailable())
+		}
+		for p, d := range files {
+			got, err := r.Get(p)
+			if err != nil || !bytes.Equal(got, d) {
+				t.Fatalf("%s: %v", p, err)
+			}
+		}
+		if r.Repairs().Rebuilt == 0 {
+			t.Fatal("nothing rebuilt")
+		}
+		r.Close()
+	}
+	bad := []stash.Parity{{Scheme: stash.XOR, K: 2, M: 2}, {Scheme: stash.ReedSolomon, K: 0, M: 1},
+		{Scheme: stash.ReedSolomon, K: 200, M: 57}, {Scheme: stash.NoParity, K: 1}, {Scheme: 7, K: 1, M: 1}}
+	for _, p := range bad {
+		if err := stash.Create(t.TempDir(), stash.CreateOptions{Blobs: 4, Parity: p}); !errors.Is(err, stash.ErrInvalid) {
+			t.Fatalf("%+v: %v", p, err)
+		}
+	}
+	if err := stash.Create(t.TempDir(), stash.CreateOptions{Blobs: 1, Parity: stash.Parity{Scheme: stash.XOR, K: 2}}); err == nil {
+		t.Fatal("parity with one blob")
+	}
+}
+
+// reading through parity with one of six blobs missing
+func BenchmarkGet64MRS42LostBlob(b *testing.B) {
+	dir, a := newArchive(b, rs42)
+	a.Put("x", rnd(1, 64<<20))
+	a.Close()
+	os.Remove(filepath.Join(dir, "generation-0000000000000000", "frames", "blob-02.stash"))
+	r, err := stash.OpenReadOnly(dir)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer r.Close()
+	b.SetBytes(64 << 20)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := r.Get("x"); err != nil {
 			b.Fatal(err)
 		}
 	}

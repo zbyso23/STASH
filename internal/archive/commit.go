@@ -148,6 +148,9 @@ func (w *Writer) writeAndCommit(ctx context.Context, p string, src extentSource)
 	if err != nil {
 		return 0, err
 	}
+	if w.code != nil {
+		return w.writeGroupsAndCommit(ctx, p, ver, src)
+	}
 	type result struct {
 		loc  manifest.Loc
 		blob int

@@ -76,21 +76,53 @@ func readRoot(fsys vfs.FS) (wire.Root, error) {
 // checks it against the root (§11.1). Every blob is checked again when it
 // is opened.
 func readHeader(fsys vfs.FS, gen string, root wire.Root) (*wire.ArchiveHeader, error) {
-	f, err := fsys.OpenFile(path.Join(gen, "frames/blob-00.stash"), 0, 0)
-	if err != nil {
-		return nil, err
+	// Every blob carries a copy (§2.2). A missing blob or one whose copy
+	// does not decode is skipped here (the blob itself is then unavailable
+	// or sealed); copies that decode must all agree, or the header is
+	// corrupt and the archive fails closed (§2.3).
+	var found *wire.ArchiveHeader
+	var firstErr error
+	for b := 0; b <= wire.MaxBlobOrdinal; b++ {
+		f, err := fsys.OpenFile(path.Join(gen, fmt.Sprintf("frames/blob-%02X.stash", b)), 0, 0)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			if found != nil && b >= int(found.BlobCount) {
+				break
+			}
+			continue
+		}
+		var hb [wire.ArchiveHeaderSize]byte
+		_, err = f.ReadAt(hb[:], 0)
+		f.Close()
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("blob %02X header: %w", b, err)
+			}
+			continue
+		}
+		h, err := wire.DecodeArchiveHeader(hb[:])
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if found == nil {
+			found = &h
+		} else if h != *found {
+			return nil, fmt.Errorf("%w: header copies of blob 00..%02X disagree", wire.ErrCorrupt, b)
+		}
+		if b+1 >= int(found.BlobCount) {
+			break
+		}
 	}
-	defer f.Close()
-	var hb [wire.ArchiveHeaderSize]byte
-	if _, err := f.ReadAt(hb[:], 0); err != nil {
-		return nil, fmt.Errorf("blob 00 header: %w", err)
+	if found == nil {
+		return nil, firstErr
 	}
-	h, err := wire.DecodeArchiveHeader(hb[:])
-	if err != nil {
-		return nil, err
-	}
-	if h.GenerationID != root.GenerationID || h.ArchiveID != root.ArchiveID {
+	if found.GenerationID != root.GenerationID || found.ArchiveID != root.ArchiveID {
 		return nil, fmt.Errorf("%w: blob header does not match root.current", wire.ErrCorrupt)
 	}
-	return &h, nil
+	return found, nil
 }

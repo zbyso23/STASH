@@ -14,6 +14,7 @@ import (
 	"stash/internal/bufpool"
 	"stash/internal/index"
 	"stash/internal/manifest"
+	"stash/internal/parity"
 	"stash/internal/vfs"
 	"stash/internal/wire"
 )
@@ -46,6 +47,9 @@ type Health struct {
 	AbortedOnStart []manifest.TxID
 	// RebuiltIndexes lists blobs whose index was rebuilt by scan.
 	RebuiltIndexes []uint8
+	// ParityWarning is set when the writable blobs cannot hold a parity
+	// group so that losing one whole blob is survivable (§7.4).
+	ParityWarning string
 }
 
 // Writer is the single writer of an archive (§12.1). Put, Delete and Get
@@ -58,6 +62,8 @@ type Writer struct {
 	opt     Options
 
 	genAlloc, verAlloc, seqAlloc *alloc.Allocator
+	groupAlloc                   *alloc.Allocator // nil without parity
+	code                         *parity.Code     // full-size code; nil without parity
 	ordAlloc                     []*alloc.Allocator
 	writers                      []*blob.Writer // nil: sealed
 
@@ -103,8 +109,13 @@ func OpenWriter(fsys vfs.FS, opt Options) (w *Writer, err error) {
 	if err != nil {
 		return nil, err
 	}
-	if h.Encrypted() || h.ParityScheme != wire.ParityNone {
-		return nil, fmt.Errorf("%w: encrypted and parity archives need later milestones", wire.ErrUnsupported)
+	if h.Encrypted() {
+		return nil, fmt.Errorf("%w: encrypted archives need a later milestone", wire.ErrUnsupported)
+	}
+	if h.ParityScheme != wire.ParityNone {
+		if w.code, err = parity.New(h.ParityScheme, int(h.ParityK), int(h.ParityM)); err != nil {
+			return nil, err
+		}
 	}
 	w.view = view{fsys: fsys, gen: gen, h: h, pool: opt.Pool}
 
@@ -135,6 +146,11 @@ func OpenWriter(fsys vfs.FS, opt Options) (w *Writer, err error) {
 	if w.seqAlloc, err = per(wire.AllocManifestSeq, 0); err != nil {
 		return nil, err
 	}
+	if w.code != nil {
+		if w.groupAlloc, err = per(wire.AllocGroupID, 0); err != nil {
+			return nil, err
+		}
+	}
 
 	// manifest: torn tail, allocator checks against the fold, cold-start aborts
 	j, st, res, err := manifest.OpenJournal(fsys, gen, h, manifest.LoadOptions{
@@ -158,13 +174,27 @@ func OpenWriter(fsys vfs.FS, opt Options) (w *Writer, err error) {
 	w.writers = make([]*blob.Writer, h.BlobCount)
 	w.ordAlloc = make([]*alloc.Allocator, h.BlobCount)
 	truncated := make([]bool, h.BlobCount)
+	var maxGroup uint32
+	var groupRef func(uint32) bool
+	tailHold := false
+	if w.code != nil {
+		refd, incomplete, err := w.groupCensus(st)
+		if err != nil {
+			return nil, err
+		}
+		groupRef = func(g uint32) bool { return refd[g] }
+		tailHold = incomplete
+	}
 	for b := 0; b < int(h.BlobCount); b++ {
 		if w.ordAlloc[b], err = per(wire.AllocFrameOrdinal, uint8(b)); err != nil {
 			return nil, err
 		}
 		// unencrypted: the frame-ordinal check is skipped (§2.1.3.1)
 		name, _ := blob.Name(uint8(b))
-		bw, br, err := blob.OpenWriter(fsys, path.Join(gen, name), h, opt.Pool, st.BlobCommitted(uint8(b), nil))
+		committed := st.BlobCommitted(uint8(b), groupRef)
+		committed.TailMayHoldCommitted = tailHold
+		bw, br, err := blob.OpenWriter(fsys, path.Join(gen, name), h, opt.Pool, committed)
+		maxGroup = max(maxGroup, br.MaxGroupID)
 		switch {
 		case blob.IsSealed(err):
 			w.health.Sealed[uint8(b)] = err
@@ -178,6 +208,23 @@ func OpenWriter(fsys vfs.FS, opt Options) (w *Writer, err error) {
 			}
 		}
 	}
+	if w.groupAlloc != nil {
+		// group_id cold-start check over every frame found (§2.1.3.1, §7)
+		if err := w.groupAlloc.Check(uint64(maxGroup), maxGroup > 0); err != nil {
+			return nil, err
+		}
+		writable := 0
+		for _, bw := range w.writers {
+			if bw != nil {
+				writable++
+			}
+		}
+		n, m := int(h.ParityK)+int(h.ParityM), int(h.ParityM)
+		if need := (n + m - 1) / m; writable < need {
+			w.health.ParityWarning = fmt.Sprintf("%d writable blobs cannot place a group of %d+%d so that one lost blob is survivable (needs %d, §7.4)",
+				writable, h.ParityK, h.ParityM, need)
+		}
+	}
 	// indexes: a truncated blob gets a fresh index (stale records could
 	// otherwise collide with frames appended at the same offsets)
 	for b, t := range truncated {
@@ -186,7 +233,7 @@ func OpenWriter(fsys vfs.FS, opt Options) (w *Writer, err error) {
 			fsys.Remove(path.Join(gen, iname))
 		}
 	}
-	stats, err := w.openBlobs(true)
+	stats, err := w.openBlobs(true, false)
 	if err != nil {
 		return nil, err
 	}
@@ -196,6 +243,59 @@ func OpenWriter(fsys vfs.FS, opt Options) (w *Writer, err error) {
 		}
 	}
 	return w, nil
+}
+
+// groupCensus hops every blob once (Prefix and tail only) and returns,
+// for the torn-tail rules of §10.4.2, the parity groups that a loc
+// references through one of their DATA members, and whether such a
+// committed group lacks a member that no blob holds (E1-22). Members are
+// counted by intact tail; a member whose payload is damaged is useless for
+// reconstruction already, so truncating it loses nothing.
+func (w *Writer) groupCensus(st *manifest.State) (referenced map[uint32]bool, incomplete bool, err error) {
+	referenced = map[uint32]bool{}
+	type info struct {
+		k, m uint8
+		idx  map[uint8]bool
+	}
+	groups := map[uint32]*info{}
+	for b := 0; b < int(w.h.BlobCount); b++ {
+		refs := st.BlobCommitted(uint8(b), nil).Refs
+		name, _ := blob.Name(uint8(b))
+		r, err := blob.Open(w.fsys, path.Join(w.gen, name), w.h, w.pool)
+		if err != nil {
+			return nil, false, fmt.Errorf("blob %02X: %w", b, err)
+		}
+		err = r.Hop(func(f blob.HopFrame) error {
+			g := f.Trailer.GroupID
+			if g == 0 {
+				return nil
+			}
+			gi := groups[g]
+			if gi == nil {
+				gi = &info{k: f.Trailer.GroupK, m: f.Trailer.GroupM, idx: map[uint8]bool{}}
+				groups[g] = gi
+			}
+			gi.idx[f.Trailer.GroupIndex] = true
+			if f.Trailer.BlockType == wire.BlockData && len(f.Entries) == 1 {
+				e := f.Entries[0]
+				if _, ok := refs[blob.FrameKey{Hash: f.Trailer.HashPayload, Path: e.Path, FileVer: e.FileVer, Offset: e.Offset}]; ok {
+					referenced[g] = true
+				}
+			}
+			return nil
+		})
+		r.Close()
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	for g := range referenced {
+		gi := groups[g]
+		if len(gi.idx) < int(gi.k)+int(gi.m) {
+			incomplete = true
+		}
+	}
+	return referenced, incomplete, nil
 }
 
 // Header returns the archive header.
@@ -208,6 +308,9 @@ func (w *Writer) Health() Health { return w.health }
 func (w *Writer) maxExtent(p string) int {
 	pt := 4 + 2 + len(p) + 24 + 4 // entry list + outer CRC
 	n := int(w.h.MaxFrameSize()) - wire.FrameOverhead - pt
+	if w.code != nil {
+		n -= wire.MinParityPadding // §7.2
+	}
 	n = n / wire.BaseQuantum * wire.BaseQuantum
 	return min(n, w.opt.MaxExtent/wire.BaseQuantum*wire.BaseQuantum)
 }

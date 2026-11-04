@@ -40,15 +40,27 @@ type view struct {
 	h     *wire.ArchiveHeader
 	pool  *bufpool.Pool
 	blobs []*blobView // nil entry: blob unavailable
+	// unavailable records why a blob could not be opened (readers of a
+	// parity archive continue without it, §7.4).
+	unavailable map[uint8]error
+	repairs
 }
 
-func (v *view) openBlobs(writeIndexes bool) (statuses []index.Status, err error) {
+// openBlobs opens every blob and its index. With tolerate, a blob that
+// cannot be opened is recorded as unavailable instead of failing (only
+// useful when parity can stand in for it).
+func (v *view) openBlobs(writeIndexes, tolerate bool) (statuses []index.Status, err error) {
 	v.blobs = make([]*blobView, v.h.BlobCount)
+	v.unavailable = map[uint8]error{}
 	statuses = make([]index.Status, v.h.BlobCount)
 	for b := range v.blobs {
 		name, _ := blob.Name(uint8(b))
 		r, err := blob.Open(v.fsys, path.Join(v.gen, name), v.h, v.pool)
 		if err != nil {
+			if tolerate && !errors.Is(err, wire.ErrUnsupported) {
+				v.unavailable[uint8(b)] = err
+				continue
+			}
 			return nil, fmt.Errorf("blob %02X: %w", b, err)
 		}
 		iname, _ := index.Name(uint8(b))
@@ -81,28 +93,40 @@ func (v *view) close() {
 // (candidates validated, fallback scan), carrying exactly this object's
 // path, file_ver and placement. The Ref must be released.
 func (v *view) fetch(p string, ver *manifest.Version, l manifest.Loc) (*blob.Ref, error) {
-	if int(l.Blob) >= len(v.blobs) || v.blobs[l.Blob] == nil {
-		return nil, fmt.Errorf("%w: blob %02X unavailable", ErrMissingData, l.Blob)
+	if int(l.Blob) >= len(v.blobs) {
+		return nil, fmt.Errorf("%w: blob %02X out of range", ErrMissingData, l.Blob)
 	}
-	bv := v.blobs[l.Blob]
 	accept := func(ref *blob.Ref) bool {
 		if ref.Trailer.BlockType != wire.BlockData || len(ref.Entries) != 1 {
 			return false
 		}
 		e := ref.Entries[0]
-		return e.Path == p && e.FileVer == ver.FileVer && e.Offset == l.Offset && e.Length == l.Length &&
-			ref.Trailer.CodecID == wire.CodecStore
+		return ref.Trailer.HashPayload == l.Hash && e.Path == p && e.FileVer == ver.FileVer &&
+			e.Offset == l.Offset && e.Length == l.Length && ref.Trailer.CodecID == wire.CodecStore
 	}
-	bv.mu.Lock()
-	ref, how, err := bv.idx.Find(bv.r, l.Hash, accept)
-	if how == index.ViaScan {
+	if bv := v.blobs[l.Blob]; bv != nil {
+		bv.mu.Lock()
+		ref, how, err := bv.idx.Find(bv.r, l.Hash, accept)
+		if how == index.ViaScan {
+			bv.defective = true
+		}
+		bv.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		if how != index.NotFound {
+			return ref, nil
+		}
+		bv.mu.Lock()
 		bv.defective = true
+		bv.mu.Unlock()
 	}
-	bv.mu.Unlock()
+	// damaged or unavailable: hop-and-read, then parity (§7.3, §11)
+	ref, err := v.recover(p, ver, l, accept)
 	if err != nil {
 		return nil, err
 	}
-	if how == index.NotFound {
+	if ref == nil {
 		return nil, fmt.Errorf("%w: %s v%d extent at %d (blob %02X)", ErrMissingData, p, ver.FileVer, l.Offset, l.Blob)
 	}
 	return ref, nil
@@ -224,12 +248,16 @@ func OpenReader(fsys vfs.FS, pool *bufpool.Pool) (*Reader, error) {
 		return nil, err
 	}
 	r := &Reader{view: view{fsys: fsys, gen: gen, h: h, pool: pool}, st: st}
-	if _, err := r.openBlobs(false); err != nil {
+	if _, err := r.openBlobs(false, h.ParityScheme != wire.ParityNone); err != nil {
 		r.close()
 		return nil, err
 	}
 	return r, nil
 }
+
+// Unavailable lists the blobs that could not be opened, with the reason;
+// their data is read through parity.
+func (r *Reader) Unavailable() map[uint8]error { return r.unavailable }
 
 // Header returns the archive header.
 func (r *Reader) Header() *wire.ArchiveHeader { return r.h }

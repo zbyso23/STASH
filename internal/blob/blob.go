@@ -130,6 +130,22 @@ func (r *Ref) Release() {
 	}
 }
 
+// Bytes returns the frame's encoded bytes (valid until Release).
+func (r *Ref) Bytes() []byte {
+	return r.buf[:wire.FrameSize(r.Prefix.FrameQuanta)]
+}
+
+// NewRef validates a complete frame held in buf (taken from pool, and
+// owned by the Ref afterwards) and wraps it as a Ref with offset -1, for
+// frames that were rebuilt rather than read (§7.3).
+func NewRef(buf []byte, h *wire.ArchiveHeader, pool *bufpool.Pool) (*Ref, error) {
+	fr, err := frame.Parse(buf, h)
+	if err != nil {
+		return nil, err
+	}
+	return &Ref{Frame: fr, Offset: -1, buf: buf, pool: pool}, nil
+}
+
 // ReadFrame reads and fully validates the frame at off (on the frame grid).
 // The read size comes from a validated prefix and is bounded by the file
 // size, so a corrupt prefix cannot force a large allocation.

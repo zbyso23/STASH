@@ -33,6 +33,10 @@ type Committed struct {
 	// GroupReferenced reports whether a loc anywhere references a frame
 	// carrying groupID (non-zero). nil means no group is referenced.
 	GroupReferenced func(groupID uint32) bool
+	// TailMayHoldCommitted is set when a committed parity group lacks a
+	// member that no blob holds intact: such a member may lie in this
+	// blob's [E, EOF), so the tail is not truncated (§10.4.2, E1-22).
+	TailMayHoldCommitted bool
 }
 
 // keysOf returns the keys under which a validated frame satisfies locs.
@@ -57,12 +61,19 @@ func keysOf(f *frame.Frame) []FrameKey {
 // referenced frame is not among the valid frames before E (it lies in the
 // damaged region, valid or not), or a valid frame beyond E carries a
 // referenced group_id.
-func (c *Committed) protects(E int64, satisfied int, tail []TailFrame) error {
+func (c *Committed) protects(E int64, satisfied int, tail []TailFrame, atE *HopFrame) error {
 	if satisfied < len(c.Refs) {
 		return fmt.Errorf("%w: %d referenced frame(s) are not in the valid run before %d", ErrSealed, len(c.Refs)-satisfied, E)
 	}
+	if c.TailMayHoldCommitted {
+		return fmt.Errorf("%w: a committed parity group lacks a member that may lie in [%d, EOF)", ErrSealed, E)
+	}
 	if c.GroupReferenced == nil {
 		return nil
+	}
+	if atE != nil && atE.Trailer.GroupID != 0 && c.GroupReferenced(atE.Trailer.GroupID) {
+		// a damaged frame whose tail is intact belongs to a committed group
+		return fmt.Errorf("%w: damaged frame at %d belongs to committed parity group %d", ErrSealed, E, atE.Trailer.GroupID)
 	}
 	for _, t := range tail {
 		if g := t.Trailer.GroupID; g != 0 && c.GroupReferenced(g) {
@@ -168,7 +179,7 @@ func OpenWriter(fsys vfs.FS, name string, h *wire.ArchiveHeader, pool *bufpool.P
 		if E < size {
 			res.Tail, _ = probeTail(f, h, pool, E, size)
 		}
-		return fail(committed.protects(E, len(satisfied), res.Tail))
+		return fail(committed.protects(E, len(satisfied), res.Tail, nil))
 	}
 	if E < size {
 		if res.Tail, err = probeTail(f, h, pool, E, size); err != nil {
@@ -177,7 +188,15 @@ func OpenWriter(fsys vfs.FS, name string, h *wire.ArchiveHeader, pool *bufpool.P
 		for i := range res.Tail {
 			res.see(&res.Tail[i].Trailer)
 		}
-		if err := committed.protects(E, len(satisfied), res.Tail); err != nil {
+		var atE *HopFrame
+		var scratch []byte
+		if hf, ok, err := tailAt(f, h, E, size, &scratch); err != nil {
+			return fail(err)
+		} else if ok {
+			atE = &hf
+			res.see(&hf.Trailer)
+		}
+		if err := committed.protects(E, len(satisfied), res.Tail, atE); err != nil {
 			return fail(err)
 		}
 		if err := f.Truncate(E); err != nil {
@@ -235,11 +254,20 @@ func (w *Writer) AppendIndexed(s *frame.Spec) (wire.IndexRecord, error) {
 		return wire.IndexRecord{}, err
 	}
 	defer w.pool.Put(b) // b may have grown past the estimate
+	return w.AppendBuilt(b)
+}
+
+// AppendBuilt writes a frame that frame.AppendFrame just encoded (so it is
+// valid by construction) and returns its index record.
+func (w *Writer) AppendBuilt(b []byte) (wire.IndexRecord, error) {
+	if len(b) < wire.BaseQuantum {
+		return wire.IndexRecord{}, fmt.Errorf("%w: frame of %d bytes", wire.ErrInvalid, len(b))
+	}
 	t, err := wire.DecodeMasterTrailer(b[len(b)-wire.MasterTrailerSize:])
 	if err != nil {
 		return wire.IndexRecord{}, err
 	}
-	off, _, err := w.write(b)
+	off, _, err := w.AppendEncoded(b)
 	if err != nil {
 		return wire.IndexRecord{}, err
 	}

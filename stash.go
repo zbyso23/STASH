@@ -1,8 +1,9 @@
 // Package stash is the public API of the STASH 2.0 R10 reference
 // implementation (wire 0x0006, SPEC.md).
 //
-// Current scope: STANDARD security policy, unencrypted archives without
-// parity, STORE codec, VARIABLE and FIXED frame modes. One writer per
+// Current scope: STANDARD security policy, unencrypted archives, STORE
+// codec, VARIABLE and FIXED frame modes, optional XOR or Reed-Solomon
+// parity with repair on read. One writer per
 // archive (an exclusive lock on writer.lock); any number of readers.
 //
 //	err := stash.Create(dir, stash.CreateOptions{})
@@ -71,6 +72,30 @@ const (
 	BLAKE3
 )
 
+// ParityScheme selects erasure coding (SPEC §7).
+type ParityScheme int
+
+const (
+	// NoParity: damaged data is reported, not repaired (default).
+	NoParity ParityScheme = iota
+	// XOR: one parity frame per group of up to K data frames; survives the
+	// loss of one member.
+	XOR
+	// ReedSolomon: M parity frames per group of up to K data frames;
+	// survives the loss of any M members.
+	ReedSolomon
+)
+
+// Parity configures erasure coding. A group's members are spread over
+// distinct blobs; to survive the loss of a whole blob, Blobs must be at
+// least ceil((K+M)/M).
+type Parity struct {
+	Scheme ParityScheme
+	// K data frames per group (1..255), M parity frames (XOR: 1);
+	// K+M <= 256.
+	K, M int
+}
+
 // CreateOptions are fixed for the archive's lifetime.
 type CreateOptions struct {
 	Mode FrameMode
@@ -80,6 +105,8 @@ type CreateOptions struct {
 	Blobs int
 	// MaxFrameSize in bytes, a multiple of 4096 from 8 KiB (default 4 MiB).
 	MaxFrameSize int
+	// Parity: none by default. Needs at least 2 blobs.
+	Parity Parity
 }
 
 // Create creates a new archive in dir, which must be empty or absent.
@@ -105,6 +132,27 @@ func Create(dir string, o CreateOptions) error {
 			return errors.Join(ErrInvalid, errors.New("stash: MaxFrameSize must be a multiple of 4096, at least 8192"))
 		}
 		cfg.MaxFrameQuanta = uint32(o.MaxFrameSize / 4096)
+	}
+	switch o.Parity.Scheme {
+	case NoParity:
+		if o.Parity.K != 0 || o.Parity.M != 0 {
+			return errors.Join(ErrInvalid, errors.New("stash: Parity.K and M need a parity scheme"))
+		}
+	case XOR, ReedSolomon:
+		k, m := o.Parity.K, o.Parity.M
+		if o.Parity.Scheme == XOR && m == 0 {
+			m = 1
+		}
+		if k < 1 || k > 255 || m < 1 || m > 255 || k+m > 256 || (o.Parity.Scheme == XOR && m != 1) {
+			return errors.Join(ErrInvalid, errors.New("stash: parity needs 1 <= K, 1 <= M, K+M <= 256 (XOR: M = 1)"))
+		}
+		cfg.ParityScheme = wire.ParityXOR
+		if o.Parity.Scheme == ReedSolomon {
+			cfg.ParityScheme = wire.ParityRS
+		}
+		cfg.ParityK, cfg.ParityM = uint8(k), uint8(m)
+	default:
+		return errors.Join(ErrInvalid, errors.New("stash: unknown parity scheme"))
 	}
 	_, err := archive.Create(vfs.OS{Root: dir}, cfg)
 	return err
@@ -207,6 +255,10 @@ func (a *Archive) List() []string { return a.w.List() }
 // Health reports what crash recovery found when the archive was opened.
 func (a *Archive) Health() Health { return a.w.Health() }
 
+// Repairs counts reads that needed hop-and-read past damage or parity
+// reconstruction since the archive was opened.
+func (a *Archive) Repairs() RepairStats { return a.w.Repairs() }
+
 // Close persists indexes and releases the writer lock. Every completed Put
 // and Delete is already durable.
 func (a *Archive) Close() error { return a.w.Close() }
@@ -216,6 +268,9 @@ type Object = archive.Object
 
 // Health is the report of crash recovery.
 type Health = archive.Health
+
+// RepairStats counts repaired reads.
+type RepairStats = archive.RepairStats
 
 // Info describes one object version.
 type Info struct {
@@ -276,6 +331,13 @@ func (r *Reader) Stat(path string) (Info, error) {
 
 // List returns every live path of the snapshot.
 func (r *Reader) List() []string { return r.r.List() }
+
+// Unavailable lists blob files that could not be opened (missing or with a
+// damaged header); with parity their data is rebuilt on read.
+func (r *Reader) Unavailable() map[uint8]error { return r.r.Unavailable() }
+
+// Repairs counts reads that needed hop-and-read or parity.
+func (r *Reader) Repairs() RepairStats { return r.r.Repairs() }
 
 // Close releases the files.
 func (r *Reader) Close() error { return r.r.Close() }
