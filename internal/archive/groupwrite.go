@@ -17,6 +17,15 @@ type pending struct {
 	off     int
 	payload []byte
 	release func()
+	enc     *encExtent // already compressed (payload nil)
+}
+
+// length is the logical length of the extent.
+func (e pending) length() int {
+	if e.enc != nil {
+		return e.enc.n
+	}
+	return len(e.payload)
 }
 
 // writeGroupsAndCommit is writeAndCommit for a parity archive (§7, §10.4).
@@ -74,12 +83,10 @@ func (w *Writer) writeGroupsAndCommit(ctx context.Context, p string, ver uint64,
 	var curQ uint32
 	releaseAll := func(g []pending) {
 		for _, e := range g {
-			if e.release != nil {
-				e.release()
-			}
+			e.free()
 		}
 	}
-	off := 0
+	next, stop := w.pendingSource(p, src, workers, failed)
 	for {
 		if err := ctx.Err(); err != nil {
 			fail(err)
@@ -88,7 +95,7 @@ func (w *Writer) writeGroupsAndCommit(ctx context.Context, p string, ver uint64,
 		if failed() {
 			break
 		}
-		payload, release, err := src(off)
+		e, err := next()
 		if err == errDone {
 			break
 		}
@@ -96,11 +103,13 @@ func (w *Writer) writeGroupsAndCommit(ctx context.Context, p string, ver uint64,
 			fail(err)
 			break
 		}
-		q, err := w.memberQuanta(p, len(payload))
+		n := len(e.payload)
+		if e.enc != nil {
+			n = len(e.enc.stored)
+		}
+		q, err := w.memberQuanta(p, n)
 		if err != nil {
-			if release != nil {
-				release()
-			}
+			releaseAll([]pending{e})
 			fail(err)
 			break
 		}
@@ -108,16 +117,13 @@ func (w *Writer) writeGroupsAndCommit(ctx context.Context, p string, ver uint64,
 			dispatch(cur, curQ)
 			cur = nil
 		}
-		cur, curQ = append(cur, pending{off, payload, release}), q
+		cur, curQ = append(cur, e), q
 		if len(cur) == k {
 			dispatch(cur, curQ)
 			cur = nil
 		}
-		off += len(payload)
-		if len(payload) == 0 {
-			break // the single extent of an empty object
-		}
 	}
+	stop()
 	if len(cur) > 0 {
 		if failed() {
 			releaseAll(cur)
@@ -179,9 +185,7 @@ func (w *Writer) placement(n int) ([]int, error) {
 func (w *Writer) writeGroup(p string, ver uint64, members []pending, q uint32) ([]manifest.Loc, map[int]bool, error) {
 	defer func() {
 		for _, e := range members {
-			if e.release != nil {
-				e.release()
-			}
+			e.free()
 		}
 	}()
 	specs := make([]*frame.Spec, len(members))
@@ -200,10 +204,14 @@ func (w *Writer) writeGroup(p string, ver uint64, members []pending, q uint32) (
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			c, stored, rel := w.encode(e.payload)
-			rels[i] = rel
+			c, stored := wire.CodecStore, e.payload
+			if e.enc != nil {
+				c, stored = e.enc.codec, e.enc.stored
+			} else {
+				c, stored, rels[i] = w.encode(e.payload)
+			}
 			specs[i] = &frame.Spec{BlockType: wire.BlockData, Codec: c, Payload: stored,
-				Entries: []wire.Entry{{Path: p, Offset: uint64(e.off), Length: uint64(len(e.payload)), FileVer: ver}}}
+				Entries: []wire.Entry{{Path: p, Offset: uint64(e.off), Length: uint64(e.length()), FileVer: ver}}}
 		}()
 	}
 	wg.Wait()

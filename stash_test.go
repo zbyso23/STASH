@@ -732,3 +732,36 @@ func BenchmarkGet64MSecureZstdText(b *testing.B) {
 		}
 	}
 }
+
+// Compressible text in a FIXED archive of 64 KiB frames: frames holding
+// the logical bytes that compress into them vs the M15 writer.
+func benchText(b *testing.B, uncompressed bool) {
+	dir := b.TempDir()
+	if err := stash.Create(dir, stash.CreateOptions{Mode: stash.Fixed, MaxFrameSize: 64 << 10, Compression: stash.ZstdFast}); err != nil {
+		b.Fatal(err)
+	}
+	a, err := stash.Open(dir, stash.Options{UncompressedExtents: uncompressed})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer a.Close()
+	d := bytes.Repeat([]byte("STASH reference text, compressible. "), 64<<20/36+1)[:64<<20]
+	b.SetBytes(int64(len(d)))
+	for i := 0; i < b.N; i++ {
+		if _, err := a.Put(fmt.Sprintf("p%d", i), d); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+	var size int64
+	filepath.Walk(dir, func(_ string, fi os.FileInfo, _ error) error {
+		if fi != nil && !fi.IsDir() {
+			size += fi.Size()
+		}
+		return nil
+	})
+	b.ReportMetric(float64(size)/float64(int64(b.N)*int64(len(d))), "disk/logical")
+}
+
+func BenchmarkPut64MTextFixedCompressedExtents(b *testing.B)   { benchText(b, false) }
+func BenchmarkPut64MTextFixedUncompressedExtents(b *testing.B) { benchText(b, true) }

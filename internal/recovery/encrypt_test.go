@@ -123,3 +123,40 @@ func TestEncryptedRecovery(t *testing.T) {
 		rc.Close()
 	}
 }
+
+// Raw recovery of extents whose logical length exceeds the frame's
+// uncompressed capacity (§6.6.1), with and without the manifest.
+func TestRecoverCompressedExtents(t *testing.T) {
+	for _, key := range [][]byte{nil, rkey} {
+		fsys := vfs.NewCrashFS()
+		c := archive.Config{Mode: wire.ModeFixed, HashID: wire.HashSHA256, BlobCount: 3, MaxFrameQuanta: 4,
+			Codec: wire.CodecZstdDense, ParityScheme: wire.ParityRS, ParityK: 2, ParityM: 1, Key: key}
+		if _, err := archive.Create(fsys, c); err != nil {
+			t.Fatal(err)
+		}
+		w, err := archive.OpenWriter(fsys, archive.Options{Key: key})
+		if err != nil {
+			t.Fatal(err)
+		}
+		d := bytes.Repeat([]byte("recoverable compressed extent "), 40000)
+		if _, err := w.Put("x", d); err != nil {
+			t.Fatal(err)
+		}
+		v, _ := w.Stat("x")
+		w.Close()
+		if v.Loc[0].Length <= 16384-4096 {
+			t.Fatalf("extent of %d bytes", v.Loc[0].Length)
+		}
+		for _, noManifest := range []bool{false, true} {
+			rc, err := Scan(fsys, Options{Key: key, NoManifest: noManifest})
+			if err != nil {
+				t.Fatal(err)
+			}
+			sel := rc.DefaultSelection()
+			if len(sel) != 1 || !bytes.Equal(extract(t, rc, sel[0]), d) {
+				t.Fatalf("recovery (noManifest %v)", noManifest)
+			}
+			rc.Close()
+		}
+	}
+}

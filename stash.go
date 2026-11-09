@@ -20,6 +20,9 @@
 // Paths are relative, '/'-separated and are normalized to Unicode NFC
 // (SPEC §6.4.5); a path that is not a clean relative path is rejected,
 // never rewritten.
+//
+// The command stash (cmd/stash) exposes the same operations on the
+// command line.
 package stash
 
 import (
@@ -27,6 +30,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
 	"stash/internal/anchor"
@@ -262,8 +266,14 @@ func Create(dir string, o CreateOptions) error {
 
 // Options configure Open.
 type Options struct {
-	// MaxExtent caps the bytes per frame of one object (default 4 MiB).
+	// MaxExtent caps the logical bytes per frame of one object (default
+	// 4 MiB; never more than the archive's maximum frame size).
 	MaxExtent int
+	// UncompressedExtents makes a compressing archive put no more logical
+	// bytes into a frame than it would hold uncompressed. By default a
+	// frame holds as many bytes as compress into it, up to the maximum
+	// frame size (SPEC §6.6.1).
+	UncompressedExtents bool
 	// PackThreshold: objects up to this size share PACKED frames with
 	// the other small objects written at the same time (default 64 KiB;
 	// negative disables packing).
@@ -295,7 +305,7 @@ type Archive struct {
 // Open opens the archive in dir for writing, taking the writer lock and
 // running crash recovery (torn tails, open transactions, indexes).
 func Open(dir string, o Options) (*Archive, error) {
-	w, err := archive.OpenWriter(vfs.OS{Root: dir}, archive.Options{MaxExtent: o.MaxExtent, PackThreshold: o.PackThreshold, VerifyAll: o.VerifyAll,
+	w, err := archive.OpenWriter(vfs.OS{Root: dir}, archive.Options{MaxExtent: o.MaxExtent, UncompressedExtents: o.UncompressedExtents, PackThreshold: o.PackThreshold, VerifyAll: o.VerifyAll,
 		Anchor: o.Anchor, AdoptUnanchored: o.AdoptUnanchored, Key: o.Key, AcknowledgeAllocatorRollback: o.AcknowledgeAllocatorRollback})
 	if err != nil {
 		return nil, err
@@ -624,4 +634,55 @@ func AuthorizeAnchorTransition(ctx context.Context, dir string, a Anchor, operat
 // encrypted archive.
 func AuthorizeAnchorTransitionWithKey(ctx context.Context, dir string, a Anchor, key []byte, operator string, log func(string)) error {
 	return archive.AuthorizeAnchorTransition(ctx, vfs.OS{Root: dir}, a, operator, log, key)
+}
+
+// ArchiveInfo describes an archive's fixed parameters and state as stored
+// in its plaintext root and header; reading it needs no key and no lock.
+type ArchiveInfo struct {
+	ArchiveID    [32]byte
+	Generation   uint64   // the generation root.current names
+	Generations  []uint64 // generation directories present
+	Mode         FrameMode
+	Hash         Hash
+	Compression  Compression
+	Encrypted    bool
+	Hardened     bool
+	Blobs        int
+	MaxFrameSize int
+	Parity       Parity
+}
+
+// Describe reads the archive parameters of dir.
+func Describe(dir string) (ArchiveInfo, error) {
+	fsys := vfs.OS{Root: dir}
+	root, err := archive.ReadRoot(fsys)
+	if err != nil {
+		return ArchiveInfo{}, err
+	}
+	h, err := archive.ReadHeader(fsys, archive.GenDir(root.GenerationID))
+	if err != nil {
+		return ArchiveInfo{}, err
+	}
+	gens, err := archive.Generations(fsys)
+	if err != nil {
+		return ArchiveInfo{}, err
+	}
+	in := ArchiveInfo{ArchiveID: h.ArchiveID, Generation: root.GenerationID, Generations: gens,
+		Compression: Compression(h.CodecID), Encrypted: h.Encrypted(), Blobs: int(h.BlobCount), MaxFrameSize: int(h.MaxFrameSize())}
+	if h.Mode == wire.ModeFixed {
+		in.Mode = Fixed
+	}
+	if h.HashID == wire.HashBLAKE3 {
+		in.Hash = BLAKE3
+	}
+	switch h.ParityScheme {
+	case wire.ParityXOR:
+		in.Parity = Parity{Scheme: XOR, K: int(h.ParityK), M: int(h.ParityM)}
+	case wire.ParityRS:
+		in.Parity = Parity{Scheme: ReedSolomon, K: int(h.ParityK), M: int(h.ParityM)}
+	}
+	if _, err := os.Stat(filepath.Join(dir, archive.PolicyName)); err == nil {
+		in.Hardened = true
+	}
+	return in, nil
 }

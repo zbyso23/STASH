@@ -299,8 +299,45 @@ Benchmark (4 cores, this container's disk, incompressible data): 64 KiB Puts wit
 
 SPEC change: E1-25 (§15.1.1 key check, no wire change).
 
+## Milestone 16 — compressed extents up to MAX_FRAME_SIZE (done)
+
+| Where | Content | SPEC |
+|---|---|---|
+| `internal/archive/extents.go` | with a compressing codec, extent sources yield windows of several extents (up to 16 × the extent limit, at most 4 MiB); each window is split into extents of up to min(MAX_FRAME_SIZE, `MaxExtent`) logical bytes whose stored form fits the frame. The first attempt takes the whole limit; a too-large result shrinks by the observed ratio with a 3 % margin, at most three times, then falls back to the uncompressed capacity (STORE always fits). The next extent starts from the previous extent's ratio, so incompressible data costs one compression per frame | §6.6.1 |
+| | windows are split in parallel: one worker per window without parity; with parity a pipeline splits up to `workers` windows ahead while groups are formed in object order (`pendingSource`). Window buffers are reference-counted until every extent is written | §7.1 |
+| `Options.UncompressedExtents` | the M15 writer (logical extent ≤ uncompressed frame capacity); public `stash.Options.UncompressedExtents` | |
+
+Readers, verification, compaction (byte copy, regroup with re-sealing) and raw recovery needed no change: they already accepted any logical length up to MAX_FRAME_SIZE.
+
+Tests: VARIABLE, FIXED + encrypted, RS + encrypted and XOR + FIXED with text, mixed (compressible text with incompressible runs, so extents shrink inside a window), random data, an object of exactly one MAX_FRAME_SIZE, and a streamed Put; every frame stays within MAX_FRAME_SIZE and its quanta; frames above the uncompressed capacity exist only without `UncompressedExtents`; ReadAt across extents, reopen, Verify, compaction; 16 concurrent Puts with parity and small windows; a cancelled stream; raw recovery of such extents with and without the manifest (keyed and plain, FIXED + RS).
+
+The gain is bounded by the format: a logical extent never exceeds MAX_FRAME_SIZE, so a frame holds at most MAX_FRAME_SIZE / capacity more logical bytes (FIXED 64 KiB frames of compressible text: 1.069 → 1.001 bytes on disk per logical byte; frame counts −6 % to −19 % in the tests). Throughput is unchanged within noise.
+
+## Milestone 17 — command-line interface (done)
+
+`cmd/stash` (`go build ./cmd/stash`) uses only the public package. Commands:
+
+| Command | |
+|---|---|
+| `keygen <keyfile>` | a new archive key, 64 hex digits, mode 0600, never overwrites |
+| `create <archive> [-profile baseline\|secure\|fast] [-mode variable\|fixed] [-hash] [-compression store\|zstd-fast\|zstd\|zstd-dense] [-parity none\|xor\|rs -k K -m M] [-blobs N] [-frame-size 64K]` | prints the parameters |
+| `info <archive>` | parameters from the plaintext root and header (`stash.Describe`, no key, no lock) |
+| `put <archive> <file\|dir\|->... [-prefix p] [-as name] [-q]` | streams files (PutReader); directories recursively as `<dir name>/<relative path>`; `-` reads stdin |
+| `get <archive> <path> [-o file]`, `export <archive> <dir> [-prefix p]` | streaming reads; files are written through a temporary file and renamed |
+| `ls [-l] <archive> [prefix]`, `stat`, `rm` | |
+| `verify <archive>` | full verification (VerifyAll); exit 3 on damage |
+| `compact [-keep-old]`, `gc` | |
+| `recover <archive> [-no-manifest] [-generation N] [-all]` | raw recovery report; keyless for encrypted archives (opaque objects); exit 3 on damage |
+| `salvage <archive> <new-archive>` | the default selection into a new archive |
+| `enroll`, `leave-hardened`, `authorize` | HARDENED operator actions (`-operator` required, `-anchor` a file anchor directory) |
+
+Common flags: `-key-file` (raw 32 bytes or hex; or `$STASH_KEY`), `-anchor`, `-acknowledge-allocator-rollback`, `-adopt-unanchored`. Flags may follow the arguments. Exit codes: 0 ok, 1 error, 2 usage, 3 damage found. Errors an operator can act on carry a hint (missing key, anchor, lock, sealed blobs).
+
+Tests (`cmd/stash/main_test.go`, through `run` on real directories): three configurations (baseline; fast + FIXED + XOR; secure + RS + zstd) through keygen, create, put of a tree with Czech names and stdin, ls, get, export (byte-compared), rm, stat, verify, missing and wrong keys, a damaged blob (verify and recover exit 3), compact rebuilding the frame from parity, verify OK, gc, salvage and keyless recovery of the salvaged archive; HARDENED create, refusal without the anchor, leave and enroll with a new anchor; usage errors.
+
+No SPEC change in M16–M17.
+
 ## Next milestones
 
-16. A writer option for compressed extents larger than the frame's uncompressed capacity (the reader already accepts them).
-17. CLI (`stash create/put/get/ls/verify/compact/recover`).
-18. FUSE mount, then Emergency Pruning.
+18. FUSE mount (read-only first).
+19. Emergency Pruning (§13.9).

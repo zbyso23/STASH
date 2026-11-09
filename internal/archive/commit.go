@@ -246,15 +246,28 @@ func (w *Writer) writeAndCommit(ctx context.Context, p string, src extentSource)
 		go func(off int, payload []byte, release func()) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			if release != nil {
-				defer release()
+			if !w.compressedExtents() {
+				if release != nil {
+					defer release()
+				}
+				loc, b, err := w.writeExtent(p, ver, off, payload)
+				mu.Lock()
+				results = append(results, result{loc, b, err})
+				mu.Unlock()
+				if err != nil {
+					fail(err)
+				}
+				return
 			}
-			loc, b, err := w.writeExtent(p, ver, off, payload)
-			mu.Lock()
-			results = append(results, result{loc, b, err})
-			mu.Unlock()
-			if err != nil {
-				fail(err)
+			for _, e := range w.splitWindow(p, off, payload, release) {
+				loc, b, err := w.writeEncoded(p, ver, e)
+				e.release()
+				mu.Lock()
+				results = append(results, result{loc, b, err})
+				mu.Unlock()
+				if err != nil {
+					fail(err)
+				}
 			}
 		}(off, payload, release)
 		off += len(payload)
@@ -310,8 +323,26 @@ func (w *Writer) writeExtent(p string, ver uint64, off int, payload []byte) (man
 	if rel != nil {
 		defer rel()
 	}
-	s := &frame.Spec{BlockType: wire.BlockData, Codec: codec, Payload: stored, FrameOrdinal: ord,
-		Entries: []wire.Entry{{Path: p, Offset: uint64(off), Length: uint64(len(payload)), FileVer: ver}}}
+	return w.appendData(p, ver, b, ord, encExtent{off: off, n: len(payload), codec: codec, stored: stored})
+}
+
+// writeEncoded writes one compressed extent as a DATA frame and indexes it.
+func (w *Writer) writeEncoded(p string, ver uint64, e encExtent) (manifest.Loc, int, error) {
+	b, err := w.pickBlob()
+	if err != nil {
+		return manifest.Loc{}, 0, err
+	}
+	ord, err := w.ordAlloc[b].Next()
+	if err != nil {
+		return manifest.Loc{}, 0, err
+	}
+	return w.appendData(p, ver, b, ord, e)
+}
+
+func (w *Writer) appendData(p string, ver uint64, b int, ord uint64, e encExtent) (manifest.Loc, int, error) {
+	off, n := e.off, e.n
+	s := &frame.Spec{BlockType: wire.BlockData, Codec: e.codec, Payload: e.stored, FrameOrdinal: ord,
+		Entries: []wire.Entry{{Path: p, Offset: uint64(off), Length: uint64(n), FileVer: ver}}}
 	rec, err := w.writers[b].AppendIndexed(s)
 	if err != nil {
 		return manifest.Loc{}, 0, err
@@ -320,5 +351,5 @@ func (w *Writer) writeExtent(p string, ver uint64, off int, payload []byte) (man
 	bv.mu.Lock()
 	bv.idx.Add(rec)
 	bv.mu.Unlock()
-	return manifest.Loc{Blob: uint8(b), Hash: rec.FrameHash, Offset: uint64(off), Length: uint64(len(payload))}, b, nil
+	return manifest.Loc{Blob: uint8(b), Hash: rec.FrameHash, Offset: uint64(off), Length: uint64(n)}, b, nil
 }

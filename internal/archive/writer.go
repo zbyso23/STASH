@@ -32,9 +32,16 @@ var ErrPathBusy = manifest.ErrPathBusy
 // Options configures OpenWriter.
 type Options struct {
 	Pool *bufpool.Pool
-	// MaxExtent caps the logical bytes per DATA frame (default 4 MiB, never
-	// more than the frame can hold).
+	// MaxExtent caps the logical bytes per DATA frame (default 4 MiB).
+	// Uncompressed, an extent never exceeds what the frame holds; with a
+	// compressing codec it may reach MAX_FRAME_SIZE when its compressed
+	// form fits the frame (§6.6.1, see UncompressedExtents).
 	MaxExtent int
+	// UncompressedExtents limits every logical extent to what the frame
+	// would hold uncompressed, even when the archive compresses (the M15
+	// writer). Without it the writer packs as many logical bytes into a
+	// frame as compress into it, up to MAX_FRAME_SIZE and MaxExtent.
+	UncompressedExtents bool
 	// PackThreshold: objects up to this size are packed into shared
 	// PACKED frames by the group commit (§8). 0 means
 	// DefaultPackThreshold, negative disables packing.
@@ -450,8 +457,13 @@ func (w *Writer) Health() Health {
 	return w.health
 }
 
-// maxPayload is the largest DATA payload for path in one frame.
+// maxExtent is the largest stored DATA payload for path in one frame,
+// within MaxExtent; frameCapacity is the same without MaxExtent.
 func (w *Writer) maxExtent(p string) int {
+	return min(w.frameCapacity(p), w.opt.MaxExtent/wire.BaseQuantum*wire.BaseQuantum)
+}
+
+func (w *Writer) frameCapacity(p string) int {
 	pt := 4 + 2 + len(p) + 24 + 4 // entry list + outer CRC
 	n := int(w.h.MaxFrameSize()) - wire.FrameOverhead - pt
 	if w.h.Encrypted() {
@@ -460,8 +472,7 @@ func (w *Writer) maxExtent(p string) int {
 	if w.code != nil {
 		n -= wire.MinParityPadding // §7.2
 	}
-	n = n / wire.BaseQuantum * wire.BaseQuantum
-	return min(n, w.opt.MaxExtent/wire.BaseQuantum*wire.BaseQuantum)
+	return n / wire.BaseQuantum * wire.BaseQuantum
 }
 
 func (w *Writer) pickBlob() (int, error) {
@@ -522,6 +533,9 @@ func (w *Writer) prepare(p string) (int, error) {
 	chunk := w.maxExtent(p)
 	if chunk <= 0 {
 		return 0, fmt.Errorf("%w: path too long for one frame", wire.ErrInvalid)
+	}
+	if w.compressedExtents() {
+		chunk = w.window()
 	}
 	if err := w.claim(p); err != nil {
 		return 0, err
