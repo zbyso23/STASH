@@ -65,6 +65,7 @@ type frameDir struct {
 	seen   map[[2]int64]bool
 	byHash map[[wire.HashSize]byte][]*hopMember
 	groups map[uint32][]*hopMember
+	all    []*hopMember // every frame found, in discovery order
 	// rebuiltAs remembers which group holds a frame that was already
 	// rebuilt once, so a lost blob is not decoded group by group again.
 	rebuiltAs map[blob.FrameKey]uint32
@@ -106,6 +107,7 @@ func (v *view) refresh(d *frameDir) error {
 			}
 			d.seen[k] = true
 			m := &hopMember{blob: uint8(b), off: f.Offset, quanta: f.Quanta, t: f.Trailer, entries: f.Entries}
+			d.all = append(d.all, m)
 			if f.Trailer.BlockType != wire.BlockParity {
 				d.byHash[f.Trailer.HashPayload] = append(d.byHash[f.Trailer.HashPayload], m)
 			}

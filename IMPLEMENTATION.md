@@ -198,6 +198,50 @@ Tests: checkpoint used and advanced, payload damage below it reported on read (n
 
 SPEC change E1-23 (approved by the user): verified checkpoint in §10.4.2.
 
+## Milestone 11 — verification and raw recovery (done)
+
+| Where | Content | SPEC |
+|---|---|---|
+| `internal/blob/resync.go` | `Reader.Resync`: normal scan until the first frame that fails, then a probe at every frame-grid offset (every slot in FIXED mode), also inside frames found by probing; probes check Prefix, tail and outer CRC before hashing; frames from the first failure on are resync candidates, overlapping candidates are conflicts; damaged regions are the bytes no frame covers; a hash budget (default 4x blob size) ends the scan with an "unscanned" region, never an empty one | §11.2, §11.2.1, §11.3 |
+| `internal/recovery` | `Scan`: generation from `root.current`, or the newest directory when the root is unusable (labeled not authoritative); header from any agreeing blob copy; every blob resynced in parallel; parity groups by frame-local metadata, conflicting ones unused, missing DATA/PACKED members rebuilt and validated; versions assembled from DATA entries (by `logical_offset`) and PACKED entries, with gaps, overlaps and PACKED/DATA mixes reported as conflicts; labels from a surviving manifest (also from the records before a manifest failure): committed or "not known to be committed", current, known length; extents from resync candidates are unverified unless a record references the version | §7, §11.2.2, §11.4–§11.6 |
+| | `Extract` (complete versions only, every frame read and validated again), `ExtractAt` (whatever is recoverable, missing ranges returned, never zero-filled), `DefaultSelection` (current versions, or the newest complete version per path without a manifest), `Salvage` into a new archive with the same parameters | §11.2.2 |
+| `internal/archive/verify.go` | `Verify` of a writer (writes wait) or a reader: every blob resynced, every live version read completely (repairs counted), every parity group checked: Healthy (stored parity equals recomputed parity), Degraded, Unrecoverable, Conflicting, Inconsistent | §11, §13.9 |
+| `internal/archive/layout.go` | `ReadHeader` of any generation directory, `ReadRoot`, `Generations` | §2.1, §11.1 |
+
+Public API: `stash.Recover(dir, RecoverOptions)`, `Recovery.Extract`, `Recovery.ExtractAt`, `Recovery.DefaultSelection`, `stash.Salvage`, `Archive.Verify`, `Reader.Verify`.
+
+Tests: resync of intact blobs, after damage in VARIABLE and FIXED mode, a forged frame inside a probed frame (both conflicts; an intact blob is never probed inside), the hash budget; recovery of an intact archive (every version including superseded and deleted ones, labels, content), without manifest and root (nothing labeled committed, newest version per path), a damaged frame without parity (gap, resync candidates unverified only without a manifest, partial extraction), RS 3+2 with a lost and a damaged blob in both modes, salvage into a new archive; verify of a clean, a degraded and an unprotected damaged archive.
+
+## Milestone 12 — compaction, GC and reader pins (done)
+
+`Writer.Compact` runs Mark → Sweep → Freeze/Merge → Switch → GC (§13):
+
+- **Mark**: the live versions and the source allocator positions, under a short shared lock.
+- **Sweep** (writes continue): the destination generation gets a new id from `generation.alloc` and is opened as a second writer. The source is hopped once (Prefix and tail only) to find every frame with a live entry. Ungrouped DATA frames are copied byte for byte. PACKED frames are copied when every entry is live, otherwise their live objects are repacked. A parity group whose members are all live is copied whole with its `group_id`, its members keep their blob ordinals, lost or damaged DATA/PACKED members are rebuilt and copied byte-identically, and lost PARITY frames are recomputed with the same group fields and a new ordinal (§7.3.1). Other groups are regrouped: live members are rewritten with new group fields and new parity (§13.7.1), and a `frame_hash` stays the same because it covers only the payload. Live entries that no intact frame holds are searched in incomplete groups through parity. Then the destination manifest gets one record per live path in bytewise order (§13.2.1), and blobs, raised allocators (ordinals and group ids above everything copied), indexes and manifest are made durable. Every version is read back and every group's parity recomputed (§13.5 step 4).
+- **Freeze/Merge** (writes wait): the net change since the Mark is copied and appended as `ADD`/`DEL`, made durable and verified (E1-24).
+- **Switch**: `root.current` is replaced atomically. The writer continues on the new generation, and its sealed blobs are writable again.
+- **GC**: removes every generation other than the current one that no unexpired pin and no open `Object` uses (replaced generations and aborted attempts). An aborted compaction removes its own directory.
+- A committed extent that cannot be found or rebuilt fails the compaction with `ErrMissingData` (GC-blocked, §13.8) and leaves the archive as it was.
+
+| Where | Content | SPEC |
+|---|---|---|
+| `internal/archive/compact.go` | compactor (see above) | §7.3.1, §13–§13.8 |
+| `internal/archive/gc.go` | `GC`; reader pins `pins/<generation>-<random>.pin` (magic, expiry, CRC32C), renewed in the background, an undecodable pin counts as never expiring | §13.1.1 |
+| `internal/archive/view.go` | `OpenReaderPinned` (pins, then checks the generation is still current, retries otherwise); open `Object`s keep a replaced generation's files open until they close | §13.1.1 |
+| `internal/archive/writer.go` | writer state per generation (`openGeneration`), operations under a generation lock; with parity a missing blob file opens as sealed instead of failing (reads go through parity, compaction rebuilds it) | §7.4 |
+| `internal/alloc` | `RaiseTo` | §2.1.3 |
+| `internal/vfs` | `RemoveAll`; `CrashFS` removes empty directories | |
+
+Public API: `Archive.Compact(ctx, CompactOptions{KeepOld})`, `CompactResult`, `Archive.GC()`; `OpenReadOnly` now pins, and `OpenReadOnlyWith(dir, ReadOptions{NoPin, PinTTL})` lets you choose.
+
+Tests: compaction in VARIABLE/FIXED, without parity, XOR and RS (dead data dropped, partly dead PACKED frames repacked, destination smaller, an `Object` opened before the switch still reads, GC after it closes, writes and reopen afterwards, a second compaction copies only); one damaged member per group (rebuilt or recomputed, sealed blobs writable again, verify OK); a lost blob file; regrouping of a packed parity group with a dead member; 4 concurrent writers and deleters during 3 compactions (delta merged); a damaged extent without parity blocks the compaction; a pinned reader keeps its generation; crash at every 3rd mutating step of a compaction without parity and with RS 3+2 (300 crash points: the old or the new generation is authoritative with every live version, GC then leaves one generation, writes continue).
+
+Benchmarks (4 cores, this container's disk): compaction of 64 MiB with half deleted and RS 4+2 is about 75 MB/s of live data. It is bound by I/O and by the full verification of the destination, which reads everything back and recomputes parity. A raw recovery scan of 64 MiB without damage runs at about 3.7 GB/s.
+
+SPEC change E1-24: the post-Mark delta may be merged by its net effect per path, and a post-Mark group keeps its `group_id` only below the destination's allocation start. §7 asked to raise the destination `groups.alloc` above every copied ID before allocating new ones, which a concurrent Sweep cannot do.
+
+Not yet: Emergency Pruning (§13.9) and health records of degraded groups, `PARITY_GROUP` records in the destination (optional).
+
 ## Next milestones
 
-11. Recovery tooling (resync per §11.2.1 and full raw recovery). Then compaction with parity repair and regrouping, HARDENED anchor, encryption, zstd, CLI, FUSE.
+13. HARDENED anchor (§2.1.2, §13.6.1). Then encryption, zstd, CLI, FUSE.

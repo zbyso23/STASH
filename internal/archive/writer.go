@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"path"
 	"sync"
 	"sync/atomic"
@@ -67,10 +68,20 @@ type Health struct {
 // are safe for concurrent use; writes to different blobs proceed in
 // parallel, commits go through one manifest stream.
 type Writer struct {
-	view
-	unlock  func() error
-	journal *manifest.Journal
-	opt     Options
+	*view
+	// genMu: every operation holds it shared; compaction holds it
+	// exclusively while it freezes, merges and switches generations
+	// (§13.5).
+	genMu sync.RWMutex
+	// retired are views of earlier generations still used by open
+	// Objects; their files close when the last Object closes, or in Close.
+	retiredMu sync.Mutex
+	retired   []*view
+	compactMu sync.Mutex
+	fsys      vfs.FS // shadows view.fsys (the same FS), usable before a view exists
+	unlock    func() error
+	journal   *manifest.Journal
+	opt       Options
 
 	genAlloc, verAlloc, seqAlloc *alloc.Allocator
 	groupAlloc                   *alloc.Allocator // nil without parity
@@ -103,7 +114,7 @@ func OpenWriter(fsys vfs.FS, opt Options) (w *Writer, err error) {
 	if err != nil {
 		return nil, err
 	}
-	w = &Writer{unlock: unlock, opt: opt, busy: map[string]bool{},
+	w = &Writer{unlock: unlock, opt: opt, busy: map[string]bool{}, fsys: fsys,
 		health: Health{Sealed: map[uint8]error{}, TornBlobBytes: map[uint8]int64{}}}
 	opened := w
 	defer func() {
@@ -124,13 +135,6 @@ func OpenWriter(fsys vfs.FS, opt Options) (w *Writer, err error) {
 	if h.Encrypted() {
 		return nil, fmt.Errorf("%w: encrypted archives need a later milestone", wire.ErrUnsupported)
 	}
-	if h.ParityScheme != wire.ParityNone {
-		if w.code, err = parity.New(h.ParityScheme, int(h.ParityK), int(h.ParityM)); err != nil {
-			return nil, err
-		}
-	}
-	w.view = view{fsys: fsys, gen: gen, h: h, pool: opt.Pool}
-
 	// archive-wide allocators
 	ga := alloc.Identity{Kind: wire.AllocGeneration, ArchiveID: h.ArchiveID, Encrypted: h.Encrypted()}
 	if w.genAlloc, err = alloc.Open(fsys, alloc.FileName(wire.AllocGeneration, 0), ga, 0); err != nil {
@@ -151,16 +155,33 @@ func OpenWriter(fsys vfs.FS, opt Options) (w *Writer, err error) {
 	if w.verAlloc, err = alloc.Open(fsys, alloc.FileName(wire.AllocFileVer, 0), fa, 0); err != nil {
 		return nil, err
 	}
+	if err := w.openGeneration(gen, h); err != nil {
+		return nil, err
+	}
+	w.opened = true
+	return w, nil
+}
+
+// openGeneration opens generation gen for writing with every cold-start
+// rule (see OpenWriter). The archive-wide allocators must be open.
+func (w *Writer) openGeneration(gen string, h *wire.ArchiveHeader) (err error) {
+	fsys, opt := w.fsys, w.opt
+	if h.ParityScheme != wire.ParityNone {
+		if w.code, err = parity.New(h.ParityScheme, int(h.ParityK), int(h.ParityM)); err != nil {
+			return err
+		}
+	}
+	w.view = &view{fsys: fsys, gen: gen, h: h, pool: opt.Pool}
 	per := func(kind wire.AllocKind, b uint8) (*alloc.Allocator, error) {
 		return alloc.Open(fsys, path.Join(gen, alloc.FileName(kind, b)),
 			alloc.Identity{Kind: kind, Blob: b, GenerationID: h.GenerationID, ArchiveID: h.ArchiveID, Encrypted: h.Encrypted()}, 0)
 	}
 	if w.seqAlloc, err = per(wire.AllocManifestSeq, 0); err != nil {
-		return nil, err
+		return err
 	}
 	if w.code != nil {
 		if w.groupAlloc, err = per(wire.AllocGroupID, 0); err != nil {
-			return nil, err
+			return err
 		}
 	}
 
@@ -176,7 +197,7 @@ func OpenWriter(fsys vfs.FS, opt Options) (w *Writer, err error) {
 		},
 	})
 	if err != nil {
-		return nil, err
+		return err
 	}
 	w.journal = j
 	w.health.TornManifestBytes = res.Load.Torn
@@ -192,7 +213,7 @@ func OpenWriter(fsys vfs.FS, opt Options) (w *Writer, err error) {
 	if w.code != nil {
 		refd, incomplete, err := w.groupCensus(st)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		groupRef = func(g uint32) bool { return refd[g] }
 		tailHold = incomplete
@@ -206,7 +227,7 @@ func OpenWriter(fsys vfs.FS, opt Options) (w *Writer, err error) {
 	opens := make([]blobOpen, h.BlobCount)
 	for b := 0; b < int(h.BlobCount); b++ {
 		if w.ordAlloc[b], err = per(wire.AllocFrameOrdinal, uint8(b)); err != nil {
-			return nil, err
+			return err
 		}
 	}
 	var cps []blob.Checkpoint
@@ -236,6 +257,10 @@ func OpenWriter(fsys vfs.FS, opt Options) (w *Writer, err error) {
 		switch {
 		case blob.IsSealed(o.err):
 			w.health.Sealed[uint8(b)] = o.err
+		case o.err != nil && w.code != nil && errors.Is(o.err, fs.ErrNotExist):
+			// a lost blob file: parity stands in for its frames, writes go
+			// to the other blobs, compaction rebuilds it (§7.3.1)
+			w.health.Sealed[uint8(b)] = fmt.Errorf("%w: blob file missing: %v", blob.ErrSealed, o.err)
 		case o.err != nil:
 			if openErr == nil {
 				openErr = fmt.Errorf("blob %02X: %w", b, o.err)
@@ -250,12 +275,12 @@ func OpenWriter(fsys vfs.FS, opt Options) (w *Writer, err error) {
 		}
 	}
 	if openErr != nil {
-		return nil, openErr
+		return openErr
 	}
 	if w.groupAlloc != nil {
 		// group_id cold-start check over every frame found (§2.1.3.1, §7)
 		if err := w.groupAlloc.Check(uint64(maxGroup), maxGroup > 0); err != nil {
-			return nil, err
+			return err
 		}
 		writable := 0
 		for _, bw := range w.writers {
@@ -277,17 +302,16 @@ func OpenWriter(fsys vfs.FS, opt Options) (w *Writer, err error) {
 			fsys.Remove(path.Join(gen, iname))
 		}
 	}
-	stats, err := w.openBlobs(true, false)
+	stats, err := w.openBlobs(true, w.code != nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	for b, s := range stats {
 		if s.Rebuilt {
 			w.health.RebuiltIndexes = append(w.health.RebuiltIndexes, uint8(b))
 		}
 	}
-	w.opened = true
-	return w, nil
+	return nil
 }
 
 // groupCensus hops every blob once (Prefix and tail only) and returns,
@@ -307,6 +331,9 @@ func (w *Writer) groupCensus(st *manifest.State) (referenced map[uint32]bool, in
 		refs := st.BlobCommitted(uint8(b), nil).Refs
 		name, _ := blob.Name(uint8(b))
 		r, err := blob.Open(w.fsys, path.Join(w.gen, name), w.h, w.pool)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue // lost blob: OpenWriter decides
+		}
 		if err != nil {
 			return nil, false, fmt.Errorf("blob %02X: %w", b, err)
 		}
@@ -347,10 +374,18 @@ func (w *Writer) groupCensus(st *manifest.State) (referenced map[uint32]bool, in
 }
 
 // Header returns the archive header.
-func (w *Writer) Header() *wire.ArchiveHeader { return w.h }
+func (w *Writer) Header() *wire.ArchiveHeader {
+	w.genMu.RLock()
+	defer w.genMu.RUnlock()
+	return w.h
+}
 
 // Health returns what the cold start found.
-func (w *Writer) Health() Health { return w.health }
+func (w *Writer) Health() Health {
+	w.genMu.RLock()
+	defer w.genMu.RUnlock()
+	return w.health
+}
 
 // maxPayload is the largest DATA payload for path in one frame.
 func (w *Writer) maxExtent(p string) int {
@@ -394,6 +429,8 @@ func (w *Writer) release(p string) {
 // Put writes data as a new version of p and commits it durably (§9.5,
 // §10.4). It returns the new file_ver. See PutReader for streaming input.
 func (w *Writer) Put(p string, data []byte) (uint64, error) {
+	w.genMu.RLock()
+	defer w.genMu.RUnlock()
 	chunk, err := w.prepare(p)
 	if err != nil {
 		return 0, err
@@ -428,6 +465,8 @@ func (w *Writer) prepare(p string) (int, error) {
 
 // Delete commits removal of the current version of p.
 func (w *Writer) Delete(p string) error {
+	w.genMu.RLock()
+	defer w.genMu.RUnlock()
 	if err := w.claim(p); err != nil {
 		return err
 	}
@@ -437,6 +476,8 @@ func (w *Writer) Delete(p string) error {
 
 // Get returns the content of the current version of p.
 func (w *Writer) Get(p string) ([]byte, error) {
+	w.genMu.RLock()
+	defer w.genMu.RUnlock()
 	w.stateMu.RLock()
 	v, ok := w.journal.State().Lookup(p)
 	w.stateMu.RUnlock()
@@ -450,6 +491,8 @@ func (w *Writer) Get(p string) ([]byte, error) {
 // readable after later writes to p (versions are immutable, §9.5) until
 // compaction, which does not exist yet.
 func (w *Writer) Open(p string) (*Object, error) {
+	w.genMu.RLock()
+	defer w.genMu.RUnlock()
 	w.stateMu.RLock()
 	v, ok := w.journal.State().Lookup(p)
 	w.stateMu.RUnlock()
@@ -461,6 +504,8 @@ func (w *Writer) Open(p string) (*Object, error) {
 
 // Stat returns the current version of p.
 func (w *Writer) Stat(p string) (*manifest.Version, error) {
+	w.genMu.RLock()
+	defer w.genMu.RUnlock()
 	w.stateMu.RLock()
 	defer w.stateMu.RUnlock()
 	v, ok := w.journal.State().Lookup(p)
@@ -475,6 +520,8 @@ func (w *Writer) Stat(p string) (*manifest.Version, error) {
 // number of workers times the extent size. Cancelling ctx stops the write
 // before the commit (frames written so far stay unreferenced).
 func (w *Writer) PutReader(ctx context.Context, p string, r io.Reader) (uint64, error) {
+	w.genMu.RLock()
+	defer w.genMu.RUnlock()
 	chunk, err := w.prepare(p)
 	if err != nil {
 		return 0, err
@@ -538,6 +585,8 @@ func (w *Writer) putPacked(p string, data []byte) (uint64, error) {
 
 // List returns the live paths.
 func (w *Writer) List() []string {
+	w.genMu.RLock()
+	defer w.genMu.RUnlock()
 	w.stateMu.RLock()
 	defer w.stateMu.RUnlock()
 	return w.journal.State().Paths()
@@ -555,7 +604,11 @@ func (w *Writer) Close() error {
 	if w.opened {
 		keep(w.writeCheckpoints())
 	}
-	for b, bv := range w.blobs {
+	var blobs []*blobView
+	if w.view != nil {
+		blobs = w.blobs
+	}
+	for b, bv := range blobs {
 		if bv == nil {
 			continue
 		}
@@ -566,7 +619,15 @@ func (w *Writer) Close() error {
 			bv.mu.Unlock()
 		}
 	}
-	w.close()
+	if w.view != nil {
+		w.close()
+	}
+	w.retiredMu.Lock()
+	for _, v := range w.retired {
+		v.close()
+	}
+	w.retired = nil
+	w.retiredMu.Unlock()
 	for _, bw := range w.writers {
 		if bw != nil {
 			keep(bw.Close())

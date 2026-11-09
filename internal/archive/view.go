@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"stash/internal/blob"
 	"stash/internal/bufpool"
@@ -47,7 +49,24 @@ type view struct {
 	// parity archive continue without it, §7.4).
 	unavailable map[uint8]error
 	repairs
+
+	// users counts open Objects; a retired view (an earlier generation
+	// after compaction) closes its files when the last one closes.
+	users     atomic.Int64
+	retiredV  atomic.Bool
+	closeOnce sync.Once
 }
+
+// retire marks the view as belonging to a replaced generation.
+func (v *view) retire() {
+	v.retiredV.Store(true)
+	if v.users.Load() == 0 {
+		v.close()
+	}
+}
+
+// inUse reports whether a retired view still has open Objects.
+func (v *view) inUse() bool { return v.users.Load() > 0 }
 
 // openBlobs opens every blob and its index. With tolerate, a blob that
 // cannot be opened is recorded as unavailable instead of failing (only
@@ -103,11 +122,13 @@ func (v *view) openBlobs(writeIndexes, tolerate bool) (statuses []index.Status, 
 }
 
 func (v *view) close() {
-	for _, b := range v.blobs {
-		if b != nil {
-			b.r.Close()
+	v.closeOnce.Do(func() {
+		for _, b := range v.blobs {
+			if b != nil {
+				b.r.Close()
+			}
 		}
-	}
+	})
 }
 
 // fetch finds the frame of one extent (§9.1): through the index
@@ -245,10 +266,11 @@ type Object struct {
 	path string
 	ver  *manifest.Version
 
-	mu    sync.Mutex
-	cur   *blob.Ref // last frame read (sequential reads hit it)
-	at    int       // its extent index
-	ahead *prefetch // the next extent, fetched in the background
+	mu     sync.Mutex
+	cur    *blob.Ref // last frame read (sequential reads hit it)
+	at     int       // its extent index
+	ahead  *prefetch // the next extent, fetched in the background
+	closed bool
 }
 
 // prefetch is a background fetch of extent i.
@@ -305,6 +327,7 @@ func (o *Object) load(i int) (*blob.Ref, error) {
 }
 
 func (v *view) object(p string, ver *manifest.Version) *Object {
+	v.users.Add(1)
 	o := &Object{v: v, path: p, ver: ver, at: -1}
 	o.SectionReader = io.NewSectionReader(objectAt{o}, 0, int64(ver.Length))
 	return o
@@ -361,6 +384,12 @@ func (o *Object) Close() error {
 		o.ahead.drop()
 		o.ahead = nil
 	}
+	if !o.closed {
+		o.closed = true
+		if o.v.users.Add(-1) == 0 && o.v.retiredV.Load() {
+			o.v.close()
+		}
+	}
 	return nil
 }
 
@@ -375,17 +404,60 @@ func checkPath(p string) error {
 // reader snapshot). It takes no lock and never writes.
 type Reader struct {
 	view
-	st *manifest.State
+	st  *manifest.State
+	pin *Pin
 }
 
-// OpenReader opens the archive in fsys for reading.
+// OpenReader opens the archive in fsys for reading, without a pin: a
+// compaction's GC may remove the generation while it is read (on POSIX
+// filesystems the open blob files stay readable).
 func OpenReader(fsys vfs.FS, pool *bufpool.Pool) (*Reader, error) {
-	if pool == nil {
-		pool = bufpool.Default
-	}
 	root, err := readRoot(fsys)
 	if err != nil {
 		return nil, err
+	}
+	return openReaderAt(fsys, pool, root)
+}
+
+// OpenReaderPinned opens the archive for reading and pins the generation
+// first (§13.1.1), so GC keeps it until Close. ttl <= 0 selects
+// DefaultPinTTL; the pin is renewed in the background.
+func OpenReaderPinned(fsys vfs.FS, pool *bufpool.Pool, ttl time.Duration) (*Reader, error) {
+	for try := 0; ; try++ {
+		root, err := readRoot(fsys)
+		if err != nil {
+			return nil, err
+		}
+		pin, err := pinGeneration(fsys, root.GenerationID, ttl)
+		if err != nil {
+			return nil, err
+		}
+		// the pin counts only if the generation was still current once
+		// it existed: GC never removes the current generation
+		again, err := readRoot(fsys)
+		if err != nil || again.GenerationID != root.GenerationID {
+			pin.Release()
+			if err != nil {
+				return nil, err
+			}
+			if try < 8 {
+				continue
+			}
+			return nil, fmt.Errorf("generation keeps changing while pinning")
+		}
+		r, err := openReaderAt(fsys, pool, root)
+		if err != nil {
+			pin.Release()
+			return nil, err
+		}
+		r.pin = pin
+		return r, nil
+	}
+}
+
+func openReaderAt(fsys vfs.FS, pool *bufpool.Pool, root wire.Root) (*Reader, error) {
+	if pool == nil {
+		pool = bufpool.Default
 	}
 	gen := GenDir(root.GenerationID)
 	h, err := readHeader(fsys, gen, root)
@@ -441,8 +513,11 @@ func (r *Reader) Open(p string) (*Object, error) {
 	return r.object(p, v), nil
 }
 
-// Close releases the files.
+// Generation returns the generation the snapshot reads.
+func (r *Reader) Generation() uint64 { return r.h.GenerationID }
+
+// Close releases the files and the pin.
 func (r *Reader) Close() error {
 	r.close()
-	return nil
+	return r.pin.Release()
 }

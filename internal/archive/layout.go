@@ -76,6 +76,25 @@ func readRoot(fsys vfs.FS) (wire.Root, error) {
 // checks it against the root (§11.1). Every blob is checked again when it
 // is opened.
 func readHeader(fsys vfs.FS, gen string, root wire.Root) (*wire.ArchiveHeader, error) {
+	found, err := ReadHeader(fsys, gen)
+	if err != nil {
+		return nil, err
+	}
+	if found.GenerationID != root.GenerationID || found.ArchiveID != root.ArchiveID {
+		return nil, fmt.Errorf("%w: blob header does not match root.current", wire.ErrCorrupt)
+	}
+	return found, nil
+}
+
+// ReadRoot reads and validates root.current (§2.1.1).
+func ReadRoot(fsys vfs.FS) (wire.Root, error) { return readRoot(fsys) }
+
+// Generations lists the generation ids present as directories.
+func Generations(fsys vfs.FS) ([]uint64, error) { return generations(fsys) }
+
+// ReadHeader reads the Archive Header of generation directory gen from any
+// intact blob copy; copies that decode must agree (§2.2, §2.3, §11.1).
+func ReadHeader(fsys vfs.FS, gen string) (*wire.ArchiveHeader, error) {
 	// Every blob carries a copy (§2.2). A missing blob or one whose copy
 	// does not decode is skipped here (the blob itself is then unavailable
 	// or sealed); copies that decode must all agree, or the header is
@@ -121,8 +140,8 @@ func readHeader(fsys vfs.FS, gen string, root wire.Root) (*wire.ArchiveHeader, e
 	if found == nil {
 		return nil, firstErr
 	}
-	if found.GenerationID != root.GenerationID || found.ArchiveID != root.ArchiveID {
-		return nil, fmt.Errorf("%w: blob header does not match root.current", wire.ErrCorrupt)
+	if g, ok := ParseGenDir(gen); !ok || g != found.GenerationID {
+		return nil, fmt.Errorf("%w: blob header names generation %d, directory is %s", wire.ErrCorrupt, found.GenerationID, gen)
 	}
 	return found, nil
 }

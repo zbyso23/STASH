@@ -120,6 +120,27 @@ func (c *CrashFS) Remove(name string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	name = clean(name)
+	if c.dirs[name] && name != "." {
+		// an empty directory; its removal is durable at once (directories
+		// are durable when created, see CrashFS)
+		for d := range c.dirs {
+			if d != name && dirOf(d) == name {
+				return &fs.PathError{Op: "remove", Path: name, Err: fs.ErrExist}
+			}
+		}
+		for n := range c.ns {
+			if dirOf(n) == name {
+				return &fs.PathError{Op: "remove", Path: name, Err: fs.ErrExist}
+			}
+		}
+		for n := range c.durNS {
+			if dirOf(n) == name {
+				delete(c.durNS, n) // removed but not yet synced: gone with the directory
+			}
+		}
+		delete(c.dirs, name)
+		return nil
+	}
 	if _, ok := c.ns[name]; !ok {
 		return &fs.PathError{Op: "remove", Path: name, Err: fs.ErrNotExist}
 	}

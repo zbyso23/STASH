@@ -1739,6 +1739,8 @@ The delta is not a separate on-disk format. Post-Mark writes continue to append 
 
 No writer may commit against the old root after the new root becomes authoritative.
 
+The merge MAY replace the post-Mark records by their net effect per path (E1-24): for every path whose live version at the freeze differs from the Mark snapshot an `ADD` (or transaction) of the live version, and for every snapshot path no longer live a `DEL`. Intermediate versions written and superseded after the Mark are dead and need not be copied. A post-Mark group whose `group_id` is not below the value from which the destination `groups.alloc` allocated during the Sweep MUST NOT be copied with its ID, because the destination may already use that ID; its live members are regrouped (§13.7.1). Every copied ID stays below the destination's `reserved_through` (§7).
+
 ## 13.5 Freeze/Merge
 
 Freeze/Merge is the bounded finalization interval between the concurrent Sweep and root Switch. The implementation MUST prevent any writer from committing new state against the old root while it: (1) freezes or redirects the manifest commit stream, (2) drains and durably captures the post-Mark delta, (3) merges that delta into the destination manifest/index state, (4) verifies every resulting frame reference and required parity/object sibling, and (5) durably flushes the complete destination generation. Only after these steps may Switch begin.
@@ -2834,6 +2836,7 @@ E1 was applied in 2026-11, before any implementation existed. It fixes defects f
 | E1-21 | Creation order and incomplete STANDARD creation; `file_ver` cold-start check covers every record | §2.1.1, §2.1.3.1 | A crash inside creation under STANDARD was undefined; "live-state fold" omitted dead and aborted versions whose `file_ver` was already used |
 | E1-22 | Torn-tail rule protects the PARITY frames of committed groups | §10.4.2 | No `loc` names a PARITY frame, so a committed PARITY frame damaged at the end of a blob (§3.1.1 item 4) was truncated as a torn tail and the group silently lost its protection |
 | E1-23 | Verified checkpoint: frames below a clean-close checkpoint are walked by Prefix and tail without rehashing at writer open | §10.4.2 | The uninterrupted validating scan made every writer open read and hash the whole archive (hours at multi-terabyte scale); torn-write protection needs full validation only beyond the last durable, verified point |
+| E1-24 | Post-Mark delta merged by net effect per path; post-Mark groups keep their `group_id` only below the destination's allocation start | §13.4 | §7 asked a compactor to initialize the destination `groups.alloc` above every copied ID before allocating new ones, which a concurrent Sweep cannot do: groups written after the Mark are copied after the destination has allocated IDs for regrouping, and could collide |
 
 # 21. README / Public Specification Requirements
 

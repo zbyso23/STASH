@@ -231,3 +231,23 @@ func Reinit(fsys vfs.FS, name string, id Identity, maxObserved uint64, observed 
 	logf(fmt.Sprintf("alloc: re-initializing %s (kind %d) with reserved_through %d (max observed %d, present %v)", path.Clean(name), id.Kind, r, maxObserved, observed))
 	return write(fsys, name, id.state(r))
 }
+
+// RaiseTo makes every later value at least v: reserved_through is
+// durably raised to v when it is lower (skipping is always safe), and next
+// moves up to it. A compactor uses it so a destination namespace stays
+// above every identifier copied into it (§2.1.3.5, §7).
+func (a *Allocator) RaiseTo(v uint64) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if v > a.limit {
+		return fmt.Errorf("%s: %w", a.name, ErrExhausted)
+	}
+	if a.reserved < v {
+		if err := write(a.fsys, a.name, a.id.state(v)); err != nil {
+			return err
+		}
+		a.reserved = v
+	}
+	a.next = max(a.next, v)
+	return nil
+}

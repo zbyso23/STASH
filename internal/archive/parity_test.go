@@ -271,10 +271,12 @@ func TestParityLostBlob(t *testing.T) {
 					t.Fatalf("blob %d lost: %d objects unreadable", lost, failed)
 				}
 				r.Close()
-				// the writer refuses to open without the blob
-				if _, err := OpenWriter(fsys, Options{}); err == nil {
-					t.Fatal("writer opened without a blob")
+				// the writer opens without the blob, which counts as sealed
+				w, err := OpenWriter(fsys, Options{})
+				if err != nil || w.Health().Sealed[uint8(lost)] == nil {
+					t.Fatalf("writer without blob %d: %v", lost, err)
 				}
+				w.Close()
 			}
 		})
 	}

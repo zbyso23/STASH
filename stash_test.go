@@ -441,3 +441,110 @@ func BenchmarkOpenReader(b *testing.B) {
 		r.Close()
 	}
 }
+
+func TestPublicCompactVerifyRecover(t *testing.T) {
+	ctx := context.Background()
+	dir, a := newArchive(t, stash.CreateOptions{Blobs: 5, MaxFrameSize: 256 << 10, Parity: stash.Parity{Scheme: stash.ReedSolomon, K: 3, M: 2}})
+	want := map[string][]byte{}
+	for i := 0; i < 30; i++ {
+		p := fmt.Sprintf("f/%02d", i)
+		want[p] = rnd(int64(i), []int{10, 3000, 90000, 1 << 20}[i%4])
+		if _, err := a.Put(p, want[p]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 30; i += 3 {
+		p := fmt.Sprintf("f/%02d", i)
+		a.Delete(p)
+		delete(want, p)
+	}
+	r, err := stash.OpenReadOnly(dir) // pinned: survives the compaction
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := a.Compact(ctx, stash.CompactOptions{})
+	if err != nil || res.DestBytes >= res.SourceBytes || len(res.Removed) != 0 {
+		t.Fatalf("%v %+v", err, res)
+	}
+	for p, d := range want {
+		if got, err := r.Get(p); err != nil || !bytes.Equal(got, d) {
+			t.Fatalf("pinned reader %s: %v", p, err)
+		}
+	}
+	r.Close()
+	if removed, err := a.GC(); err != nil || len(removed) != 1 {
+		t.Fatalf("GC %v %v", removed, err)
+	}
+	rep, err := a.Verify(ctx)
+	if err != nil || !rep.OK() || rep.Versions != len(want) {
+		t.Fatalf("verify %v %+v", err, rep)
+	}
+	a.Close()
+
+	rc, err := stash.Recover(dir, stash.RecoverOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	sel := rc.DefaultSelection()
+	if len(sel) != len(want) {
+		t.Fatalf("selection %d of %d", len(sel), len(want))
+	}
+	out := filepath.Join(t.TempDir(), "salvaged")
+	if sr, err := stash.Salvage(ctx, rc, out, sel); err != nil || sr.Written != len(want) {
+		t.Fatalf("%v %+v", err, sr)
+	}
+	s, err := stash.OpenReadOnlyWith(out, stash.ReadOptions{NoPin: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for p, d := range want {
+		if got, err := s.Get(p); err != nil || !bytes.Equal(got, d) {
+			t.Fatalf("salvaged %s: %v", p, err)
+		}
+	}
+}
+
+// BenchmarkCompact64M: 64 MiB of objects, half deleted, RS 4+2.
+func BenchmarkCompact64M(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		dir := b.TempDir()
+		stash.Create(dir, stash.CreateOptions{Blobs: 6, Parity: stash.Parity{Scheme: stash.ReedSolomon, K: 4, M: 2}})
+		a, _ := stash.Open(dir, stash.Options{})
+		for j := 0; j < 64; j++ {
+			a.Put(fmt.Sprintf("o/%02d", j), rnd(int64(j), 1<<20))
+		}
+		for j := 0; j < 64; j += 2 {
+			a.Delete(fmt.Sprintf("o/%02d", j))
+		}
+		b.SetBytes(32 << 20)
+		b.StartTimer()
+		if _, err := a.Compact(context.Background(), stash.CompactOptions{}); err != nil {
+			b.Fatal(err)
+		}
+		b.StopTimer()
+		a.Close()
+	}
+}
+
+// BenchmarkRecover64M: raw recovery scan of 64 MiB without parity.
+func BenchmarkRecover64M(b *testing.B) {
+	dir := b.TempDir()
+	stash.Create(dir, stash.CreateOptions{})
+	a, _ := stash.Open(dir, stash.Options{})
+	for j := 0; j < 64; j++ {
+		a.Put(fmt.Sprintf("o/%02d", j), rnd(int64(j), 1<<20))
+	}
+	a.Close()
+	b.SetBytes(64 << 20)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rc, err := stash.Recover(dir, stash.RecoverOptions{})
+		if err != nil || len(rc.Versions) != 64 {
+			b.Fatal(err)
+		}
+		rc.Close()
+	}
+}

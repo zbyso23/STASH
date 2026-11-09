@@ -3,7 +3,9 @@
 //
 // Current scope: STANDARD security policy, unencrypted archives, STORE
 // codec, VARIABLE and FIXED frame modes, optional XOR or Reed-Solomon
-// parity with repair on read, small objects packed into shared frames. One writer per
+// parity with repair on read, small objects packed into shared frames,
+// compaction with repair and regrouping, full verification, and raw
+// recovery from blob files alone. One writer per
 // archive (an exclusive lock on writer.lock); any number of readers.
 //
 //	err := stash.Create(dir, stash.CreateOptions{})
@@ -22,10 +24,12 @@ import (
 	"errors"
 	"io"
 	"os"
+	"time"
 
 	"stash/internal/archive"
 	"stash/internal/canonpath"
 	"stash/internal/manifest"
+	"stash/internal/recovery"
 	"stash/internal/vfs"
 	"stash/internal/wire"
 )
@@ -271,6 +275,37 @@ func (a *Archive) Repairs() RepairStats { return a.w.Repairs() }
 // and Delete is already durable.
 func (a *Archive) Close() error { return a.w.Close() }
 
+// Compact copies the live versions into a new generation (SPEC §13): dead
+// data is dropped, frames damaged or lost are rebuilt from parity, parity
+// groups with dead members are regrouped and partly dead PACKED frames
+// repacked; sealed blobs become writable again. Writes continue during
+// the copy and wait only during the final merge and switch. Unless
+// KeepOld is set, generations nothing uses any more are removed
+// afterwards. A committed extent that cannot be found or rebuilt makes
+// Compact fail with ErrMissingData and leaves the archive unchanged.
+func (a *Archive) Compact(ctx context.Context, o CompactOptions) (CompactResult, error) {
+	return a.w.Compact(ctx, o)
+}
+
+// GC removes old generations (replaced by compaction or left by an
+// interrupted one) that no pinned reader and no open Object still uses.
+func (a *Archive) GC() ([]uint64, error) { return a.w.GC() }
+
+// Verify reads and checks the whole archive: every blob scanned frame by
+// frame, every live version read completely, every parity group checked
+// against recomputed parity. Writes wait while it runs.
+func (a *Archive) Verify(ctx context.Context) (*VerifyReport, error) { return a.w.Verify(ctx) }
+
+// CompactOptions configure Compact.
+type CompactOptions = archive.CompactOptions
+
+// CompactResult describes a compaction.
+type CompactResult = archive.CompactResult
+
+// VerifyReport is the result of Verify; OK() says whether nothing is
+// damaged, missing or degraded.
+type VerifyReport = archive.VerifyReport
+
 // Object is a lazily read object version.
 type Object = archive.Object
 
@@ -297,14 +332,38 @@ type Reader struct {
 	r *archive.Reader
 }
 
-// OpenReadOnly opens a snapshot of the archive in dir for reading.
-func OpenReadOnly(dir string) (*Reader, error) {
-	r, err := archive.OpenReader(vfs.OS{Root: dir}, nil)
+// ReadOptions configure OpenReadOnlyWith.
+type ReadOptions struct {
+	// NoPin skips the reader pin (for read-only media): a compaction may
+	// then remove the generation while the snapshot is open.
+	NoPin bool
+	// PinTTL is the pin lifetime between background renewals (default 10
+	// minutes); a crashed reader's pin expires after it.
+	PinTTL time.Duration
+}
+
+// OpenReadOnly opens a snapshot of the archive in dir for reading. It pins
+// the snapshot's generation (a file under pins/) so compaction keeps it
+// until Close (SPEC §13.1.1).
+func OpenReadOnly(dir string) (*Reader, error) { return OpenReadOnlyWith(dir, ReadOptions{}) }
+
+// OpenReadOnlyWith is OpenReadOnly with options.
+func OpenReadOnlyWith(dir string, o ReadOptions) (*Reader, error) {
+	var r *archive.Reader
+	var err error
+	if o.NoPin {
+		r, err = archive.OpenReader(vfs.OS{Root: dir}, nil)
+	} else {
+		r, err = archive.OpenReaderPinned(vfs.OS{Root: dir}, nil, o.PinTTL)
+	}
 	if err != nil {
 		return nil, err
 	}
 	return &Reader{r: r}, nil
 }
+
+// Verify checks the snapshot completely (see Archive.Verify).
+func (r *Reader) Verify(ctx context.Context) (*VerifyReport, error) { return r.r.Verify(ctx) }
 
 // Get returns the whole content of path in the snapshot.
 func (r *Reader) Get(path string) ([]byte, error) {
@@ -349,3 +408,48 @@ func (r *Reader) Repairs() RepairStats { return r.r.Repairs() }
 
 // Close releases the files.
 func (r *Reader) Close() error { return r.r.Close() }
+
+// RecoverOptions configure Recover.
+type RecoverOptions struct {
+	// Generation selects a generation by id; nil takes the one
+	// root.current names, or the newest one when the root is unusable.
+	Generation *uint64
+	// NoManifest ignores the manifest (labels then say nothing is known
+	// to be committed).
+	NoManifest bool
+	// ResyncBudget bounds the bytes hashed per blob while resynchronizing
+	// after damage (default four times the blob size).
+	ResyncBudget int64
+}
+
+// Recovery is a raw recovery scan (SPEC §11): object versions rebuilt from
+// the blob files alone, labeled with what a surviving manifest says.
+type Recovery = recovery.Recovery
+
+// RecoveredVersion is one version found by Recover.
+type RecoveredVersion = recovery.Version
+
+// SalvageResult describes Recovery.Salvage.
+type SalvageResult = recovery.SalvageResult
+
+// Recover scans the archive in dir without the writer lock and without
+// trusting its manifest or indexes: frames are validated one by one,
+// damaged regions are skipped by resynchronization, and lost frames are
+// rebuilt from parity. It writes nothing. The result lists every version
+// found, including deleted and superseded ones (raw recovery cannot know
+// the live state), with gaps, provenance and manifest labels. Extract
+// reads one version; Salvage writes a selection into a new archive.
+func Recover(dir string, o RecoverOptions) (*Recovery, error) {
+	return recovery.Scan(vfs.OS{Root: dir}, recovery.Options{Generation: o.Generation, NoManifest: o.NoManifest, Budget: o.ResyncBudget})
+}
+
+// Salvage creates a new archive in dir (empty or absent) with the
+// recovered archive's parameters and writes the given versions into it
+// (rc.DefaultSelection() picks the current versions, or the newest
+// complete version per path when the manifest is gone).
+func Salvage(ctx context.Context, rc *Recovery, dir string, versions []*RecoveredVersion) (SalvageResult, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return SalvageResult{}, err
+	}
+	return rc.Salvage(ctx, vfs.OS{Root: dir}, versions)
+}

@@ -2,7 +2,9 @@ package vfs
 
 import (
 	"bufio"
+	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path"
 )
@@ -89,3 +91,30 @@ type tooLarge struct{}
 func (tooLarge) Error() string { return "file larger than allowed" }
 
 var errTooLarge error = tooLarge{}
+
+// RemoveAll removes name and everything below it, then syncs the parent
+// directory. A crash part way leaves a partially removed tree.
+func RemoveAll(fsys FS, name string) error {
+	st, err := fsys.Stat(name)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if st.IsDir() {
+		ents, err := fsys.ReadDir(name)
+		if err != nil {
+			return err
+		}
+		for _, e := range ents {
+			if err := RemoveAll(fsys, path.Join(name, e.Name())); err != nil {
+				return err
+			}
+		}
+	}
+	if err := fsys.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return fsys.SyncDir(path.Dir(name))
+}
