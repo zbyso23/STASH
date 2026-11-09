@@ -17,13 +17,16 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"text/tabwriter"
+	"time"
 
 	"stash"
+	"stash/fusefs"
 )
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	code := run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
 	stop()
 	os.Exit(code)
@@ -69,6 +72,7 @@ func init() {
 		{name: "gc", args: "<archive>", help: "remove unused old generations", minArgs: 1, maxArgs: 1, run: cmdGC},
 		{name: "recover", args: "<archive>", help: "raw recovery scan from the blob files (read-only; exit 3 on damage)", minArgs: 1, maxArgs: 1, run: cmdRecover, flags: recoverFlags},
 		{name: "salvage", args: "<archive> <new-archive>", help: "recover the current versions into a new archive", minArgs: 2, maxArgs: 2, run: cmdSalvage, flags: recoverFlags},
+		{name: "mount", args: "<archive> <mountpoint>", help: "mount the archive read-only (FUSE) until interrupted or unmounted", minArgs: 2, maxArgs: 2, run: cmdMount, flags: mountFlags},
 		{name: "enroll", args: "<archive>", help: "make an archive HARDENED with -anchor (after full verification)", minArgs: 1, maxArgs: 1, run: cmdEnroll, flags: operatorFlags},
 		{name: "leave-hardened", args: "<archive>", help: "make a HARDENED archive STANDARD again", minArgs: 1, maxArgs: 1, run: cmdLeave, flags: operatorFlags},
 		{name: "authorize", args: "<archive>", help: "authorize a verified local state that leads the anchor", minArgs: 1, maxArgs: 1, run: cmdAuthorize, flags: operatorFlags},
@@ -989,5 +993,63 @@ func cmdAuthorize(e *env, _ *flag.FlagSet, args []string) error {
 		return err
 	}
 	fmt.Fprintln(e.stdout, "anchor advanced to the verified local state")
+	return nil
+}
+
+// ---- mount
+
+var (
+	mRefresh    time.Duration
+	mAllowOther bool
+	mDebug      bool
+)
+
+func mountFlags(fl *flag.FlagSet) {
+	fl.DurationVar(&mRefresh, "refresh", 0, "follow a writer: open a new snapshot at this interval (e.g. 30s); 0 mounts one fixed snapshot")
+	fl.BoolVar(&mAllowOther, "allow-other", false, "let other users access the mount")
+	fl.BoolVar(&mDebug, "debug", false, "log every FUSE request")
+}
+
+func cmdMount(e *env, _ *flag.FlagSet, args []string) error {
+	key, err := readKey()
+	if err != nil {
+		return err
+	}
+	a, err := openAnchor()
+	if err != nil {
+		return err
+	}
+	logf := func(s string) { fmt.Fprintln(e.stderr, s) }
+	srv, err := fusefs.Mount(args[0], args[1], fusefs.Options{Read: stash.ReadOptions{Key: key, Anchor: a},
+		Refresh: mRefresh, AllowOther: mAllowOther, Debug: mDebug, Log: logf})
+	if err != nil {
+		return err
+	}
+	mode := "fixed snapshot"
+	if mRefresh > 0 {
+		mode = "refreshed every " + mRefresh.String()
+	}
+	fmt.Fprintf(e.stderr, "mounted %s on %s (read-only, %s); Ctrl-C or umount ends it\n", args[0], args[1], mode)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-e.ctx.Done():
+			for {
+				if err := srv.Unmount(); err == nil {
+					return
+				} else {
+					logf("unmount: " + err.Error() + " (close open files; retrying)")
+				}
+				select {
+				case <-done:
+					return
+				case <-time.After(2 * time.Second):
+				}
+			}
+		case <-done:
+		}
+	}()
+	srv.Wait()
+	close(done)
 	return nil
 }

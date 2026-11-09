@@ -337,7 +337,29 @@ Tests (`cmd/stash/main_test.go`, through `run` on real directories): three confi
 
 No SPEC change in M16–M17.
 
+## Milestone 18 — read-only FUSE mount (done)
+
+`fusefs` (public package, `github.com/hanwen/go-fuse/v2` v2.7.2, pure Go) and `stash mount <archive> <mountpoint> [-refresh 30s] [-allow-other] [-debug]`.
+
+| Topic | Behavior |
+|---|---|
+| tree | a snapshot (`stash.Reader`, pinned, §13.1.1) lists the live objects; each object is a regular file (0444), each component of its path a directory (0555). An object whose path is also a directory prefix ("a" next to "a/b") is hidden behind the directory, reported by `Server.Shadowed` and logged; `stash get` still reads it |
+| reads | through `Object.ReadAt` (frames verified, repaired from parity, never zero-filled); damaged committed data without parity fails with EIO; open files and concurrent reads of one file are safe |
+| caching | a fixed snapshot uses one-hour entry and attribute timeouts and `FOPEN_KEEP_CACHE` (versions are immutable, §9.5) |
+| `Refresh` | a new snapshot at the interval (`Server.Refresh` on demand) so the mount follows a writer; timeouts drop to one second and the page cache is not kept. A file opened before keeps reading its version, even across a compaction that replaced the generation (its snapshot stays pinned until the last open file closes). A failed refresh keeps the previous snapshot |
+| inodes | stable per path across snapshots, never shared by two paths |
+| metadata | objects have no timestamps (§9): every entry shows the snapshot's open time; xattrs `user.stash.version` (file_ver) and `user.stash.extents`; statfs reports logical bytes and object count |
+| writes | refused: mounted `ro`, opens for writing fail with EROFS |
+| keys, HARDENED | `-key-file`/`$STASH_KEY` and `-anchor` as for the other commands; a HARDENED mount shows the anchored state |
+| end | Ctrl-C / SIGTERM unmounts (retried while files are open), as does an external `umount` |
+
+Tests (real mounts through `/dev/fuse`; skipped where FUSE is unavailable): the whole tree of a BASELINE and of an encrypted RS + zstd archive (Czech names, empty and 3 MiB files, a 301-entry directory, shadowing) read through the mount and compared; attributes, sorted readdir, ENOENT, refused write/create/remove, xattrs, statfs; 8 goroutines of random ReadAt on one open file; refresh after new versions and a compaction while an old file stays open; EIO on damage without parity with the intact last extent still readable; damage repaired from RS parity; `stash mount` serving until its context ends. `-race` clean.
+
+Throughput in this container: 256 MiB of random data compared through the mount in 0.43 s (cold, including reading the source file); cached re-reads about 4 GB/s.
+
+No SPEC change.
+
 ## Next milestones
 
-18. FUSE mount (read-only first).
 19. Emergency Pruning (§13.9).
+20. Optionally a writable FUSE mount (new versions on close), if wanted.

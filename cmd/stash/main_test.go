@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 type result struct {
@@ -236,5 +237,47 @@ func TestUsage(t *testing.T) {
 	}
 	if r := ok(t, "help"); !strings.Contains(r.stdout, "salvage") {
 		t.Fatal(r)
+	}
+}
+
+// stash mount serves the archive until its context ends.
+func TestMountCommand(t *testing.T) {
+	dir := t.TempDir()
+	arch, mnt := filepath.Join(dir, "arch"), filepath.Join(dir, "mnt")
+	os.MkdirAll(mnt, 0o755)
+	ok(t, "create", arch)
+	must(t, cli(t, "mounted content", "put", arch, "-", "-as", "d/f.txt"))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan result)
+	go func() {
+		var out, errb bytes.Buffer
+		code := run(ctx, []string{"mount", arch, mnt}, strings.NewReader(""), &out, &errb)
+		done <- result{code, out.String(), errb.String()}
+	}()
+	var got []byte
+	var err error
+	for i := 0; i < 100; i++ {
+		if got, err = os.ReadFile(filepath.Join(mnt, "d", "f.txt")); err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err != nil {
+		cancel()
+		r := <-done
+		if strings.Contains(r.stderr, "fuse") {
+			t.Skipf("FUSE not available: %s", r.stderr)
+		}
+		t.Fatalf("%v %+v", err, r)
+	}
+	if string(got) != "mounted content" {
+		t.Fatalf("%q", got)
+	}
+	cancel()
+	if r := <-done; r.code != 0 || !strings.Contains(r.stderr, "mounted") {
+		t.Fatalf("%+v", r)
+	}
+	if _, err := os.Stat(filepath.Join(mnt, "d")); err == nil {
+		t.Fatal("still mounted")
 	}
 }

@@ -22,7 +22,7 @@
 // never rewritten.
 //
 // The command stash (cmd/stash) exposes the same operations on the
-// command line.
+// command line; package stash/fusefs mounts an archive read-only.
 package stash
 
 import (
