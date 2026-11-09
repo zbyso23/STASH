@@ -215,7 +215,7 @@ func TestHardenedRollbackDetection(t *testing.T) {
 	a.Restore(saved)
 	expect("root ahead", fsys, a, ErrRollback)
 	var log []string
-	if err := AuthorizeAnchorTransition(ctx, fsys, a, "test", func(s string) { log = append(log, s) }); err != nil || len(log) != 1 {
+	if err := AuthorizeAnchorTransition(ctx, fsys, a, "test", func(s string) { log = append(log, s) }, nil); err != nil || len(log) != 1 {
 		t.Fatal(err)
 	}
 	w = hopen(t, fsys, a)

@@ -13,6 +13,7 @@ import (
 	"stash/internal/anchor"
 	"stash/internal/blob"
 	"stash/internal/manifest"
+	"stash/internal/seal"
 	"stash/internal/vfs"
 	"stash/internal/wire"
 )
@@ -29,6 +30,11 @@ type Config struct {
 	// Anchor creates a HARDENED archive (§2.1.2.1): generation 0 durable,
 	// the policy marker, the anchor's initial state, then root.current.
 	Anchor anchor.Anchor
+	// Codec is the archive default codec_id (§5); writers use it for every
+	// frame it makes smaller and STORE otherwise.
+	Codec wire.CodecID
+	// Key, a 32-byte archive DEK, creates an encrypted archive (§15).
+	Key []byte
 }
 
 // Create creates a new STANDARD archive in an empty directory (§2.1,
@@ -47,7 +53,7 @@ func Create(fsys vfs.FS, cfg Config) (*wire.ArchiveHeader, error) {
 			}
 		}
 	}
-	h := &wire.ArchiveHeader{Mode: cfg.Mode, HashID: cfg.HashID, CodecID: wire.CodecStore,
+	h := &wire.ArchiveHeader{Mode: cfg.Mode, HashID: cfg.HashID, CodecID: cfg.Codec,
 		ParityScheme: cfg.ParityScheme, ParityK: cfg.ParityK, ParityM: cfg.ParityM, BlobCount: cfg.BlobCount, MaxFrameQuanta: cfg.MaxFrameQuanta}
 	if h.MaxFrameQuanta < 2 {
 		return nil, fmt.Errorf("%w: a writer must not create max_frame_quanta < 2 (§3.1)", wire.ErrInvalid)
@@ -55,13 +61,21 @@ func Create(fsys vfs.FS, cfg Config) (*wire.ArchiveHeader, error) {
 	if _, err := rand.Read(h.ArchiveID[:]); err != nil {
 		return nil, err
 	}
+	var keys *seal.Keys
+	if cfg.Key != nil {
+		h.Flags |= wire.HeaderFlagEncrypted
+		var err error
+		if keys, err = seal.New(cfg.Key, h.ArchiveID); err != nil {
+			return nil, err
+		}
+	}
 	if err := h.Validate(); err != nil {
 		return nil, err
 	}
 	if err := fsys.MkdirAll("alloc", 0o755); err != nil {
 		return nil, err
 	}
-	gid := alloc.Identity{Kind: wire.AllocGeneration, ArchiveID: h.ArchiveID}
+	gid := alloc.Identity{Kind: wire.AllocGeneration, ArchiveID: h.ArchiveID, Encrypted: h.Encrypted()}
 	if err := alloc.Create(fsys, alloc.FileName(wire.AllocGeneration, 0), gid); err != nil {
 		return nil, err
 	}
@@ -81,6 +95,11 @@ func Create(fsys vfs.FS, cfg Config) (*wire.ArchiveHeader, error) {
 	if err := createGeneration(fsys, h); err != nil {
 		return nil, err
 	}
+	if keys != nil {
+		if err := writeKeyCheck(fsys, keys); err != nil {
+			return nil, err
+		}
+	}
 	if err := fsys.SyncDir("."); err != nil {
 		return nil, err
 	}
@@ -92,6 +111,12 @@ func Create(fsys vfs.FS, cfg Config) (*wire.ArchiveHeader, error) {
 		}
 		empty := sha256.Sum256(nil)
 		st := anchor.State{ArchiveID: h.ArchiveID, GenerationID: h.GenerationID, RootDigest: anchor.RootDigest(rb), ManifestDigest: empty}
+		if h.Encrypted() {
+			// §2.1.3.5: the initial reservations are bound from the start
+			if st.Reservations, err = currentReservations(fsys, h); err != nil {
+				return nil, err
+			}
+		}
 		if err := cfg.Anchor.Create(context.Background(), st); err != nil {
 			return nil, err
 		}

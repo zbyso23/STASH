@@ -1,15 +1,17 @@
 // Package stash is the public API of the STASH 2.0 R10 reference
 // implementation (wire 0x0006, SPEC.md).
 //
-// Current scope: STANDARD security policy, unencrypted archives, STORE
-// codec, VARIABLE and FIXED frame modes, optional XOR or Reed-Solomon
-// parity with repair on read, small objects packed into shared frames,
-// compaction with repair and regrouping, full verification, and raw
-// recovery from blob files alone. HARDENED policy binds freshness to an
-// external Generation Anchor (anti-rollback). One writer per
-// archive (an exclusive lock on writer.lock); any number of readers.
+// Scope: the BASELINE, SECURE and FAST profiles (SPEC §5.2): SHA-256 or
+// BLAKE3 hashes, STORE or Zstandard compression, optional AES-256-GCM
+// encryption with a caller-held archive key; VARIABLE and FIXED frame
+// modes, optional XOR or Reed-Solomon parity with repair on read, small
+// objects packed into shared frames, compaction with repair and
+// regrouping, full verification, and raw recovery from blob files alone
+// (keyless or with the key). STANDARD or HARDENED policy; HARDENED binds
+// freshness to an external Generation Anchor (anti-rollback). One writer
+// per archive (an exclusive lock on writer.lock); any number of readers.
 //
-//	err := stash.Create(dir, stash.CreateOptions{})
+//	err := stash.Create(dir, stash.CreateOptions{Profile: stash.Fast})
 //	a, err := stash.Open(dir, stash.Options{})
 //	defer a.Close()
 //	ver, err := a.Put("photos/2026/a.jpg", data)
@@ -32,6 +34,7 @@ import (
 	"stash/internal/canonpath"
 	"stash/internal/manifest"
 	"stash/internal/recovery"
+	"stash/internal/seal"
 	"stash/internal/vfs"
 	"stash/internal/wire"
 )
@@ -66,6 +69,53 @@ var (
 	// ErrAnchorUnavailable: the anchor cannot be reached; HARDENED does
 	// not downgrade, the operation fails.
 	ErrAnchorUnavailable = archive.ErrAnchorUnavailable
+	// ErrKeyRequired: an encrypted archive opened without its key.
+	ErrKeyRequired = archive.ErrKeyRequired
+	// ErrWrongKey: the key does not match the archive (key.check).
+	ErrWrongKey = archive.ErrWrongKey
+	// ErrAllocatorRollback: an encrypted HARDENED archive's allocator
+	// files are below the anchored reservations (a security incident;
+	// Options.AcknowledgeAllocatorRollback continues after review).
+	ErrAllocatorRollback = archive.ErrAllocatorRollback
+)
+
+// KeySize is the size of an archive key (the archive DEK, SPEC §15.1).
+const KeySize = seal.KeySize
+
+// NewKey returns a new random archive key. Keep it (wrapped by your KMS
+// or key-encryption key) outside the archive: the archive never stores
+// it, and without it the encrypted content is lost.
+func NewKey() ([]byte, error) { return seal.NewKey() }
+
+// Profile is a named combination of hash, compression and encryption
+// (SPEC §5.2).
+type Profile int
+
+const (
+	// Custom uses CreateOptions.Hash, Compression and Key as given
+	// (default; with zero values this is BASELINE).
+	Custom Profile = iota
+	// Baseline: SHA-256, STORE, no encryption.
+	Baseline
+	// Secure: SHA-256, STORE, AES-256-GCM; CreateOptions.Key is required.
+	Secure
+	// Fast: BLAKE3, ZSTD_FAST (STORE where compression does not help), no
+	// encryption.
+	Fast
+)
+
+// Compression selects the archive codec (SPEC §5).
+type Compression int
+
+const (
+	// Store keeps data uncompressed (default).
+	Store Compression = iota
+	// ZstdFast is Zstandard level 1.
+	ZstdFast
+	// ZstdDefault is Zstandard level 3.
+	ZstdDefault
+	// ZstdDense is Zstandard level 9 (the encoder's closest setting).
+	ZstdDense
 )
 
 // FrameMode selects the physical frame geometry (SPEC §3).
@@ -127,10 +177,39 @@ type CreateOptions struct {
 	// bound to this external Generation Anchor, which must live where the
 	// archive's storage cannot roll it back.
 	Anchor Anchor
+	// Profile sets Hash, Compression and encryption together; with a
+	// profile other than Custom, Hash and Compression must be zero.
+	Profile Profile
+	// Compression is the codec for every frame it makes smaller.
+	Compression Compression
+	// Key (KeySize bytes, see NewKey) encrypts the archive with
+	// AES-256-GCM (SPEC §15). The same key is needed to open it.
+	Key []byte
 }
 
 // Create creates a new archive in dir, which must be empty or absent.
 func Create(dir string, o CreateOptions) error {
+	switch o.Profile {
+	case Custom:
+	case Baseline, Secure, Fast:
+		if o.Hash != SHA256 || o.Compression != Store {
+			return errors.Join(ErrInvalid, errors.New("stash: a profile fixes Hash and Compression"))
+		}
+		if (o.Profile == Secure) != (o.Key != nil) {
+			return errors.Join(ErrInvalid, errors.New("stash: the Secure profile needs a Key, Baseline and Fast take none"))
+		}
+		if o.Profile == Fast {
+			o.Hash, o.Compression = BLAKE3, ZstdFast
+		}
+	default:
+		return errors.Join(ErrInvalid, errors.New("stash: unknown profile"))
+	}
+	if o.Compression < Store || o.Compression > ZstdDense {
+		return errors.Join(ErrInvalid, errors.New("stash: unknown compression"))
+	}
+	if o.Key != nil && len(o.Key) != KeySize {
+		return errors.Join(ErrInvalid, errors.New("stash: Key must be 32 bytes"))
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
@@ -175,6 +254,8 @@ func Create(dir string, o CreateOptions) error {
 		return errors.Join(ErrInvalid, errors.New("stash: unknown parity scheme"))
 	}
 	cfg.Anchor = o.Anchor
+	cfg.Codec = wire.CodecID(o.Compression)
+	cfg.Key = o.Key
 	_, err := archive.Create(vfs.OS{Root: dir}, cfg)
 	return err
 }
@@ -198,6 +279,11 @@ type Options struct {
 	// advance (a crash in between) instead of discarding them. It is an
 	// operator decision: their content is not authenticated.
 	AdoptUnanchored bool
+	// Key opens an encrypted archive.
+	Key []byte
+	// AcknowledgeAllocatorRollback continues an encrypted HARDENED archive
+	// after ErrAllocatorRollback was reviewed, from the anchored values.
+	AcknowledgeAllocatorRollback bool
 }
 
 // Archive is an archive opened for writing. Its methods are safe for
@@ -210,7 +296,7 @@ type Archive struct {
 // running crash recovery (torn tails, open transactions, indexes).
 func Open(dir string, o Options) (*Archive, error) {
 	w, err := archive.OpenWriter(vfs.OS{Root: dir}, archive.Options{MaxExtent: o.MaxExtent, PackThreshold: o.PackThreshold, VerifyAll: o.VerifyAll,
-		Anchor: o.Anchor, AdoptUnanchored: o.AdoptUnanchored})
+		Anchor: o.Anchor, AdoptUnanchored: o.AdoptUnanchored, Key: o.Key, AcknowledgeAllocatorRollback: o.AcknowledgeAllocatorRollback})
 	if err != nil {
 		return nil, err
 	}
@@ -368,6 +454,8 @@ type ReadOptions struct {
 	// Anchor is required for a HARDENED archive: the snapshot is the
 	// anchored state, never bytes written after the last anchor advance.
 	Anchor Anchor
+	// Key opens an encrypted archive.
+	Key []byte
 }
 
 // OpenReadOnly opens a snapshot of the archive in dir for reading. It pins
@@ -377,7 +465,7 @@ func OpenReadOnly(dir string) (*Reader, error) { return OpenReadOnlyWith(dir, Re
 
 // OpenReadOnlyWith is OpenReadOnly with options.
 func OpenReadOnlyWith(dir string, o ReadOptions) (*Reader, error) {
-	r, err := archive.OpenReaderWith(vfs.OS{Root: dir}, archive.ReaderOptions{Pin: !o.NoPin, PinTTL: o.PinTTL, Anchor: o.Anchor})
+	r, err := archive.OpenReaderWith(vfs.OS{Root: dir}, archive.ReaderOptions{Pin: !o.NoPin, PinTTL: o.PinTTL, Anchor: o.Anchor, Key: o.Key})
 	if err != nil {
 		return nil, err
 	}
@@ -442,6 +530,10 @@ type RecoverOptions struct {
 	// ResyncBudget bounds the bytes hashed per blob while resynchronizing
 	// after damage (default four times the blob size).
 	ResyncBudget int64
+	// Key recovers an encrypted archive's content. Without it the scan is
+	// keyless: frames, parity and opaque object_id groups are checked and
+	// reported, nothing can be extracted (SPEC §15.10).
+	Key []byte
 }
 
 // Recovery is a raw recovery scan (SPEC §11): object versions rebuilt from
@@ -462,7 +554,7 @@ type SalvageResult = recovery.SalvageResult
 // the live state), with gaps, provenance and manifest labels. Extract
 // reads one version; Salvage writes a selection into a new archive.
 func Recover(dir string, o RecoverOptions) (*Recovery, error) {
-	return recovery.Scan(vfs.OS{Root: dir}, recovery.Options{Generation: o.Generation, NoManifest: o.NoManifest, Budget: o.ResyncBudget})
+	return recovery.Scan(vfs.OS{Root: dir}, recovery.Options{Generation: o.Generation, NoManifest: o.NoManifest, Budget: o.ResyncBudget, Key: o.Key})
 }
 
 // Salvage creates a new archive in dir (empty or absent) with the
@@ -505,7 +597,13 @@ func NewMemoryAnchor() *anchor.Memory { return anchor.NewMemory() }
 // log are required; keep the logged record outside the archive. No
 // archive wire byte changes.
 func Enroll(ctx context.Context, dir string, a Anchor, operator string, log func(string)) (AnchorState, error) {
-	return archive.Enroll(ctx, vfs.OS{Root: dir}, a, archive.EnrollOptions{Operator: operator, Log: log})
+	return EnrollWithKey(ctx, dir, a, nil, operator, log)
+}
+
+// EnrollWithKey is Enroll for an encrypted archive; the anchor also binds
+// its allocator reservations (SPEC §2.1.3.5).
+func EnrollWithKey(ctx context.Context, dir string, a Anchor, key []byte, operator string, log func(string)) (AnchorState, error) {
+	return archive.Enroll(ctx, vfs.OS{Root: dir}, a, archive.EnrollOptions{Operator: operator, Log: log, Key: key})
 }
 
 // LeaveHardened returns an archive to STANDARD (an explicit operator
@@ -519,5 +617,11 @@ func LeaveHardened(dir, operator string, log func(string)) error {
 // §13.6.1): that generation is verified completely and the anchor is
 // advanced to it.
 func AuthorizeAnchorTransition(ctx context.Context, dir string, a Anchor, operator string, log func(string)) error {
-	return archive.AuthorizeAnchorTransition(ctx, vfs.OS{Root: dir}, a, operator, log)
+	return AuthorizeAnchorTransitionWithKey(ctx, dir, a, nil, operator, log)
+}
+
+// AuthorizeAnchorTransitionWithKey is AuthorizeAnchorTransition for an
+// encrypted archive.
+func AuthorizeAnchorTransitionWithKey(ctx context.Context, dir string, a Anchor, key []byte, operator string, log func(string)) error {
+	return archive.AuthorizeAnchorTransition(ctx, vfs.OS{Root: dir}, a, operator, log, key)
 }

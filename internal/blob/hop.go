@@ -1,6 +1,7 @@
 package blob
 
 import (
+	"stash/internal/seal"
 	"stash/internal/vfs"
 	"stash/internal/wire"
 )
@@ -12,9 +13,23 @@ type HopFrame struct {
 	Offset  int64
 	Quanta  uint32
 	Trailer wire.MasterTrailer
-	// Entries are the plaintext Pre-Trailer entries (nil for PARITY, and
-	// for encrypted or undecodable Pre-Trailers).
+	// Entries are the Pre-Trailer entries (nil for PARITY, for
+	// undecodable Pre-Trailers, and for encrypted ones read without keys
+	// or failing authentication).
 	Entries []wire.Entry
+	// Nonce is the stored Pre-Trailer nonce of an encrypted DATA/PACKED
+	// frame (nil otherwise); it equals the payload nonce of a frame built
+	// by §15.6.
+	Nonce []byte
+}
+
+// storedNonce returns the stored nonce of an encrypted DATA/PACKED
+// Pre-Trailer body, or nil.
+func storedNonce(h *wire.ArchiveHeader, t *wire.MasterTrailer, body []byte) []byte {
+	if !h.Encrypted() || t.BlockType == wire.BlockParity || len(body) < wire.AEADNonceSize {
+		return nil
+	}
+	return append([]byte(nil), body[:wire.AEADNonceSize]...)
 }
 
 // Hop walks the blob frame by frame reading only Prefixes and tails
@@ -40,7 +55,7 @@ func (r *Reader) HopFrom(from int64, fn func(HopFrame) error) (contiguous int64,
 	var buf []byte
 	off := from
 	for off+wire.BaseQuantum <= size {
-		hf, ok, err := tailAt(r.f, r.h, off, size, &buf)
+		hf, ok, err := tailAt(r.f, r.h, r.k, off, size, &buf)
 		if err != nil {
 			return from, err
 		}
@@ -65,7 +80,7 @@ func (r *Reader) HopFrom(from int64, fn func(HopFrame) error) (contiguous int64,
 // tailAt checks the Prefix and the tail of a frame at off without reading
 // its payload. ok is false when they do not validate; err reports I/O
 // errors only. buf is a reusable scratch buffer.
-func tailAt(f vfs.File, h *wire.ArchiveHeader, off, size int64, buf *[]byte) (HopFrame, bool, error) {
+func tailAt(f vfs.File, h *wire.ArchiveHeader, k *seal.Keys, off, size int64, buf *[]byte) (HopFrame, bool, error) {
 	var pre [wire.FramePrefixSize]byte
 	if _, err := f.ReadAt(pre[:], off); err != nil {
 		return HopFrame{}, false, err
@@ -97,10 +112,20 @@ func tailAt(f vfs.File, h *wire.ArchiveHeader, off, size int64, buf *[]byte) (Ho
 	if err != nil || wire.ValidateTrailer(&t.Trailer, h, p) != nil {
 		return HopFrame{}, false, nil
 	}
-	hf := HopFrame{Offset: off, Quanta: p.FrameQuanta, Trailer: t.Trailer}
-	if t.Trailer.BlockType != wire.BlockParity && !h.Encrypted() {
+	hf := HopFrame{Offset: off, Quanta: p.FrameQuanta, Trailer: t.Trailer, Nonce: storedNonce(h, &t.Trailer, t.Body)}
+	switch {
+	case t.Trailer.BlockType == wire.BlockParity:
+	case !h.Encrypted():
 		if es, err := wire.DecodeEntries(t.Body[:len(t.Body)-4]); err == nil {
 			hf.Entries = es
+		}
+	case k != nil && len(t.Body) >= wire.AEADOverhead+4:
+		var aadBuf [seal.FrameAADSize]byte
+		aad := seal.FrameAAD(aadBuf[:0], h, p.FrameQuanta, tail[len(tail)-wire.MasterTrailerSize:][:64])
+		if plain, err := k.Open(seal.PreTrailerDomain, nil, t.Body[:len(t.Body)-4], aad); err == nil {
+			if es, err := wire.DecodeEntries(plain); err == nil {
+				hf.Entries = es
+			}
 		}
 	}
 	return hf, true, nil

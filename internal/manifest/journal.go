@@ -111,6 +111,10 @@ type LoadOptions struct {
 	Limits Limits
 	// TrackRefs records loc references for State.BlobCommitted (writers).
 	TrackRefs bool
+	// Crypto is required for an encrypted archive: every record is an
+	// envelope authenticated with the manifest key and the prev chain
+	// (§15.8).
+	Crypto *Crypto
 
 	// Writer options (OpenJournal only).
 
@@ -134,18 +138,25 @@ type LoadInfo struct {
 	TornReason string
 	// Linked counts linked manifests merged.
 	Linked int
+	// Prev is the chain value for the next line appended to
+	// manifest.jsonl (encrypted archives, §15.8.2): the hash of the last
+	// kept line, or the file's chain start.
+	Prev [32]byte
 }
 
 type cursor struct {
-	file   int
-	name   string
-	f      vfs.File
-	lr     *lineReader
-	rec    *Record
-	last   uint64 // last seq of this file
-	main   bool
-	torn   *LoadInfo
-	minSeq uint64 // records must be greater (LINK seq for linked files)
+	file     int
+	name     string
+	f        vfs.File
+	lr       *lineReader
+	rec      *Record
+	last     uint64 // last seq of this file
+	main     bool
+	torn     *LoadInfo
+	minSeq   uint64 // records must be greater (LINK seq for linked files)
+	crypto   *Crypto
+	prev     [32]byte // chain value of the last line read (encrypted)
+	accepted [32]byte // chain value of the last record accepted
 
 	// read-ahead: lines decoded in parallel, consumed in order
 	ahead []lineItem
@@ -162,6 +173,7 @@ type lineItem struct {
 	nul       bool
 	rec       *Record
 	decodeErr error
+	prev      [32]byte // chain value this line must carry (encrypted)
 }
 
 // fill reads the next lines (stopping after the first non-line event or a
@@ -197,11 +209,27 @@ func (c *cursor) fill(encrypted bool) {
 			off += n
 		}
 	}
+	if c.crypto != nil {
+		// the chain value of line i is the hash of line i-1, known before
+		// decoding, so decoding stays parallel (§15.8.2)
+		for i := range c.ahead {
+			it := &c.ahead[i]
+			if it.err != nil || it.nul {
+				break
+			}
+			it.prev = c.prev
+			c.prev = LineHash(it.line)
+		}
+	}
 	decode := func(lo, hi int) {
 		for i := lo; i < hi; i++ {
 			it := &c.ahead[i]
 			if it.err == nil && !it.nul {
-				it.rec, it.decodeErr = DecodeLine(it.line, encrypted)
+				if c.crypto != nil {
+					it.rec, it.decodeErr = DecodeEnvelope(it.line, c.crypto, it.prev)
+				} else {
+					it.rec, it.decodeErr = DecodeLine(it.line, encrypted)
+				}
 			}
 		}
 	}
@@ -268,6 +296,9 @@ func (c *cursor) advance(encrypted bool) error {
 		return c.corrupt(at, "seq %d not increasing in file", r.Seq)
 	}
 	c.last = r.Seq
+	if c.crypto != nil {
+		c.accepted = LineHash(it.line)
+	}
 	c.rec = r
 	return nil
 }
@@ -302,6 +333,16 @@ func LoadWith(fsys vfs.FS, genDir string, h *wire.ArchiveHeader, opt LoadOptions
 		st.TrackRefs()
 	}
 	enc := h.Encrypted()
+	if enc && (opt.Crypto == nil || opt.Crypto.Keys == nil) {
+		return nil, info, &wire.Error{Struct: "Manifest", Class: wire.ErrInvalid, Detail: "encrypted manifest needs the archive keys"}
+	}
+	if enc && (opt.Crypto.Keys.ArchiveID != h.ArchiveID || opt.Crypto.GenerationID != h.GenerationID) {
+		return nil, info, &wire.Error{Struct: "Manifest", Class: wire.ErrInvalid, Detail: "manifest keys belong to another archive or generation"}
+	}
+	var crypto *Crypto
+	if enc {
+		crypto = opt.Crypto
+	}
 	mf, err := fsys.OpenFile(path.Join(genDir, ManifestName), os.O_RDONLY, 0)
 	if err != nil {
 		return nil, info, err
@@ -318,7 +359,11 @@ func LoadWith(fsys vfs.FS, genDir string, h *wire.ArchiveHeader, opt LoadOptions
 		}
 		limit = opt.Limit
 	}
-	main := &cursor{file: 0, name: ManifestName, f: mf, lr: newLineReader(mf, limit), main: true, torn: &info}
+	main := &cursor{file: 0, name: ManifestName, f: mf, lr: newLineReader(mf, limit), main: true, torn: &info, crypto: crypto}
+	if crypto != nil {
+		main.prev = ChainStart(h.ArchiveID, ManifestName)
+		main.accepted = main.prev
+	}
 	if err := main.advance(enc); err != nil {
 		return nil, info, err
 	}
@@ -350,7 +395,7 @@ func LoadWith(fsys vfs.FS, genDir string, h *wire.ArchiveHeader, opt LoadOptions
 				return nil, info, &wire.Error{Struct: "Manifest", Class: wire.ErrResource, Detail: "more than MAX_LINKED_MANIFESTS"}
 			}
 			linked[r.Path] = true
-			lc, err := openLinked(fsys, genDir, h, r, len(linked))
+			lc, err := openLinked(fsys, genDir, h, r, len(linked), crypto)
 			if err != nil {
 				return nil, info, err
 			}
@@ -372,6 +417,7 @@ func LoadWith(fsys vfs.FS, genDir string, h *wire.ArchiveHeader, opt LoadOptions
 			heap.Fix(hp, 0)
 		}
 	}
+	info.Prev = main.accepted
 	return st, info, nil
 }
 
@@ -384,7 +430,7 @@ func newHash(id wire.HashID) hash.Hash {
 
 // openLinked verifies a linked manifest's digest and line count over its
 // exact bytes (§10.6), then returns a cursor over its records.
-func openLinked(fsys vfs.FS, genDir string, h *wire.ArchiveHeader, link *Record, n int) (*cursor, error) {
+func openLinked(fsys vfs.FS, genDir string, h *wire.ArchiveHeader, link *Record, n int, crypto *Crypto) (*cursor, error) {
 	name := path.Join(genDir, link.Path)
 	f, err := fsys.OpenFile(name, os.O_RDONLY, 0)
 	if err != nil {
@@ -418,5 +464,9 @@ func openLinked(fsys vfs.FS, genDir string, h *wire.ArchiveHeader, link *Record,
 	if lines != link.Lines {
 		return nil, bad("%d lines, LINK_MANIFEST says %d", lines, link.Lines)
 	}
-	return &cursor{file: n, name: link.Path, f: f, lr: newLineReader(f, size), minSeq: link.Seq}, nil
+	c := &cursor{file: n, name: link.Path, f: f, lr: newLineReader(f, size), minSeq: link.Seq, crypto: crypto}
+	if crypto != nil {
+		c.prev = ChainStart(h.ArchiveID, link.Path)
+	}
+	return c, nil
 }

@@ -21,6 +21,7 @@ import (
 	"stash/internal/canonpath"
 	"stash/internal/index"
 	"stash/internal/manifest"
+	"stash/internal/seal"
 	"stash/internal/vfs"
 	"stash/internal/wire"
 )
@@ -46,6 +47,7 @@ type view struct {
 	fsys  vfs.FS
 	gen   string
 	h     *wire.ArchiveHeader
+	k     *seal.Keys // encrypted archive
 	pool  *bufpool.Pool
 	blobs []*blobView // nil entry: blob unavailable
 	// unavailable records why a blob could not be opened (readers of a
@@ -86,7 +88,7 @@ func (v *view) openBlobs(writeIndexes, tolerate bool) (statuses []index.Status, 
 		go func() {
 			defer wg.Done()
 			name, _ := blob.Name(uint8(b))
-			r, err := blob.Open(v.fsys, path.Join(v.gen, name), v.h, v.pool)
+			r, err := blob.OpenKeyed(v.fsys, path.Join(v.gen, name), v.h, v.pool, v.k)
 			if err != nil {
 				if tolerate && !errors.Is(err, wire.ErrUnsupported) {
 					mu.Lock()
@@ -142,7 +144,7 @@ func (v *view) fetch(p string, ver *manifest.Version, l manifest.Loc) (*blob.Ref
 		return nil, fmt.Errorf("%w: blob %02X out of range", ErrMissingData, l.Blob)
 	}
 	accept := func(ref *blob.Ref) bool {
-		if ref.Trailer.HashPayload != l.Hash || ref.Trailer.CodecID != wire.CodecStore {
+		if ref.Trailer.HashPayload != l.Hash {
 			return false
 		}
 		_, ok := packedEntry(ref, p, ver.FileVer, l)
@@ -159,6 +161,10 @@ func (v *view) fetch(p string, ver *manifest.Version, l manifest.Loc) (*blob.Ref
 			return nil, err
 		}
 		if how != index.NotFound {
+			if err := ref.Decode(); err != nil {
+				ref.Release()
+				return nil, fmt.Errorf("%w: %s v%d extent at %d: %v", ErrMissingData, p, ver.FileVer, l.Offset, err)
+			}
 			slicePacked(ref, p, ver.FileVer, l)
 			return ref, nil
 		}
@@ -173,6 +179,10 @@ func (v *view) fetch(p string, ver *manifest.Version, l manifest.Loc) (*blob.Ref
 	}
 	if ref == nil {
 		return nil, fmt.Errorf("%w: %s v%d extent at %d (blob %02X)", ErrMissingData, p, ver.FileVer, l.Offset, l.Blob)
+	}
+	if err := ref.Decode(); err != nil {
+		ref.Release()
+		return nil, fmt.Errorf("%w: %s v%d extent at %d: %v", ErrMissingData, p, ver.FileVer, l.Offset, err)
 	}
 	slicePacked(ref, p, ver.FileVer, l)
 	return ref, nil
@@ -419,7 +429,7 @@ func OpenReader(fsys vfs.FS, pool *bufpool.Pool) (*Reader, error) {
 	if err != nil {
 		return nil, err
 	}
-	return openReaderAt(fsys, pool, root, 0, false)
+	return openReaderAt(fsys, pool, root, 0, false, nil)
 }
 
 // ReaderOptions configure OpenReaderWith.
@@ -432,6 +442,8 @@ type ReaderOptions struct {
 	// the anchored generation and manifest prefix; unanchored bytes are
 	// never applied.
 	Anchor anchor.Anchor
+	// Key is the DEK of an encrypted archive.
+	Key []byte
 }
 
 // OpenReaderWith opens a read-only snapshot with options.
@@ -441,12 +453,16 @@ func OpenReaderWith(fsys vfs.FS, o ReaderOptions) (*Reader, error) {
 	}
 	if o.Anchor == nil {
 		if o.Pin {
-			return OpenReaderPinned(fsys, o.Pool, o.PinTTL)
+			return openReaderPinned(fsys, o.Pool, o.PinTTL, o.Key)
 		}
-		return OpenReader(fsys, o.Pool)
+		root, err := readRoot(fsys)
+		if err != nil {
+			return nil, err
+		}
+		return openReaderAt(fsys, o.Pool, root, 0, false, o.Key)
 	}
 	ctx := context.Background()
-	root, st, err := resolveHardened(ctx, fsys, o.Anchor, o.Pool, false)
+	root, st, err := resolveHardened(ctx, fsys, o.Anchor, o.Pool, false, o.Key)
 	if err != nil {
 		return nil, err
 	}
@@ -464,7 +480,7 @@ func OpenReaderWith(fsys vfs.FS, o ReaderOptions) (*Reader, error) {
 			return nil, err
 		}
 	}
-	r, err := openReaderAt(fsys, o.Pool, root, int64(st.ManifestLength), true)
+	r, err := openReaderAt(fsys, o.Pool, root, int64(st.ManifestLength), true, o.Key)
 	if err != nil {
 		pin.Release()
 		return nil, err
@@ -477,6 +493,10 @@ func OpenReaderWith(fsys vfs.FS, o ReaderOptions) (*Reader, error) {
 // first (§13.1.1), so GC keeps it until Close. ttl <= 0 selects
 // DefaultPinTTL; the pin is renewed in the background.
 func OpenReaderPinned(fsys vfs.FS, pool *bufpool.Pool, ttl time.Duration) (*Reader, error) {
+	return openReaderPinned(fsys, pool, ttl, nil)
+}
+
+func openReaderPinned(fsys vfs.FS, pool *bufpool.Pool, ttl time.Duration, dek []byte) (*Reader, error) {
 	for try := 0; ; try++ {
 		root, err := readRoot(fsys)
 		if err != nil {
@@ -499,7 +519,7 @@ func OpenReaderPinned(fsys vfs.FS, pool *bufpool.Pool, ttl time.Duration) (*Read
 			}
 			return nil, fmt.Errorf("generation keeps changing while pinning")
 		}
-		r, err := openReaderAt(fsys, pool, root, 0, false)
+		r, err := openReaderAt(fsys, pool, root, 0, false, dek)
 		if err != nil {
 			pin.Release()
 			return nil, err
@@ -511,7 +531,7 @@ func OpenReaderPinned(fsys vfs.FS, pool *bufpool.Pool, ttl time.Duration) (*Read
 
 // openReaderAt opens generation root.GenerationID; with limited, only
 // manifest.jsonl[0:limit] is applied (a HARDENED reader snapshot, §10.4.1).
-func openReaderAt(fsys vfs.FS, pool *bufpool.Pool, root wire.Root, limit int64, limited bool) (*Reader, error) {
+func openReaderAt(fsys vfs.FS, pool *bufpool.Pool, root wire.Root, limit int64, limited bool, dek []byte) (*Reader, error) {
 	if pool == nil {
 		pool = bufpool.Default
 	}
@@ -520,16 +540,20 @@ func openReaderAt(fsys vfs.FS, pool *bufpool.Pool, root wire.Root, limit int64, 
 	if err != nil {
 		return nil, err
 	}
+	k, err := archiveKeys(fsys, h, dek)
+	if err != nil {
+		return nil, err
+	}
 	var st *manifest.State
 	if limited && limit == 0 {
 		st = manifest.NewState(h, manifest.DefaultLimits)
 	} else {
-		st, _, err = manifest.Load(fsys, gen, h, manifest.LoadOptions{Limit: limit})
+		st, _, err = manifest.Load(fsys, gen, h, manifest.LoadOptions{Limit: limit, Crypto: manifestCrypto(h, k)})
 		if err != nil {
 			return nil, err
 		}
 	}
-	r := &Reader{view: view{fsys: fsys, gen: gen, h: h, pool: pool}, st: st}
+	r := &Reader{view: view{fsys: fsys, gen: gen, h: h, pool: pool, k: k}, st: st}
 	if _, err := r.openBlobs(false, h.ParityScheme != wire.ParityNone); err != nil {
 		r.close()
 		return nil, err

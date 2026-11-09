@@ -623,3 +623,112 @@ func BenchmarkPut64KParallelHardened(b *testing.B) {
 		}
 	})
 }
+
+// The Secure and Fast profiles end to end on a real directory: write,
+// reopen, read-only open, compaction, verification and recovery; keys are
+// required and checked.
+func TestPublicProfiles(t *testing.T) {
+	key, err := stash.NewKey()
+	if err != nil || len(key) != stash.KeySize {
+		t.Fatal(err)
+	}
+	text := bytes.Repeat([]byte("compressible stash text "), 200000)
+	for _, tc := range []struct {
+		name string
+		o    stash.CreateOptions
+		key  []byte
+	}{
+		{"fast", stash.CreateOptions{Profile: stash.Fast}, nil},
+		{"secure", stash.CreateOptions{Profile: stash.Secure, Key: key}, key},
+		{"custom_dense_encrypted", stash.CreateOptions{Compression: stash.ZstdDense, Key: key, Parity: stash.Parity{Scheme: stash.ReedSolomon, K: 2, M: 1}, Blobs: 3}, key},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := stash.Create(dir, tc.o); err != nil {
+				t.Fatal(err)
+			}
+			a, err := stash.Open(dir, stash.Options{Key: tc.key})
+			if err != nil {
+				t.Fatal(err)
+			}
+			files := map[string][]byte{"empty": nil, "small": []byte("hi"), "text": text, "rand": rnd(7, 3<<20+5)}
+			for p, d := range files {
+				if _, err := a.Put(p, d); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := a.Compact(context.Background(), stash.CompactOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			if rep, err := a.Verify(context.Background()); err != nil || !rep.OK() {
+				t.Fatal(rep, err)
+			}
+			a.Close()
+			r, err := stash.OpenReadOnlyWith(dir, stash.ReadOptions{Key: tc.key})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for p, d := range files {
+				if got, err := r.Get(p); err != nil || !bytes.Equal(got, d) {
+					t.Fatalf("%s: %v", p, err)
+				}
+			}
+			r.Close()
+			rc, err := stash.Recover(dir, stash.RecoverOptions{Key: tc.key})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n := len(rc.DefaultSelection()); n != len(files) {
+				t.Fatalf("recovered %d", n)
+			}
+			rc.Close()
+			if tc.key != nil {
+				if _, err := stash.Open(dir, stash.Options{}); !errors.Is(err, stash.ErrKeyRequired) {
+					t.Fatalf("no key: %v", err)
+				}
+				other, _ := stash.NewKey()
+				if _, err := stash.OpenReadOnlyWith(dir, stash.ReadOptions{Key: other}); !errors.Is(err, stash.ErrWrongKey) {
+					t.Fatalf("wrong key: %v", err)
+				}
+			}
+		})
+	}
+	if err := stash.Create(t.TempDir(), stash.CreateOptions{Profile: stash.Secure}); !errors.Is(err, stash.ErrInvalid) {
+		t.Fatalf("Secure without key: %v", err)
+	}
+}
+
+// Secure (AES-256-GCM) and Fast (zstd level 1 on incompressible data: the
+// encoder runs, then STORE is kept) against the BASELINE benchmarks above.
+var benchKey = bytes.Repeat([]byte{7}, 32)
+
+func BenchmarkPut64KParallelSecure(b *testing.B) {
+	benchPutOpen(b, 64<<10, 16, stash.CreateOptions{Profile: stash.Secure, Key: benchKey}, stash.Options{Key: benchKey})
+}
+func BenchmarkPut64MSecure(b *testing.B) {
+	benchPutOpen(b, 64<<20, 0, stash.CreateOptions{Profile: stash.Secure, Key: benchKey}, stash.Options{Key: benchKey})
+}
+func BenchmarkPut64MFast(b *testing.B) {
+	benchPutOpt(b, 64<<20, 0, stash.CreateOptions{Profile: stash.Fast})
+}
+
+func BenchmarkGet64MSecureZstdText(b *testing.B) {
+	dir := b.TempDir()
+	if err := stash.Create(dir, stash.CreateOptions{Compression: stash.ZstdDefault, Key: benchKey}); err != nil {
+		b.Fatal(err)
+	}
+	a, err := stash.Open(dir, stash.Options{Key: benchKey})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer a.Close()
+	d := bytes.Repeat([]byte("STASH reference text, compressible. "), 64<<20/36+1)[:64<<20]
+	a.Put("x", d)
+	b.SetBytes(64 << 20)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := a.Get("x"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

@@ -6,7 +6,7 @@ import (
 	"io"
 
 	"stash/internal/archive"
-	"stash/internal/frame"
+	"stash/internal/blob"
 	"stash/internal/vfs"
 	"stash/internal/wire"
 )
@@ -14,14 +14,15 @@ import (
 // payloadOf reads the extent's frame again, validates it completely and
 // returns the extent's bytes (copied).
 func (rc *Recovery) payloadOf(v *Version, e Extent) ([]byte, error) {
-	var fr *frame.Frame
+	if v.Opaque {
+		return nil, fmt.Errorf("%w: keyless recovery cannot decrypt", archive.ErrKeyRequired)
+	}
+	var ref *blob.Ref
 	if e.fr.off >= 0 {
-		ref, err := rc.readers[e.fr.blob].ReadFrame(e.fr.off)
-		if err != nil {
+		var err error
+		if ref, err = rc.readers[e.fr.blob].ReadFrame(e.fr.off); err != nil {
 			return nil, err
 		}
-		defer ref.Release()
-		fr = ref.Frame
 	} else {
 		rebuilt, err := rc.rebuild(e.fr.t.GroupID)
 		if err != nil {
@@ -31,23 +32,29 @@ func (rc *Recovery) payloadOf(v *Version, e Extent) ([]byte, error) {
 		if buf == nil {
 			return nil, fmt.Errorf("%w: group %d member %d no longer rebuilds", archive.ErrMissingData, e.fr.t.GroupID, e.fr.t.GroupIndex)
 		}
-		if fr, err = frame.Parse(buf, rc.h); err != nil {
+		if ref, err = blob.NewRef(append([]byte(nil), buf...), rc.h, rc.pool, rc.k); err != nil {
 			return nil, err
 		}
 	}
+	defer ref.Release()
+	fr := ref.Frame
 	if fr.Trailer.HashPayload != e.fr.t.HashPayload {
 		return nil, fmt.Errorf("%w: frame changed since the scan", wire.ErrCorrupt)
 	}
-	for _, en := range fr.Entries {
+	entries := fr.Entries
+	if err := ref.Decode(); err != nil { // decrypt, decompress (§5.1, §11.7)
+		return nil, err
+	}
+	for _, en := range entries {
 		if en.Path != v.Path || en.FileVer != v.FileVer {
 			continue
 		}
 		switch fr.Trailer.BlockType {
 		case wire.BlockPacked:
-			return append([]byte(nil), fr.Payload[en.Offset:en.Offset+en.Length]...), nil
+			return append([]byte(nil), ref.Payload[en.Offset:en.Offset+en.Length]...), nil
 		case wire.BlockData:
 			if en.Offset == e.Offset {
-				return append([]byte(nil), fr.Payload...), nil
+				return append([]byte(nil), ref.Payload...), nil
 			}
 		}
 	}
@@ -133,12 +140,15 @@ type SalvageResult struct {
 // writes the given versions into it as new versions of their paths.
 func (rc *Recovery) Salvage(ctx context.Context, dst vfs.FS, versions []*Version) (SalvageResult, error) {
 	res := SalvageResult{Failed: map[string]error{}}
+	if rc.Keyless {
+		return res, fmt.Errorf("%w: salvage of an encrypted archive", archive.ErrKeyRequired)
+	}
 	cfg := archive.Config{Mode: rc.h.Mode, HashID: rc.h.HashID, BlobCount: rc.h.BlobCount, MaxFrameQuanta: rc.h.MaxFrameQuanta,
-		ParityScheme: rc.h.ParityScheme, ParityK: rc.h.ParityK, ParityM: rc.h.ParityM}
+		ParityScheme: rc.h.ParityScheme, ParityK: rc.h.ParityK, ParityM: rc.h.ParityM, Codec: rc.h.CodecID, Key: rc.key}
 	if _, err := archive.Create(dst, cfg); err != nil {
 		return res, err
 	}
-	w, err := archive.OpenWriter(dst, archive.Options{Pool: rc.pool})
+	w, err := archive.OpenWriter(dst, archive.Options{Pool: rc.pool, Key: rc.key})
 	if err != nil {
 		return res, err
 	}

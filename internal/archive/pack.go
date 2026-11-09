@@ -48,6 +48,9 @@ func entrySize(p string) int {
 // entryBytes in total.
 func (w *Writer) packCapacity(entryBytes int) int {
 	n := int(w.h.MaxFrameSize()) - wire.FrameOverhead - 4 - entryBytes - 4 // count, entries, outer CRC
+	if w.h.Encrypted() {
+		n -= 2 * wire.AEADOverhead
+	}
 	if w.code != nil {
 		n -= wire.MinParityPadding
 	}
@@ -121,6 +124,10 @@ func (w *Writer) writePacked(batch []*commitReq) {
 			buf = append(buf, r.small...)
 		}
 		s.Payload, bufs[i] = buf, buf
+		if c, out, rel := w.encode(buf); rel != nil {
+			s.Codec, s.Payload = c, out
+			defer rel()
+		}
 		specs[i] = s
 	}
 	defer func() {
@@ -227,11 +234,11 @@ func (w *Writer) packedQuanta(s *frame.Spec) (uint32, error) {
 	if w.h.Mode == wire.ModeFixed {
 		return w.h.MaxFrameQuanta, nil
 	}
-	pt := 4 + 4
+	pt := 4
 	for _, e := range s.Entries {
 		pt += entrySize(e.Path)
 	}
-	q, err := frame.RequiredQuanta(uint64(len(s.Payload)), uint64(pt), true)
+	q, err := frame.RequiredQuanta(frame.StoredLen(w.h, s.BlockType, uint64(len(s.Payload))), frame.PreTrailerLen(w.h, s.BlockType, uint64(pt)), true)
 	if err != nil {
 		return 0, fmt.Errorf("packed frame: %w", err)
 	}

@@ -15,7 +15,9 @@ import (
 	"path"
 
 	"stash/internal/bufpool"
+	"stash/internal/compress"
 	"stash/internal/frame"
+	"stash/internal/seal"
 	"stash/internal/vfs"
 	"stash/internal/wire"
 )
@@ -87,11 +89,20 @@ func checkHeader(f vfs.File, want *wire.ArchiveHeader) error {
 type Reader struct {
 	f    vfs.File
 	h    *wire.ArchiveHeader
+	k    *seal.Keys
 	pool *bufpool.Pool
 }
 
-// Open opens a blob for reading and validates its header.
+// Open opens a blob for reading and validates its header. Frames of an
+// encrypted archive are parsed keyless (Pre-Trailers stay opaque).
 func Open(fsys vfs.FS, name string, h *wire.ArchiveHeader, pool *bufpool.Pool) (*Reader, error) {
+	return OpenKeyed(fsys, name, h, pool, nil)
+}
+
+// OpenKeyed is Open with the keys of an encrypted archive: Pre-Trailers
+// are authenticated and decrypted by every read, and Ref.Decode can
+// decrypt payloads.
+func OpenKeyed(fsys vfs.FS, name string, h *wire.ArchiveHeader, pool *bufpool.Pool, k *seal.Keys) (*Reader, error) {
 	f, err := fsys.OpenFile(name, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, err
@@ -103,8 +114,11 @@ func Open(fsys vfs.FS, name string, h *wire.ArchiveHeader, pool *bufpool.Pool) (
 	if pool == nil {
 		pool = bufpool.Default
 	}
-	return &Reader{f: f, h: h, pool: pool}, nil
+	return &Reader{f: f, h: h, k: k, pool: pool}, nil
 }
+
+// Keys returns the keys the reader was opened with (nil: keyless).
+func (r *Reader) Keys() *seal.Keys { return r.k }
 
 // Close closes the file.
 func (r *Reader) Close() error { return r.f.Close() }
@@ -119,6 +133,12 @@ type Ref struct {
 	Offset int64
 	buf    []byte
 	pool   *bufpool.Pool
+	h      *wire.ArchiveHeader
+	k      *seal.Keys
+	// decoded: Payload holds the logical bytes (Decode ran); extra are
+	// pooled buffers holding them.
+	decoded bool
+	extra   [2][]byte
 }
 
 // Release returns the frame buffer to the pool. It is idempotent.
@@ -128,6 +148,75 @@ func (r *Ref) Release() {
 		r.buf = nil
 		r.Frame = nil
 	}
+	for i, b := range r.extra {
+		if b != nil {
+			r.pool.Put(b)
+			r.extra[i] = nil
+		}
+	}
+}
+
+// Plain returns the payload plaintext of a DATA/PACKED frame: decrypted
+// when the archive is encrypted, still compressed when codec_id is not
+// STORE. It is valid until Release and must be called before Decode.
+func (r *Ref) Plain() ([]byte, error) {
+	if r.decoded {
+		return nil, fmt.Errorf("%w: Plain after Decode", wire.ErrInvalid)
+	}
+	if !r.h.Encrypted() || r.Trailer.BlockType == wire.BlockParity {
+		return r.Payload, nil
+	}
+	if r.extra[0] == nil {
+		r.extra[0] = r.pool.Get(len(r.Payload))
+		p, err := frame.OpenPayload(r.Frame, r.h, r.k, r.Bytes(), r.extra[0][:0])
+		if err != nil {
+			r.pool.Put(r.extra[0])
+			r.extra[0] = nil
+			return nil, err
+		}
+		r.extra[0] = p
+	}
+	return r.extra[0], nil
+}
+
+// Decode replaces Payload by the frame's logical bytes (§5.1): the payload
+// is decrypted (encrypted archives) and decompressed with the validated
+// logical length as the exact ceiling. For a plaintext STORE frame it does
+// nothing. It is idempotent.
+func (r *Ref) Decode() error {
+	if r.decoded || r.Trailer.BlockType == wire.BlockParity {
+		return nil
+	}
+	plain, err := r.Plain()
+	if err != nil {
+		return err
+	}
+	want, ok := r.LogicalLength()
+	if !ok {
+		return fmt.Errorf("%w: encrypted PACKED frame needs the keys", wire.ErrInvalid)
+	}
+	if r.Trailer.CodecID == wire.CodecStore {
+		if uint64(len(plain)) != want {
+			return fmt.Errorf("%w: STORE payload %d bytes, logical %d", wire.ErrCorrupt, len(plain), want)
+		}
+		r.Payload, r.decoded = plain, true
+		return nil
+	}
+	if want > r.h.MaxFrameSize() {
+		return fmt.Errorf("%w: logical length %d > MAX_FRAME_SIZE", wire.ErrCorrupt, want)
+	}
+	if err := compress.CheckFrame(plain, want, r.h.MaxFrameSize()); err != nil {
+		return err // before the decompression buffer is allocated (§5.1.1)
+	}
+	b := r.pool.Get(int(want))
+	out, err := compress.Decode(r.Trailer.CodecID, plain, want, r.h.MaxFrameSize(), b[:0])
+	if err != nil {
+		r.pool.Put(b)
+		return err
+	}
+	r.extra[1] = out
+	r.Payload, r.decoded = out, true
+	return nil
 }
 
 // Bytes returns the frame's encoded bytes (valid until Release).
@@ -138,12 +227,12 @@ func (r *Ref) Bytes() []byte {
 // NewRef validates a complete frame held in buf (taken from pool, and
 // owned by the Ref afterwards) and wraps it as a Ref with offset -1, for
 // frames that were rebuilt rather than read (§7.3).
-func NewRef(buf []byte, h *wire.ArchiveHeader, pool *bufpool.Pool) (*Ref, error) {
-	fr, err := frame.Parse(buf, h)
+func NewRef(buf []byte, h *wire.ArchiveHeader, pool *bufpool.Pool, k *seal.Keys) (*Ref, error) {
+	fr, err := frame.ParseKeyed(buf, h, k)
 	if err != nil {
 		return nil, err
 	}
-	return &Ref{Frame: fr, Offset: -1, buf: buf, pool: pool}, nil
+	return &Ref{Frame: fr, Offset: -1, buf: buf, pool: pool, h: h, k: k}, nil
 }
 
 // ReadFrame reads and fully validates the frame at off (on the frame grid).
@@ -163,12 +252,12 @@ func (r *Reader) ReadFrame(off int64) (*Ref, error) {
 		r.pool.Put(buf)
 		return nil, err
 	}
-	fr, err := frame.Parse(buf, r.h)
+	fr, err := frame.ParseKeyed(buf, r.h, r.k)
 	if err != nil {
 		r.pool.Put(buf)
 		return nil, err
 	}
-	return &Ref{Frame: fr, Offset: off, buf: buf, pool: r.pool}, nil
+	return &Ref{Frame: fr, Offset: off, buf: buf, pool: r.pool, h: r.h, k: r.k}, nil
 }
 
 func frameSizeAt(f vfs.File, h *wire.ArchiveHeader, off, size int64) (int64, error) {

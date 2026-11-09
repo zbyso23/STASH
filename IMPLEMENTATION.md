@@ -259,12 +259,48 @@ Public API: `CreateOptions.Anchor`, `Options.Anchor`, `Options.AdoptUnanchored`,
 
 Tests (§17.11): creation and refusal of a second anchor; enrollment after verification (a damaged archive is refused) and no archive byte changed except the marker and the implementation's checkpoint file; monotonic advances with non-consecutive generation ids; commit advance per batch; manifest truncated or altered below the anchored length; storage rolled back to an earlier valid state; anchor unavailable at open and during a commit (no downgrade, the Put fails, the unanchored record is truncated at reopen); stale and replayed advances; `root_digest` mismatch; root ahead of the anchor (fail closed, then the authorized flow); the anchor missing; unanchored bytes ignored by a reader, truncated by default, adopted on request; crash after the switch advance and before the root (reopen completes the switch) and with the anchored generation damaged or missing (incident); crash between the anchor creation and the first root write (root rebuilt); 140 crash points of a HARDENED workload plus compaction with the anchor state captured at each crash: every reported Put survives and every state opens.
 
-Not applicable until encryption: binding allocator reservations in the anchor (§2.1.3.5; the reservation type and `alloc.OnReserve` exist).
+Binding allocator reservations in the anchor (§2.1.3.5) came with encryption in Milestone 15.
 
 Benchmark (4 cores, this container's disk, file anchor on the same disk): 64 KiB Puts with 16 writers take about 430 MB/s HARDENED vs 555 MB/s STANDARD. Each batch pays one more durable replace.
 
 No SPEC change in this milestone.
 
+## Milestone 14 — Zstandard compression (done)
+
+| Where | Content | SPEC |
+|---|---|---|
+| `internal/compress` | `Encode`: zstd levels 1 / 3 / 9 (ZSTD_FAST / DEFAULT / DENSE) as single-segment frames with the content size, no checksum, no dictionary; STORE is kept when compression does not make the extent smaller | §5, §6.6 |
+| | `CheckFrame`/`Inspect`: strict header check before any allocation: exactly one frame, no skippable frames or trailing bytes, no dictionary ID, Frame_Content_Size present and equal to the expected logical length, Window_Size ≤ MAX_FRAME_SIZE; blocks are walked to the last one | §6.6.1 |
+| | `Decode`: a shared decoder with a capacity limit; the output must be exactly the logical length | §6.6.1 |
+| `internal/frame`, `blob.Ref.Decode` | the hash covers the stored payload; a frame is validated first, then decoded into a pooled buffer (idempotent); `LogicalLength` from the entries | §6.6 |
+| `internal/archive` | `commit.go`, `pack.go`, `groupwrite.go`: extents and PACKED frames are compressed before the frame size is chosen; parity groups take their frame size from the largest compressed member; compaction repacks from logical bytes and copies DATA frames unchanged | §7.1, §8, §13 |
+
+Reader: a compressed extent may have any logical length up to MAX_FRAME_SIZE, independent of the frame's physical capacity (`TestCompressedExtentBeyondPhysicalBudget` writes a hand-built 64 KiB extent into a frame of a few quanta, then reads it via Get, ReadAt, Verify and after compaction, plain and encrypted). The writer's default keeps each logical extent within what the frame would hold uncompressed (`Options.MaxExtent`). That is the M15 default, not a format limit. A writer option for larger compressed extents is listed below.
+
+Golden vectors: `testdata/gen/gen_golden_m14.py` uses libzstd (python `zstandard`) for 17 cases (valid frames at several levels, empty, a frame without the content size, with a dictionary ID, a checksum, a skippable frame, trailing bytes, a window above the limit, a wrong content size, a damaged block, truncation). `FuzzDecode` covers the decoder.
+
+## Milestone 15 — encryption (done, AES-256-GCM)
+
+| Where | Content | SPEC |
+|---|---|---|
+| `internal/seal` | HKDF-SHA-256 keys (frame, Pre-Trailer, manifest, object_id, key check) with salt archive_id; nonces: frame `u32 generation ‖ u8 blob ‖ u56 frame_ordinal`, manifest `u32 generation ‖ u64 seq`; frame and manifest AAD; stored form nonce ‖ ciphertext ‖ tag (+28 bytes) | §15.2–§15.5, §15.8.3 |
+| `internal/frame` | `appendSealed` in the normative order: compress, encrypt payload, encrypt Pre-Trailer, hash the stored bytes, trailer; `ParseKeyed` authenticates the Pre-Trailer; keyed object_id `HMAC(objectid_key, …)[:16]`; nonce limits checked before encryption | §6.5, §15.6 |
+| `internal/manifest/envelope.go` | `X_ENC` envelopes `{"seq","op","enc"}`, canonical base64, a `prev` chain starting at SHA-256(archive_id ‖ relpath), nonce checked before decryption, `PARITY_GROUP` stays plaintext | §15.8 |
+| `internal/archive/keys.go` | `key.check` (E1-25): a wrong DEK is `ErrWrongKey` before anything is read, a missing DEK is `ErrKeyRequired`, a DEK for a plaintext archive is refused | §15.1.1 |
+| `internal/archive` | the cold-start frame-ordinal check uses the stored nonces; compaction copies encrypted frames byte for byte (nonce, tag, hash, ordinal unchanged) and re-seals only regrouped or repacked frames with fresh nonces | §2.1.3.1, §15.7 |
+| `internal/archive/reserve.go` | HARDENED + encrypted: the generation, seq, frame-ordinal and group_id allocators anchor every new block before they use it; a local value below the anchored one is `ErrAllocatorRollback` (or raised to the anchored value with `Options.AcknowledgeAllocatorRollback`); the switch advance carries the destination's reservations | §2.1.3.5 |
+| `internal/recovery` | with the key: frames are decrypted with their stored nonce; without it (§15.10): structural validation, DATA extents grouped by the opaque object_id, extraction refused, PACKED frames counted | §11.7, §15.10 |
+
+Public API: `CreateOptions.Profile` (`Custom`, `Baseline`, `Secure`, `Fast`), `CreateOptions.Compression` (`Store`, `ZstdFast`, `ZstdDefault`, `ZstdDense`), `CreateOptions.Key`, `Options.Key`, `Options.AcknowledgeAllocatorRollback`, `ReadOptions.Key`, `RecoverOptions.Key`, `stash.NewKey`, `stash.KeySize`, `EnrollWithKey`, `AuthorizeAnchorTransitionWithKey`, errors `ErrKeyRequired`, `ErrWrongKey`, `ErrAllocatorRollback`. The caller holds the DEK; wrapping it (KEK/KMS) is outside the library.
+
+Tests: independent Python golden vectors (`cryptography`) for the HKDF keys, object_ids, nonces, five encrypted frames (DATA STORE, PACKED, DATA zstd with a logical length above the frame capacity, a FIXED parity member, an empty extent) and six manifest envelopes, reproduced byte for byte; tampering with the tag, nonce, every AAD field and archive_id is rejected; nonce limits; every profile with FIXED/VARIABLE and XOR/RS round trip, verification and compaction; byte-identical encrypted frames over three compactions; keyed recovery after compaction, without a manifest and without `key.check`; keyless recovery; a rolled-back frame-ordinal allocator; HARDENED reservation binding with rollback and acknowledgement; torn-write crash points of encrypted, compressed workloads (with RS parity), each reopened, verified and written to.
+
+Benchmark (4 cores, this container's disk, incompressible data): 64 KiB Puts with 16 writers 499 MB/s BASELINE vs 474 MB/s SECURE; 64 MiB Puts 684 vs 688 MB/s, FAST 683 MB/s. A 64 MiB compressible object reads at about 3.1 GB/s encrypted and compressed vs 1.7 GB/s for BASELINE random data. The disk dominates; AES-GCM and zstd level 1 cost little.
+
+SPEC change: E1-25 (§15.1.1 key check, no wire change).
+
 ## Next milestones
 
-14. Encryption (§15, including §2.1.3.5 reservation binding). Then zstd, CLI, FUSE.
+16. A writer option for compressed extents larger than the frame's uncompressed capacity (the reader already accepts them).
+17. CLI (`stash create/put/get/ls/verify/compact/recover`).
+18. FUSE mount, then Emergency Pruning.

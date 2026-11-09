@@ -159,30 +159,48 @@ func decodeGeneric(line []byte, encrypted bool) (*Record, error) {
 	case encOps[opName] && !encrypted:
 		return nil, corrupt("%s record in an unencrypted archive", opName)
 	case encOps[opName]:
-		return nil, &wire.Error{Struct: "Manifest", Field: "op", Class: wire.ErrUnsupported, Detail: opName + " needs the encryption layer (not implemented yet)"}
+		return nil, &wire.Error{Struct: "Manifest", Field: "op", Class: wire.ErrInvalid, Detail: opName + " envelope needs the archive keys"}
 	case !ok:
 		return nil, &wire.Error{Struct: "Manifest", Field: "op", Class: wire.ErrUnsupported, Detail: fmt.Sprintf("unknown op %q", opName)}
 	case encrypted:
 		return nil, corrupt("plaintext %s record in an encrypted archive", opName)
 	}
+	r, _, err := recordFrom(v.obj, op, false)
+	return r, err
+}
+
+// recordFrom checks and decodes the members of a record object. In an
+// envelope plaintext (§15.8.1) seq and op are absent and prev is required;
+// prev is returned (64 lowercase hex characters, checked).
+func recordFrom(obj []member, op Op, envelope bool) (*Record, [32]byte, error) {
+	var prev [32]byte
 	fields := map[string]value{}
+	required := fieldOrder[op]
+	if envelope {
+		required = append(required[2:len(required):len(required)], "prev")
+	}
 	allowed := map[string]bool{"ts": true}
-	for _, f := range fieldOrder[op] {
+	for _, f := range required {
 		allowed[f] = true
 	}
-	for _, m := range v.obj {
+	for _, m := range obj {
 		if !allowed[m.key] {
-			return nil, corrupt("%s: unknown key %q", op, m.key)
+			return nil, prev, corrupt("%s: unknown key %q", op, m.key)
 		}
 		fields[m.key] = m.val
 	}
-	for _, f := range fieldOrder[op] {
+	for _, f := range required {
 		if _, ok := fields[f]; !ok {
-			return nil, corrupt("%s: missing %q", op, f)
+			return nil, prev, corrupt("%s: missing %q", op, f)
 		}
 	}
 	d := decoder{f: fields, op: op}
-	r := &Record{Op: op, Seq: d.dec("seq")}
+	r := &Record{Op: op}
+	if envelope {
+		prev = d.hash(fields["prev"], "prev")
+	} else {
+		r.Seq = d.dec("seq")
+	}
 	if _, ok := fields["ts"]; ok {
 		r.HasTS, r.TS = true, d.dec("ts")
 	}
@@ -211,9 +229,9 @@ func decodeGeneric(line []byte, encrypted bool) (*Record, error) {
 		r.Members = d.members("members")
 	}
 	if d.err != nil {
-		return nil, d.err
+		return nil, prev, d.err
 	}
-	return r, nil
+	return r, prev, nil
 }
 
 type decoder struct {

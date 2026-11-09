@@ -9,6 +9,7 @@ import (
 
 	"stash/internal/bufpool"
 	"stash/internal/frame"
+	"stash/internal/seal"
 	"stash/internal/vfs"
 	"stash/internal/wire"
 )
@@ -114,21 +115,37 @@ type OpenResult struct {
 	MaxGroupID uint32
 	MaxOrdinal uint64
 	HasFrames  bool
+	// MaxNonceOrdinal is the largest frame_ordinal encoded in a stored
+	// nonce whose (generation_id, blob_ordinal) prefix is this namespace
+	// (encrypted archives, §2.1.3.1, §2.1.3.4); copied frames keep the
+	// nonce of their origin and do not count. HasNonce is false if none.
+	MaxNonceOrdinal uint64
+	HasNonce        bool
+	gen             uint64
+	ordinal         uint8
 }
 
-func (r *OpenResult) see(t *wire.MasterTrailer) {
+func (r *OpenResult) see(t *wire.MasterTrailer, nonce []byte) {
 	r.HasFrames = true
 	r.MaxGroupID = max(r.MaxGroupID, t.GroupID)
 	r.MaxOrdinal = max(r.MaxOrdinal, t.FrameOrdinal)
+	if len(nonce) == wire.AEADNonceSize {
+		if g, b, o := seal.SplitFrameNonce(nonce); g == r.gen && b == r.ordinal {
+			r.MaxNonceOrdinal = max(r.MaxNonceOrdinal, o)
+			r.HasNonce = true
+		}
+	}
 }
 
 // Writer appends frames to one blob. Methods are safe for concurrent use:
 // only the allocation of the next offset is serialized (§12.2); building
 // frames (hashing) and writing them run in parallel.
 type Writer struct {
-	f    vfs.File
-	h    *wire.ArchiveHeader
-	pool *bufpool.Pool
+	f       vfs.File
+	h       *wire.ArchiveHeader
+	k       *seal.Keys
+	ordinal uint8
+	pool    *bufpool.Pool
 
 	mu       sync.Mutex
 	cond     sync.Cond          // signals completion of an in-flight write
@@ -149,7 +166,16 @@ type Writer struct {
 // A blob whose header is incomplete and that holds nothing beyond it (a
 // crash inside Create) is re-initialized.
 func OpenWriter(fsys vfs.FS, name string, h *wire.ArchiveHeader, pool *bufpool.Pool, committed Committed) (*Writer, OpenResult, error) {
-	var res OpenResult
+	return OpenWriterKeyed(fsys, name, h, pool, committed, nil, 0)
+}
+
+// OpenWriterKeyed is OpenWriter for the blob with the given ordinal, with
+// the keys of an encrypted archive: committed references are matched
+// through decrypted Pre-Trailers, stored nonces of this namespace are
+// reported (OpenResult.MaxNonceOrdinal), and appended DATA/PACKED frames
+// are sealed with nonces of (generation_id, ordinal, frame_ordinal).
+func OpenWriterKeyed(fsys vfs.FS, name string, h *wire.ArchiveHeader, pool *bufpool.Pool, committed Committed, k *seal.Keys, ordinal uint8) (*Writer, OpenResult, error) {
+	res := OpenResult{gen: h.GenerationID, ordinal: ordinal}
 	if pool == nil {
 		pool = bufpool.Default
 	}
@@ -176,7 +202,7 @@ func OpenWriter(fsys vfs.FS, name string, h *wire.ArchiveHeader, pool *bufpool.P
 	}
 	satisfied := map[FrameKey]struct{}{}
 	collect := func(_ int64, fr *frame.Frame) error {
-		res.see(&fr.Trailer)
+		res.see(&fr.Trailer, storedNonce(h, &fr.Trailer, fr.PreTrailer))
 		if len(committed.Refs) == 0 {
 			return nil
 		}
@@ -188,8 +214,8 @@ func OpenWriter(fsys vfs.FS, name string, h *wire.ArchiveHeader, pool *bufpool.P
 		return nil
 	}
 	start := int64(wire.FrameAreaStart)
-	if n, ok, err := useCheckpoint(f, h, pool, committed.Verified, size, func(hf HopFrame) {
-		res.see(&hf.Trailer)
+	if n, ok, err := useCheckpoint(f, h, k, pool, committed.Verified, size, func(hf HopFrame) {
+		res.see(&hf.Trailer, hf.Nonce)
 		for _, k := range keysOfTail(&hf.Trailer, hf.Entries) {
 			if _, ok := committed.Refs[k]; ok {
 				satisfied[k] = struct{}{}
@@ -201,9 +227,9 @@ func OpenWriter(fsys vfs.FS, name string, h *wire.ArchiveHeader, pool *bufpool.P
 		start, res.Checkpointed = committed.Verified.End, n
 	} else {
 		clear(satisfied)
-		res = OpenResult{}
+		res = OpenResult{gen: h.GenerationID, ordinal: ordinal}
 	}
-	if res.Scan, err = scan(f, h, pool, start, size, collect); err != nil {
+	if res.Scan, err = scan(f, h, k, pool, start, size, collect); err != nil {
 		return fail(err)
 	}
 	res.Scan.Frames += res.Checkpointed
@@ -212,24 +238,24 @@ func OpenWriter(fsys vfs.FS, name string, h *wire.ArchiveHeader, pool *bufpool.P
 		// Committed data lies at or beyond E even if nothing validates
 		// there (damage of §3.1.1 item 4); the blob is sealed either way.
 		if E < size {
-			res.Tail, _ = probeTail(f, h, pool, E, size)
+			res.Tail, _ = probeTail(f, h, k, pool, E, size)
 		}
 		return fail(committed.protects(E, len(satisfied), res.Tail, nil))
 	}
 	if E < size {
-		if res.Tail, err = probeTail(f, h, pool, E, size); err != nil {
+		if res.Tail, err = probeTail(f, h, k, pool, E, size); err != nil {
 			return fail(err)
 		}
 		for i := range res.Tail {
-			res.see(&res.Tail[i].Trailer)
+			res.see(&res.Tail[i].Trailer, res.Tail[i].Nonce)
 		}
 		var atE *HopFrame
 		var scratch []byte
-		if hf, ok, err := tailAt(f, h, E, size, &scratch); err != nil {
+		if hf, ok, err := tailAt(f, h, k, E, size, &scratch); err != nil {
 			return fail(err)
 		} else if ok {
 			atE = &hf
-			res.see(&hf.Trailer)
+			res.see(&hf.Trailer, hf.Nonce)
 		}
 		if err := committed.protects(E, len(satisfied), res.Tail, atE); err != nil {
 			return fail(err)
@@ -242,7 +268,7 @@ func OpenWriter(fsys vfs.FS, name string, h *wire.ArchiveHeader, pool *bufpool.P
 		}
 		res.Truncated = size - E
 	}
-	w := &Writer{f: f, h: h, pool: pool, end: E, inflight: map[int64]struct{}{}}
+	w := &Writer{f: f, h: h, k: k, ordinal: ordinal, pool: pool, end: E, inflight: map[int64]struct{}{}}
 	w.cond.L = &w.mu
 	return w, res, nil
 }
@@ -282,6 +308,7 @@ func (w *Writer) Append(s *frame.Spec) (off int64, size int64, err error) {
 // AppendIndexed is Append returning the frame's physical index record
 // (§10.5), ready for index.Index.Add.
 func (w *Writer) AppendIndexed(s *frame.Spec) (wire.IndexRecord, error) {
+	w.Seal(s)
 	buf := w.pool.Get(estimateFrameSize(w.h, s))
 	b, err := frame.AppendFrame(buf[:0], w.h, s)
 	if err != nil {
@@ -290,6 +317,14 @@ func (w *Writer) AppendIndexed(s *frame.Spec) (wire.IndexRecord, error) {
 	}
 	defer w.pool.Put(b) // b may have grown past the estimate
 	return w.AppendBuilt(b)
+}
+
+// Seal sets the sealing context of s for this blob (encrypted archives):
+// the archive keys and this blob's ordinal for the nonce.
+func (w *Writer) Seal(s *frame.Spec) {
+	if w.k != nil {
+		s.Keys, s.Blob = w.k, w.ordinal
+	}
 }
 
 // AppendBuilt writes a frame that frame.AppendFrame just encoded (so it is
@@ -317,7 +352,7 @@ func estimateFrameSize(h *wire.ArchiveHeader, s *frame.Spec) int {
 	if h.Mode == wire.ModeFixed || s.FrameQuanta != 0 {
 		return maxSize
 	}
-	n := len(s.Payload) + wire.FrameOverhead + 8 + wire.MinParityPadding
+	n := len(s.Payload) + wire.FrameOverhead + 8 + wire.MinParityPadding + 2*wire.AEADOverhead
 	for i := range s.Entries {
 		n += len(s.Entries[i].Path) + 2 + 24
 		if n > maxSize {
@@ -427,7 +462,7 @@ func IsSealed(err error) bool { return errors.Is(err, ErrSealed) }
 // cp.End completely. ok is false when the checkpoint does not match the
 // blob exactly (a gap, another last frame, a different length); the
 // caller then scans everything. see receives every frame walked.
-func useCheckpoint(f vfs.File, h *wire.ArchiveHeader, pool *bufpool.Pool, cp Checkpoint, size int64, see func(HopFrame)) (int, bool, error) {
+func useCheckpoint(f vfs.File, h *wire.ArchiveHeader, k *seal.Keys, pool *bufpool.Pool, cp Checkpoint, size int64, see func(HopFrame)) (int, bool, error) {
 	if cp.End <= wire.FrameAreaStart || cp.End > size || cp.LastOff < wire.FrameAreaStart || cp.LastOff >= cp.End {
 		return 0, false, nil
 	}
@@ -435,7 +470,7 @@ func useCheckpoint(f vfs.File, h *wire.ArchiveHeader, pool *bufpool.Pool, cp Che
 	var seen []HopFrame
 	off := int64(wire.FrameAreaStart)
 	for off < cp.End {
-		hf, ok, err := tailAt(f, h, off, cp.End, &buf)
+		hf, ok, err := tailAt(f, h, k, off, cp.End, &buf)
 		if err != nil {
 			return 0, false, err
 		}
@@ -450,7 +485,7 @@ func useCheckpoint(f vfs.File, h *wire.ArchiveHeader, pool *bufpool.Pool, cp Che
 		return 0, false, nil
 	}
 	w := &window{f: f, size: cp.End, pool: pool}
-	_, _, err := parseAt(w, h, cp.LastOff) // full validation, hash included
+	_, _, err := parseAt(w, h, k, cp.LastOff) // full validation, hash included
 	w.release()
 	if err != nil {
 		if !wire.IsFormatError(err) && err != io.ErrUnexpectedEOF {

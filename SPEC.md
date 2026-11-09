@@ -1876,6 +1876,22 @@ The archive DEK MUST remain fixed for the lifetime of the encrypted archive. It 
 
 The format does not store a `key_id` in frame/blob wire structures. A deployment MAY store a wrapped DEK and key identifier in protected archive metadata or an external KMS-backed configuration associated with `archive_id`. Loss of that mapping can make encrypted logical content unavailable even though keyless structural recovery still works.
 
+### 15.1.1 Key check (E1-25)
+
+An implementation SHOULD refuse a wrong DEK before it reads or writes anything, including in an archive whose manifest is still empty and therefore authenticates nothing. It MAY store a key-check value derived from the DEK:
+
+```text
+key_check =
+    HKDF-SHA256(
+        IKM  = archive_DEK,
+        salt = archive_id,
+        info = ASCII("STASH-KEY-CHECK-R10"),
+        L    = 32
+    )
+```
+
+`key_check` reveals nothing about the four keys of §15.2 (independent HKDF outputs) and is not a wire structure: where and how it is stored is implementation-defined, like other implementation state outside the archive format. The reference implementation keeps it in the archive root as `key.check`: magic `"STKEYCK1"`, the 32-byte `key_check`, and `u32` CRC32C of the preceding 40 bytes (44 bytes in total), written at creation before `root.current`. A writer or reader of an encrypted archive MUST refuse a DEK whose `key_check` differs from a stored valid one. A damaged stored value MUST fail closed. Raw recovery (§11.7, §15.10) MUST tolerate a missing key-check value, since frame and manifest authentication still reject a wrong DEK.
+
 ## 15.2 Domain-separated AEAD keys
 
 Four independent 256-bit keys are derived using HKDF-SHA-256:
@@ -2837,6 +2853,7 @@ E1 was applied in 2026-11, before any implementation existed. It fixes defects f
 | E1-22 | Torn-tail rule protects the PARITY frames of committed groups | §10.4.2 | No `loc` names a PARITY frame, so a committed PARITY frame damaged at the end of a blob (§3.1.1 item 4) was truncated as a torn tail and the group silently lost its protection |
 | E1-23 | Verified checkpoint: frames below a clean-close checkpoint are walked by Prefix and tail without rehashing at writer open | §10.4.2 | The uninterrupted validating scan made every writer open read and hash the whole archive (hours at multi-terabyte scale); torn-write protection needs full validation only beyond the last durable, verified point |
 | E1-24 | Post-Mark delta merged by net effect per path; post-Mark groups keep their `group_id` only below the destination's allocation start | §13.4 | §7 asked a compactor to initialize the destination `groups.alloc` above every copied ID before allocating new ones, which a concurrent Sweep cannot do: groups written after the Mark are copied after the destination has allocated IDs for regrouping, and could collide |
+| E1-25 | Optional key-check value `HKDF(DEK, archive_id, "STASH-KEY-CHECK-R10")`, stored outside the wire format; a mismatching DEK is refused at open | §15.1.1 | A wrong DEK was detected only when the first authenticated structure failed; an archive with an empty manifest accepted any key and a writer would have sealed new frames with it, splitting the archive between two keys |
 
 # 21. README / Public Specification Requirements
 

@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"sync"
 
+	"stash/internal/compress"
 	"stash/internal/frame"
 	"stash/internal/manifest"
 	"stash/internal/wire"
@@ -278,6 +279,23 @@ func (w *Writer) writeAndCommit(ctx context.Context, p string, src extentSource)
 	return ver, nil
 }
 
+// encode compresses logical bytes with the archive's codec (§5): it
+// returns the codec actually used (STORE when compression does not make
+// the payload smaller), the payload plaintext, and a release for its
+// buffer (nil when the payload is logical itself).
+func (w *Writer) encode(logical []byte) (wire.CodecID, []byte, func()) {
+	if w.h.CodecID == wire.CodecStore || len(logical) == 0 {
+		return wire.CodecStore, logical, nil
+	}
+	buf := w.pool.Get(len(logical))
+	c, out, err := compress.Encode(w.h.CodecID, logical, buf[:0])
+	if err != nil || c == wire.CodecStore {
+		w.pool.Put(buf)
+		return wire.CodecStore, logical, nil
+	}
+	return c, out, func() { w.pool.Put(buf) }
+}
+
 // writeExtent writes one DATA frame and indexes it.
 func (w *Writer) writeExtent(p string, ver uint64, off int, payload []byte) (manifest.Loc, int, error) {
 	b, err := w.pickBlob()
@@ -288,7 +306,11 @@ func (w *Writer) writeExtent(p string, ver uint64, off int, payload []byte) (man
 	if err != nil {
 		return manifest.Loc{}, 0, err
 	}
-	s := &frame.Spec{BlockType: wire.BlockData, Codec: wire.CodecStore, Payload: payload, FrameOrdinal: ord,
+	codec, stored, rel := w.encode(payload)
+	if rel != nil {
+		defer rel()
+	}
+	s := &frame.Spec{BlockType: wire.BlockData, Codec: codec, Payload: stored, FrameOrdinal: ord,
 		Entries: []wire.Entry{{Path: p, Offset: uint64(off), Length: uint64(len(payload)), FileVer: ver}}}
 	rec, err := w.writers[b].AppendIndexed(s)
 	if err != nil {

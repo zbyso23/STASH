@@ -24,6 +24,17 @@ func AppendLine(dst []byte, r *Record) ([]byte, error) {
 	b = append(b, `,"op":"`...)
 	b = append(b, r.Op.String()...)
 	b = append(b, '"')
+	b = appendFields(b, r)
+	b = append(b, '}')
+	if n := len(b) - start; n > MaxLineBytes {
+		return dst, &wire.Error{Struct: "Manifest", Class: wire.ErrInvalid, Detail: fmt.Sprintf("record of %d bytes exceeds MAX_MANIFEST_LINE_BYTES", n)}
+	}
+	return append(b, '\n'), nil
+}
+
+// appendFields appends ,"field":value for every field of r after seq and
+// op, in canonical order, ts last.
+func appendFields(b []byte, r *Record) []byte {
 	switch r.Op {
 	case OpAdd:
 		b = appendStrField(b, "path", r.Path)
@@ -71,11 +82,7 @@ func AppendLine(dst []byte, r *Record) ([]byte, error) {
 	if r.HasTS {
 		b = appendDecField(b, "ts", r.TS)
 	}
-	b = append(b, '}')
-	if n := len(b) - start; n > MaxLineBytes {
-		return dst, &wire.Error{Struct: "Manifest", Class: wire.ErrInvalid, Detail: fmt.Sprintf("record of %d bytes exceeds MAX_MANIFEST_LINE_BYTES", n)}
-	}
-	return append(b, '\n'), nil
+	return b
 }
 
 func appendDec(b []byte, v uint64) []byte {

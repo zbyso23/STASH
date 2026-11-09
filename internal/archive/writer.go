@@ -17,6 +17,7 @@ import (
 	"stash/internal/index"
 	"stash/internal/manifest"
 	"stash/internal/parity"
+	"stash/internal/seal"
 	"stash/internal/vfs"
 	"stash/internal/wire"
 )
@@ -52,6 +53,13 @@ type Options struct {
 	// operator-authorized recovery action: unencrypted records are not
 	// authenticated.
 	AdoptUnanchored bool
+	// Key is the 32-byte archive DEK of an encrypted archive (§15.1).
+	Key []byte
+	// AcknowledgeAllocatorRollback continues an encrypted HARDENED archive
+	// whose local Allocator State is below the anchored reservations from
+	// the anchored values (§2.1.3.5): an operator decision after the
+	// security incident was reported.
+	AcknowledgeAllocatorRollback bool
 }
 
 // Health reports conditions found when opening (§13.9).
@@ -110,6 +118,7 @@ type Writer struct {
 	health  Health
 	opened  bool // OpenWriter completed
 	hard    hardenedState
+	keys    *seal.Keys // encrypted archive
 }
 
 // OpenWriter takes the writer lock and opens the current generation for
@@ -142,7 +151,7 @@ func OpenWriter(fsys vfs.FS, opt Options) (w *Writer, err error) {
 	}
 	if opt.Anchor != nil {
 		// §11.8: may complete an interrupted switch or creation
-		_, st, err := resolveHardened(context.Background(), fsys, opt.Anchor, opt.Pool, true)
+		_, st, err := resolveHardened(context.Background(), fsys, opt.Anchor, opt.Pool, true, opt.Key)
 		if err != nil {
 			return nil, err
 		}
@@ -157,8 +166,8 @@ func OpenWriter(fsys vfs.FS, opt Options) (w *Writer, err error) {
 	if err != nil {
 		return nil, err
 	}
-	if h.Encrypted() {
-		return nil, fmt.Errorf("%w: encrypted archives need a later milestone", wire.ErrUnsupported)
+	if w.keys, err = archiveKeys(fsys, h, opt.Key); err != nil {
+		return nil, err
 	}
 	// archive-wide allocators
 	ga := alloc.Identity{Kind: wire.AllocGeneration, ArchiveID: h.ArchiveID, Encrypted: h.Encrypted()}
@@ -196,7 +205,10 @@ func (w *Writer) openGeneration(gen string, h *wire.ArchiveHeader) (err error) {
 			return err
 		}
 	}
-	w.view = &view{fsys: fsys, gen: gen, h: h, pool: opt.Pool}
+	w.view = &view{fsys: fsys, gen: gen, h: h, pool: opt.Pool, k: w.keys}
+	if h.Encrypted() && h.GenerationID > seal.MaxGenerationID {
+		return fmt.Errorf("%w: generation %d", seal.ErrNonceLimit, h.GenerationID)
+	}
 	per := func(kind wire.AllocKind, b uint8) (*alloc.Allocator, error) {
 		return alloc.Open(fsys, path.Join(gen, alloc.FileName(kind, b)),
 			alloc.Identity{Kind: kind, Blob: b, GenerationID: h.GenerationID, ArchiveID: h.ArchiveID, Encrypted: h.Encrypted()}, 0)
@@ -209,6 +221,19 @@ func (w *Writer) openGeneration(gen string, h *wire.ArchiveHeader) (err error) {
 			return err
 		}
 	}
+	w.ordAlloc = make([]*alloc.Allocator, h.BlobCount)
+	for b := 0; b < int(h.BlobCount); b++ {
+		if w.ordAlloc[b], err = per(wire.AllocFrameOrdinal, uint8(b)); err != nil {
+			return err
+		}
+	}
+	if w.hard.anchor != nil && h.Encrypted() {
+		// §2.1.3.5: before any value is handed out (cold-start ADD_ABORTs
+		// take seq values)
+		if err := w.bindReservations(context.Background()); err != nil {
+			return err
+		}
+	}
 
 	if w.hard.anchor != nil {
 		if err := w.prepareManifest(gen, opt.AdoptUnanchored); err != nil {
@@ -218,6 +243,7 @@ func (w *Writer) openGeneration(gen string, h *wire.ArchiveHeader) (err error) {
 	// manifest: torn tail, allocator checks against the fold, cold-start aborts
 	j, st, res, err := manifest.OpenJournal(fsys, gen, h, manifest.LoadOptions{
 		Limits:    opt.Limits,
+		Crypto:    manifestCrypto(h, w.keys),
 		SeqSource: w.seqAlloc.Next,
 		BeforeAppend: func(st *manifest.State) error {
 			if err := w.verAlloc.Check(st.MaxFileVer(), st.MaxFileVer() > 0); err != nil {
@@ -241,7 +267,6 @@ func (w *Writer) openGeneration(gen string, h *wire.ArchiveHeader) (err error) {
 
 	// blobs: torn tails decided by the manifest's references
 	w.writers = make([]*blob.Writer, h.BlobCount)
-	w.ordAlloc = make([]*alloc.Allocator, h.BlobCount)
 	truncated := make([]bool, h.BlobCount)
 	var maxGroup uint32
 	var groupRef func(uint32) bool
@@ -261,11 +286,6 @@ func (w *Writer) openGeneration(gen string, h *wire.ArchiveHeader) (err error) {
 		err error
 	}
 	opens := make([]blobOpen, h.BlobCount)
-	for b := 0; b < int(h.BlobCount); b++ {
-		if w.ordAlloc[b], err = per(wire.AllocFrameOrdinal, uint8(b)); err != nil {
-			return err
-		}
-	}
 	var cps []blob.Checkpoint
 	if !opt.VerifyAll {
 		cps = readCheckpoints(fsys, gen, h)
@@ -282,7 +302,7 @@ func (w *Writer) openGeneration(gen string, h *wire.ArchiveHeader) (err error) {
 			if cps != nil {
 				committed.Verified = cps[b]
 			}
-			bw, br, err := blob.OpenWriter(fsys, path.Join(gen, name), h, opt.Pool, committed)
+			bw, br, err := blob.OpenWriterKeyed(fsys, path.Join(gen, name), h, opt.Pool, committed, w.keys, uint8(b))
 			opens[b] = blobOpen{bw, br, err}
 		}()
 	}
@@ -300,6 +320,13 @@ func (w *Writer) openGeneration(gen string, h *wire.ArchiveHeader) (err error) {
 		case o.err != nil:
 			if openErr == nil {
 				openErr = fmt.Errorf("blob %02X: %w", b, o.err)
+			}
+		case h.Encrypted() && o.err == nil && w.ordAlloc[b].Check(o.br.MaxNonceOrdinal, o.br.HasNonce) != nil:
+			// §2.1.3.1: a stored nonce of this namespace at or above
+			// reserved_through means the allocator was rolled back
+			o.bw.Close()
+			if openErr == nil {
+				openErr = fmt.Errorf("blob %02X: %w", b, w.ordAlloc[b].Check(o.br.MaxNonceOrdinal, o.br.HasNonce))
 			}
 		default:
 			w.health.Checkpointed += o.br.Checkpointed
@@ -366,7 +393,7 @@ func (w *Writer) groupCensus(st *manifest.State) (referenced map[uint32]bool, in
 	for b := 0; b < int(w.h.BlobCount); b++ {
 		refs := st.BlobCommitted(uint8(b), nil).Refs
 		name, _ := blob.Name(uint8(b))
-		r, err := blob.Open(w.fsys, path.Join(w.gen, name), w.h, w.pool)
+		r, err := blob.OpenKeyed(w.fsys, path.Join(w.gen, name), w.h, w.pool, w.keys)
 		if errors.Is(err, fs.ErrNotExist) {
 			continue // lost blob: OpenWriter decides
 		}
@@ -427,6 +454,9 @@ func (w *Writer) Health() Health {
 func (w *Writer) maxExtent(p string) int {
 	pt := 4 + 2 + len(p) + 24 + 4 // entry list + outer CRC
 	n := int(w.h.MaxFrameSize()) - wire.FrameOverhead - pt
+	if w.h.Encrypted() {
+		n -= 2 * wire.AEADOverhead // payload and Pre-Trailer (§6.4.3, §15.3)
+	}
 	if w.code != nil {
 		n -= wire.MinParityPadding // §7.2
 	}

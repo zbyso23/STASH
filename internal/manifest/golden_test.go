@@ -165,7 +165,7 @@ func TestEncryptedFormSelection(t *testing.T) {
 	if _, err := DecodeLine(plain, true); !errors.Is(err, wire.ErrCorrupt) {
 		t.Fatalf("plaintext record in encrypted archive: %v", err)
 	}
-	if _, err := DecodeLine([]byte(`{"seq":"1","op":"DEL_ENC","enc":"x"}`), true); !errors.Is(err, wire.ErrUnsupported) {
+	if _, err := DecodeLine([]byte(`{"seq":"1","op":"DEL_ENC","enc":"x"}`), true); !errors.Is(err, wire.ErrInvalid) {
 		t.Fatal(err)
 	}
 	if _, err := DecodeLine([]byte(`{"seq":"1","op":"RENAME"}`), false); !errors.Is(err, wire.ErrUnsupported) {

@@ -13,6 +13,7 @@ import (
 	"os"
 	"path"
 	"slices"
+	"sync"
 
 	"stash/internal/anchor"
 	"stash/internal/bufpool"
@@ -156,7 +157,7 @@ func checkPolicy(fsys vfs.FS, a anchor.Anchor) error {
 // missing or older local root is reconstructed after the anchored
 // generation verifies completely (§2.1.2.1); a reader only checks that it
 // could be and reads the anchored generation.
-func resolveHardened(ctx context.Context, fsys vfs.FS, a anchor.Anchor, pool *bufpool.Pool, repair bool) (wire.Root, anchor.State, error) {
+func resolveHardened(ctx context.Context, fsys vfs.FS, a anchor.Anchor, pool *bufpool.Pool, repair bool, dek []byte) (wire.Root, anchor.State, error) {
 	id, err := archiveIDOf(fsys)
 	if err != nil {
 		return wire.Root{}, anchor.State{}, err
@@ -195,7 +196,7 @@ func resolveHardened(ctx context.Context, fsys vfs.FS, a anchor.Anchor, pool *bu
 	if anchor.RootDigest(rb) != st.RootDigest {
 		return want, st, fmt.Errorf("%w: rebuilt root bytes do not match the anchored root_digest", ErrRollback)
 	}
-	if err := verifyAnchored(ctx, fsys, pool, want, st); err != nil {
+	if err := verifyAnchored(ctx, fsys, pool, want, st, dek); err != nil {
 		return want, st, fmt.Errorf("%w: anchored generation %d is missing or does not verify: %v", ErrRollback, st.GenerationID, err)
 	}
 	if repair {
@@ -223,11 +224,11 @@ func checkManifestPrefix(fsys vfs.FS, gen string, st anchor.State) error {
 }
 
 // verifyAnchored verifies a generation completely against the anchor.
-func verifyAnchored(ctx context.Context, fsys vfs.FS, pool *bufpool.Pool, root wire.Root, st anchor.State) error {
+func verifyAnchored(ctx context.Context, fsys vfs.FS, pool *bufpool.Pool, root wire.Root, st anchor.State, dek []byte) error {
 	if err := checkManifestPrefix(fsys, GenDir(root.GenerationID), st); err != nil {
 		return err
 	}
-	r, err := openReaderAt(fsys, pool, root, int64(st.ManifestLength), true)
+	r, err := openReaderAt(fsys, pool, root, int64(st.ManifestLength), true, dek)
 	if err != nil {
 		return err
 	}
@@ -251,6 +252,10 @@ type hardenedState struct {
 	// failed poisons the writer after an anchor error: the commit's state
 	// is unknown, so nothing more is reported durable until a reopen.
 	failed error
+	// mu serializes anchor advances (commits, reservations, switch); resv
+	// holds the bound reservations of an encrypted archive (§2.1.3.5).
+	mu   sync.Mutex
+	resv map[[2]uint8]uint64
 }
 
 // prepareManifest checks the anchored prefix and handles unanchored bytes
@@ -289,6 +294,8 @@ func (w *Writer) prepareManifest(gen string, adopt bool) error {
 // and advances the anchor to them (§10.4.1 commit advance).
 func (w *Writer) advanceCommit(ctx context.Context) error {
 	hs := &w.hard
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
 	if hs.failed != nil {
 		return hs.failed
 	}
@@ -325,6 +332,13 @@ func (w *Writer) advanceCommit(ctx context.Context) error {
 // id whose manifest is complete and durable.
 func (w *Writer) advanceSwitch(ctx context.Context, d *Writer, id uint64) error {
 	hs := &w.hard
+	var resv []anchor.Reservation
+	if w.h.Encrypted() {
+		// §2.1.3.5: the destination's kind 2-4 values and kind 0
+		resv = d.reservations()
+	}
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
 	if hs.failed != nil {
 		return hs.failed
 	}
@@ -334,7 +348,7 @@ func (w *Writer) advanceSwitch(ctx context.Context, d *Writer, id uint64) error 
 		return err
 	}
 	next := anchor.State{ArchiveID: w.h.ArchiveID, GenerationID: id, RootDigest: anchor.RootDigest(rootBytes(id, w.h.ArchiveID)),
-		ManifestLength: uint64(end), ManifestDigest: sum(h)}
+		ManifestLength: uint64(end), ManifestDigest: sum(h), Reservations: resv}
 	if err := hs.anchor.Advance(ctx, hs.anchored, next); err != nil {
 		hs.failed = fmt.Errorf("%w: switch advance: %v (reopen required)", ErrAnchorUnavailable, err)
 		return hs.failed
@@ -351,6 +365,8 @@ type EnrollOptions struct {
 	Log func(string)
 	// Operator identifies who enrolls.
 	Operator string
+	// Key is the DEK of an encrypted archive.
+	Key []byte
 }
 
 // Enroll switches an existing STANDARD archive to HARDENED (§2.1.2.1):
@@ -361,7 +377,7 @@ func Enroll(ctx context.Context, fsys vfs.FS, a anchor.Anchor, opt EnrollOptions
 	if opt.Log == nil || opt.Operator == "" {
 		return anchor.State{}, fmt.Errorf("%w: enrollment needs an operator and a log", wire.ErrInvalid)
 	}
-	w, err := OpenWriter(fsys, Options{Pool: opt.Pool, VerifyAll: true})
+	w, err := OpenWriter(fsys, Options{Pool: opt.Pool, VerifyAll: true, Key: opt.Key})
 	if err != nil {
 		return anchor.State{}, err
 	}
@@ -386,6 +402,9 @@ func Enroll(ctx context.Context, fsys vfs.FS, a anchor.Anchor, opt EnrollOptions
 	}
 	st := anchor.State{ArchiveID: w.h.ArchiveID, GenerationID: w.h.GenerationID, RootDigest: anchor.RootDigest(rb),
 		ManifestLength: uint64(end), ManifestDigest: sum(h)}
+	if w.h.Encrypted() {
+		st.Reservations = w.reservations() // §2.1.3.5
+	}
 	if err := a.Create(ctx, st); err != nil {
 		return st, err
 	}
@@ -422,7 +441,7 @@ func LeaveHardened(fsys vfs.FS, operator string, log func(string)) error {
 // root.current naming a generation beyond the anchor: the local generation
 // is verified completely and the anchor advanced to it. Only an operator
 // who knows why the anchor lags may run it.
-func AuthorizeAnchorTransition(ctx context.Context, fsys vfs.FS, a anchor.Anchor, operator string, log func(string)) error {
+func AuthorizeAnchorTransition(ctx context.Context, fsys vfs.FS, a anchor.Anchor, operator string, log func(string), dek []byte) error {
 	if log == nil || operator == "" {
 		return fmt.Errorf("%w: needs an operator and a log", wire.ErrInvalid)
 	}
@@ -454,7 +473,14 @@ func AuthorizeAnchorTransition(ctx context.Context, fsys vfs.FS, a anchor.Anchor
 	}
 	next := anchor.State{ArchiveID: root.ArchiveID, GenerationID: root.GenerationID,
 		RootDigest: anchor.RootDigest(rootBytes(root.GenerationID, root.ArchiveID)), ManifestLength: uint64(size), ManifestDigest: sum(mh)}
-	if err := verifyAnchored(ctx, fsys, nil, root, next); err != nil {
+	if h, err := readHeader(fsys, gen, root); err != nil {
+		return err
+	} else if h.Encrypted() {
+		if next.Reservations, err = currentReservations(fsys, h); err != nil {
+			return err
+		}
+	}
+	if err := verifyAnchored(ctx, fsys, nil, root, next, dek); err != nil {
 		return fmt.Errorf("%w: local generation %d does not verify: %v", ErrRollback, root.GenerationID, err)
 	}
 	if err := a.Advance(ctx, prev, next); err != nil {

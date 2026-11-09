@@ -127,7 +127,7 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 	if err := createGeneration(w.fsys, &dh); err != nil {
 		return res, err
 	}
-	d := &Writer{fsys: w.fsys, opt: w.opt, busy: map[string]bool{}, genAlloc: w.genAlloc, verAlloc: w.verAlloc,
+	d := &Writer{fsys: w.fsys, opt: w.opt, busy: map[string]bool{}, genAlloc: w.genAlloc, verAlloc: w.verAlloc, keys: w.keys,
 		health: Health{Sealed: map[uint8]error{}, TornBlobBytes: map[uint8]int64{}}}
 	switched := false
 	defer func() {
@@ -247,6 +247,12 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 	w.retired = append(w.retired, old)
 	w.retiredMu.Unlock()
 	old.retire()
+	if w.hard.anchor != nil && w.h.Encrypted() {
+		// the adopted allocators are bound from now on (§2.1.3.5)
+		if err := w.hookReservations(ctx); err != nil {
+			return res, err
+		}
+	}
 
 	// GC (§13): old generations nothing pins any more
 	if !opt.KeepOld {
@@ -510,6 +516,9 @@ func (c *compactor) single(m *hopMember) error {
 		c.count(func(r *CompactResult) { r.CopiedFrames++ })
 		return nil
 	}
+	if err := ref.Decode(); err != nil {
+		return fmt.Errorf("repack: %w", err)
+	}
 	return c.addRepack(live, ref.Payload)
 }
 
@@ -610,13 +619,25 @@ func (c *compactor) group(g uint32, ms []*hopMember) error {
 			}
 			t := &refs[i].Trailer
 			if t.BlockType == wire.BlockData || full[i] {
-				s := &frame.Spec{BlockType: t.BlockType, Codec: t.CodecID, Payload: append([]byte(nil), refs[i].Payload...),
+				// a regrouped member is rewritten: new group fields are
+				// AAD-covered, so it is sealed again with a fresh nonce
+				// (§13.7.1, §15.7); the compressed bytes are kept
+				plain, err := refs[i].Plain()
+				if err != nil {
+					return fmt.Errorf("regroup: %w", err)
+				}
+				s := &frame.Spec{BlockType: t.BlockType, Codec: t.CodecID, Payload: append([]byte(nil), plain...),
 					Entries: append([]wire.Entry(nil), refs[i].Entries...)}
 				if err := c.addRegroup(s, q); err != nil {
 					return err
 				}
-			} else if err := c.addRepack(live[i], refs[i].Payload); err != nil {
-				return err
+			} else {
+				if err := refs[i].Decode(); err != nil {
+					return fmt.Errorf("repack: %w", err)
+				}
+				if err := c.addRepack(live[i], refs[i].Payload); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
@@ -739,7 +760,7 @@ func (c *compactor) rebuildMissing(g uint32, refs []*blob.Ref, rebuilt []bool, k
 			c.src.pool.Put(buf)
 			continue
 		}
-		ref, err := blob.NewRef(fr, c.src.h, c.src.pool)
+		ref, err := blob.NewRef(fr, c.src.h, c.src.pool, c.src.k)
 		if err != nil {
 			c.src.pool.Put(buf)
 			continue

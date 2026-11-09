@@ -35,6 +35,8 @@ type Journal struct {
 	nextSeq  func() (uint64, error)
 	poisoned error
 	buf      []byte
+	crypto   *Crypto  // encrypted archive: envelopes (§15.8)
+	prev     [32]byte // chain value for the next line
 }
 
 // OpenResult reports what OpenJournal found and did.
@@ -50,8 +52,9 @@ type OpenResult struct {
 // every open transaction (cold start, §10.3.1).
 func OpenJournal(fsys vfs.FS, genDir string, h *wire.ArchiveHeader, opt LoadOptions) (*Journal, *State, OpenResult, error) {
 	var res OpenResult
-	if h.Encrypted() {
-		return nil, nil, res, &wire.Error{Struct: "Manifest", Class: wire.ErrUnsupported, Detail: "encrypted manifest writer needs the encryption layer"}
+	if h.Encrypted() && opt.SeqSource == nil {
+		// seq enters the manifest nonce: it must come from manifest.alloc
+		return nil, nil, res, &wire.Error{Struct: "Manifest", Class: wire.ErrInvalid, Detail: "encrypted manifest writer needs a seq allocator"}
 	}
 	name := path.Join(genDir, ManifestName)
 	if _, err := fsys.Stat(name); errors.Is(err, fs.ErrNotExist) {
@@ -95,6 +98,9 @@ func OpenJournal(fsys vfs.FS, genDir string, h *wire.ArchiveHeader, opt LoadOpti
 		}
 	}
 	j := &Journal{f: f, h: h, st: st, end: info.ValidEnd, busy: map[string]TxID{}, nextSeq: opt.SeqSource}
+	if h.Encrypted() {
+		j.crypto, j.prev = opt.Crypto, info.Prev
+	}
 	if open := st.OpenTransactions(); len(open) > 0 {
 		for _, id := range open {
 			if err := j.appendLocked(&Record{Op: OpAddAbort, TxID: id}); err != nil {
@@ -133,7 +139,13 @@ func (j *Journal) appendLocked(r *Record) error {
 	} else {
 		r.Seq = j.st.LastSeq() + 1
 	}
-	b, err := AppendLine(j.buf[:0], r)
+	var b []byte
+	var err error
+	if j.crypto != nil {
+		b, err = AppendEnvelope(j.buf[:0], r, j.crypto, j.prev)
+	} else {
+		b, err = AppendLine(j.buf[:0], r)
+	}
 	if err != nil {
 		return err
 	}
@@ -146,7 +158,30 @@ func (j *Journal) appendLocked(r *Record) error {
 		return err
 	}
 	j.end += int64(len(b))
+	if j.crypto != nil {
+		j.prev = LineHash(b[:len(b)-1])
+	}
 	return nil
+}
+
+// fits reports whether r becomes one line for the widest seq.
+func (j *Journal) fits(r *Record) bool {
+	w := *r
+	w.Seq = ^uint64(0)
+	if j.crypto == nil {
+		_, err := AppendLine(nil, &w)
+		return err == nil
+	}
+	plain, err := AppendPlain(nil, &w, [32]byte{})
+	return err == nil && EnvelopeLen(w.Op, len(plain)) <= MaxLineBytes
+}
+
+// extentsPerLine is how many loc tuples one ADD_EXTENT line holds.
+func (j *Journal) extentsPerLine(rest []Loc) int {
+	if j.crypto == nil {
+		return min(len(rest), maxExtentsPerLine)
+	}
+	return min(len(rest), maxEncExtentsPerLine)
 }
 
 // Sync makes every appended record durable (§10.4: blobs referenced by the
@@ -183,7 +218,7 @@ func (j *Journal) Add(p string, fileVer uint64, loc []Loc) error {
 	}
 	r := &Record{Op: OpAdd, Path: p, FileVer: fileVer, Loc: loc}
 	// Measure with the widest seq so the line also fits once seq is set.
-	if _, err := AppendLine(nil, &Record{Op: OpAdd, Seq: ^uint64(0), Path: p, FileVer: fileVer, Loc: loc}); err == nil {
+	if j.fits(r) {
 		return j.appendLocked(r)
 	}
 	t, err := j.beginLocked(p, fileVer)
@@ -191,7 +226,7 @@ func (j *Journal) Add(p string, fileVer uint64, loc []Loc) error {
 		return err
 	}
 	for rest := loc; len(rest) > 0; {
-		n := extentsPerLine(rest)
+		n := j.extentsPerLine(rest)
 		if err := j.extentLocked(t, rest[:n]); err != nil {
 			j.abortLocked(t)
 			return err
@@ -208,7 +243,9 @@ const (
 	maxExtentsPerLine = (MaxLineBytes - extentHeaderBytes) / maxLocBytes
 )
 
-func extentsPerLine(rest []Loc) int { return min(len(rest), maxExtentsPerLine) }
+// maxEncExtentsPerLine bounds an encrypted ADD_EXTENT: its plaintext
+// (without seq/op, with prev) must stay within MaxEnvelopePlain.
+var maxEncExtentsPerLine = (MaxEnvelopePlain - extentHeaderBytes - len(`,"prev":""`) - 64) / maxLocBytes
 
 // Del commits removal of the current version fileVer of path.
 func (j *Journal) Del(p string, fileVer uint64) error {
@@ -267,7 +304,7 @@ func (t *Tx) Extent(loc []Loc) error {
 	t.j.mu.Lock()
 	defer t.j.mu.Unlock()
 	for rest := loc; len(rest) > 0; {
-		n := extentsPerLine(rest)
+		n := t.j.extentsPerLine(rest)
 		if err := t.j.extentLocked(t, rest[:n]); err != nil {
 			return err
 		}

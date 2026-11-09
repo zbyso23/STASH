@@ -290,7 +290,7 @@ func (v *view) rebuildFrom(d *frameDir, g uint32, key blob.FrameKey, accept func
 			v.pool.Put(buf)
 			continue
 		}
-		ref, err := blob.NewRef(fr, v.h, v.pool)
+		ref, err := blob.NewRef(fr, v.h, v.pool, v.k)
 		if err != nil {
 			v.pool.Put(buf)
 			continue

@@ -70,7 +70,7 @@ func (r *Reader) Resync(budget int64) (ResyncResult, error) {
 	damagedFrom := int64(-1) // first offset of the probing phase
 	// normal scan (§11.2): never probes inside a validated frame
 	for off < size {
-		fr, fsz, err := parseAt(w, r.h, off)
+		fr, fsz, err := parseAt(w, r.h, r.k, off)
 		if err != nil {
 			if !wire.IsFormatError(err) && err != io.ErrUnexpectedEOF {
 				return res, err
@@ -87,7 +87,7 @@ func (r *Reader) Resync(budget int64) (ResyncResult, error) {
 	var tailBuf []byte
 	for off = damagedFrom + step; off+wire.FramePrefixSize <= size; off += step {
 		// cheap checks first: Prefix and bounds, then tail and outer CRC
-		hf, ok, err := tailAt(r.f, r.h, off, size, &tailBuf)
+		hf, ok, err := tailAt(r.f, r.h, r.k, off, size, &tailBuf)
 		if err != nil {
 			return res, err
 		}
@@ -108,7 +108,7 @@ func (r *Reader) Resync(budget int64) (ResyncResult, error) {
 			}
 			return res, err
 		}
-		fr, err := frame.Parse(b, r.h)
+		fr, err := frame.ParseKeyed(b, r.h, r.k)
 		if err != nil {
 			continue // hash_payload or deeper check failed
 		}

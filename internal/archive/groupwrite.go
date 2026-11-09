@@ -142,14 +142,14 @@ func (w *Writer) memberQuanta(p string, n int) (uint32, error) {
 	if w.h.Mode == wire.ModeFixed {
 		return w.h.MaxFrameQuanta, nil
 	}
-	pt := uint64(4 + 1 + len(p) + 24 + 4) // count, path_len, path, offset/length/file_ver, CRC
+	pt := uint64(4 + 1 + len(p) + 24) // count, path_len, path, offset/length/file_ver
 	if len(p) >= 128 {
 		pt++
 	}
 	if len(p) >= 1<<14 {
 		pt++
 	}
-	return frame.RequiredQuanta(uint64(n), pt, true)
+	return frame.RequiredQuanta(frame.StoredLen(w.h, wire.BlockData, uint64(n)), frame.PreTrailerLen(w.h, wire.BlockData, pt), true)
 }
 
 // placement returns the blob of every member of a group of n frames:
@@ -185,9 +185,37 @@ func (w *Writer) writeGroup(p string, ver uint64, members []pending, q uint32) (
 		}
 	}()
 	specs := make([]*frame.Spec, len(members))
+	rels := make([]func(), len(members))
+	defer func() {
+		for _, r := range rels {
+			if r != nil {
+				r()
+			}
+		}
+	}()
+	// compress in parallel; the group's frame size is its largest member
+	// after compression (§7.1 equal geometry)
+	var wg sync.WaitGroup
 	for i, e := range members {
-		specs[i] = &frame.Spec{BlockType: wire.BlockData, Codec: wire.CodecStore, Payload: e.payload,
-			Entries: []wire.Entry{{Path: p, Offset: uint64(e.off), Length: uint64(len(e.payload)), FileVer: ver}}}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c, stored, rel := w.encode(e.payload)
+			rels[i] = rel
+			specs[i] = &frame.Spec{BlockType: wire.BlockData, Codec: c, Payload: stored,
+				Entries: []wire.Entry{{Path: p, Offset: uint64(e.off), Length: uint64(len(e.payload)), FileVer: ver}}}
+		}()
+	}
+	wg.Wait()
+	if w.h.CodecID != wire.CodecStore {
+		q = 0
+		for _, s := range specs {
+			sq, err := w.memberQuanta(p, len(s.Payload))
+			if err != nil {
+				return nil, nil, err
+			}
+			q = max(q, sq)
+		}
 	}
 	placed, touched, err := w.writeGroupFrames(specs, q)
 	if err != nil {
@@ -257,6 +285,7 @@ func (w *Writer) writeGroupFrames(specs []*frame.Spec, q uint32) ([]placedFrame,
 			return
 		}
 		s.FrameOrdinal = ord
+		w.writers[b].Seal(s)
 		fr, err := frame.AppendFrame(get(fsz)[:0], w.h, s)
 		if err != nil {
 			errs[i] = err

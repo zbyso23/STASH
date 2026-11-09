@@ -19,6 +19,7 @@ import (
 	"stash/internal/frame"
 	"stash/internal/manifest"
 	"stash/internal/parity"
+	"stash/internal/seal"
 	"stash/internal/vfs"
 	"stash/internal/wire"
 )
@@ -35,6 +36,10 @@ type Options struct {
 	Budget int64
 	// NoManifest ignores the manifest entirely.
 	NoManifest bool
+	// Key is the DEK of an encrypted archive. Without it recovery is
+	// keyless (§15.10): frames are validated structurally, DATA extents
+	// are grouped by their opaque object_id, nothing can be extracted.
+	Key []byte
 }
 
 // Source tells where an extent's frame came from.
@@ -71,7 +76,11 @@ type Extent struct {
 type Version struct {
 	Path    string
 	FileVer uint64
-	Packed  bool
+	// Opaque: a keyless recovery of an encrypted archive grouped these
+	// extents by ObjectID; Path and FileVer are unknown (§6.5, §15.10).
+	Opaque   bool
+	ObjectID [16]byte
+	Packed   bool
 	// End is the end of the last extent found.
 	End     uint64
 	Extents []Extent // by offset
@@ -145,7 +154,11 @@ type Report struct {
 	Blobs         []BlobReport
 	Groups        GroupReport
 	Manifest      ManifestReport
-	Versions      []*Version // by path, then file_ver
+	Versions      []*Version // by path, then file_ver (opaque ones first)
+	// Keyless is set for an encrypted archive scanned without the DEK;
+	// OpaquePacked counts PACKED frames whose objects stay unknown.
+	Keyless      bool
+	OpaquePacked int
 }
 
 // frameRec is a frame found intact or rebuilt.
@@ -164,6 +177,8 @@ type Recovery struct {
 	Report
 	fsys    vfs.FS
 	h       *wire.ArchiveHeader
+	k       *seal.Keys
+	key     []byte
 	pool    *bufpool.Pool
 	readers []*blob.Reader
 	groups  map[uint32][]*frameRec
@@ -188,11 +203,13 @@ func Scan(fsys vfs.FS, opt Options) (*Recovery, error) {
 	if err != nil {
 		return nil, fmt.Errorf("archive header of %s: %w", genDir, err)
 	}
-	if h.Encrypted() {
-		return nil, fmt.Errorf("%w: encrypted recovery needs a later milestone", wire.ErrUnsupported)
+	k, err := archive.RecoveryKeys(fsys, h, opt.Key)
+	if err != nil {
+		return nil, err
 	}
 	rep.Header, rep.Generation = h, gen
-	rc := &Recovery{fsys: fsys, h: h, pool: opt.Pool, readers: make([]*blob.Reader, h.BlobCount), groups: map[uint32][]*frameRec{}}
+	rep.Keyless = h.Encrypted() && k == nil
+	rc := &Recovery{fsys: fsys, h: h, k: k, key: opt.Key, pool: opt.Pool, readers: make([]*blob.Reader, h.BlobCount), groups: map[uint32][]*frameRec{}}
 	rep.Blobs = make([]BlobReport, h.BlobCount)
 	results := make([]blob.ResyncResult, h.BlobCount)
 	errs := make([]error, h.BlobCount)
@@ -200,7 +217,7 @@ func Scan(fsys vfs.FS, opt Options) (*Recovery, error) {
 	for b := range rc.readers {
 		rep.Blobs[b].Ordinal = uint8(b)
 		name, _ := blob.Name(uint8(b))
-		r, err := blob.Open(fsys, path.Join(genDir, name), h, opt.Pool)
+		r, err := blob.OpenKeyed(fsys, path.Join(genDir, name), h, opt.Pool, k)
 		if err != nil {
 			rep.Blobs[b].Err = err
 			continue
@@ -233,7 +250,7 @@ func Scan(fsys vfs.FS, opt Options) (*Recovery, error) {
 	rc.Report = rep
 	frames = append(frames, rc.rebuildGroups(frames)...)
 	committed, current := rc.readManifest(genDir, opt)
-	rc.Versions = assemble(frames, committed, current)
+	rc.Versions, rc.OpaquePacked = assemble(frames, committed, current, rep.Keyless)
 	return rc, nil
 }
 
@@ -332,7 +349,7 @@ func (rc *Recovery) rebuildGroups(frames []*frameRec) []*frameRec {
 			cand = cand || f.candidate
 		}
 		for i, buf := range rebuilt {
-			fr, err := frame.Parse(buf, rc.h)
+			fr, err := frame.ParseKeyed(buf, rc.h, rc.k)
 			if err != nil {
 				continue
 			}
@@ -416,6 +433,7 @@ func (rc *Recovery) rebuild(g uint32) (map[uint8][]byte, error) {
 type verKey struct {
 	path string
 	ver  uint64
+	oid  [16]byte // keyless encrypted recovery only
 }
 
 // readManifest collects the versions that surviving records reference and
@@ -425,12 +443,20 @@ func (rc *Recovery) readManifest(genDir string, opt Options) (map[verKey]uint64,
 	if opt.NoManifest {
 		return committed, nil
 	}
+	if rc.h.Encrypted() && rc.k == nil {
+		rc.Manifest.Err = archive.ErrKeyRequired
+		return committed, nil
+	}
 	type txInfo struct {
 		k   verKey
 		len uint64
 	}
 	txs := map[manifest.TxID]*txInfo{}
-	st, _, err := manifest.LoadWith(rc.fsys, genDir, rc.h, manifest.LoadOptions{}, func(r *manifest.Record, _ int) {
+	var crypto *manifest.Crypto
+	if rc.k != nil {
+		crypto = &manifest.Crypto{Keys: rc.k, GenerationID: rc.h.GenerationID}
+	}
+	st, _, err := manifest.LoadWith(rc.fsys, genDir, rc.h, manifest.LoadOptions{Crypto: crypto}, func(r *manifest.Record, _ int) {
 		rc.Manifest.Records++
 		switch r.Op {
 		case manifest.OpAdd:
@@ -438,9 +464,9 @@ func (rc *Recovery) readManifest(genDir string, opt Options) (map[verKey]uint64,
 			for _, l := range r.Loc {
 				n += l.Length
 			}
-			committed[verKey{r.Path, r.FileVer}] = n
+			committed[verKey{path: r.Path, ver: r.FileVer}] = n
 		case manifest.OpAddBegin:
-			txs[r.TxID] = &txInfo{k: verKey{r.Path, r.FileVer}}
+			txs[r.TxID] = &txInfo{k: verKey{path: r.Path, ver: r.FileVer}}
 		case manifest.OpAddExtent:
 			if t := txs[r.TxID]; t != nil {
 				for _, l := range r.Loc {
@@ -461,23 +487,46 @@ func (rc *Recovery) readManifest(genDir string, opt Options) (map[verKey]uint64,
 	current := map[verKey]bool{}
 	for _, p := range st.Paths() {
 		v, _ := st.Lookup(p)
-		current[verKey{p, v.FileVer}] = true
+		current[verKey{path: p, ver: v.FileVer}] = true
 	}
 	return committed, current
 }
 
 // assemble builds versions from frame entries (§11.4, §11.5).
-func assemble(frames []*frameRec, committed map[verKey]uint64, current map[verKey]bool) []*Version {
+func assemble(frames []*frameRec, committed map[verKey]uint64, current map[verKey]bool, keyless bool) ([]*Version, int) {
 	vs := map[verKey]*Version{}
 	get := func(k verKey) *Version {
 		v := vs[k]
 		if v == nil {
-			v = &Version{Path: k.path, FileVer: k.ver}
+			v = &Version{Path: k.path, FileVer: k.ver, ObjectID: k.oid}
 			vs[k] = v
 		}
 		return v
 	}
+	opaquePacked := 0
 	for _, f := range frames {
+		if keyless && f.t.BlockType == wire.BlockPacked {
+			opaquePacked++
+			continue
+		}
+		if keyless && f.t.BlockType == wire.BlockData {
+			// the object_id is an opaque grouping key without the key
+			v := get(verKey{oid: f.t.ObjectID})
+			v.Opaque = true
+			if f.conflict {
+				v.Conflict = true
+				continue
+			}
+			src := Scanned
+			switch {
+			case f.off < 0:
+				src = Rebuilt
+			case f.candidate:
+				src = Resynced
+			}
+			v.Extents = append(v.Extents, Extent{Offset: f.t.LogicalOffset, Length: f.t.LogicalLength, Source: src, Blob: f.blob, FrameOffset: f.off, fr: f})
+			continue
+		}
 		src := Scanned
 		switch {
 		case f.off < 0:
@@ -486,7 +535,7 @@ func assemble(frames []*frameRec, committed map[verKey]uint64, current map[verKe
 			src = Resynced
 		}
 		for _, e := range f.entries {
-			v := get(verKey{e.Path, e.FileVer})
+			v := get(verKey{path: e.Path, ver: e.FileVer})
 			if f.conflict {
 				v.Conflict = true
 				continue
@@ -520,9 +569,12 @@ func assemble(frames []*frameRec, committed map[verKey]uint64, current map[verKe
 		if c := strings.Compare(out[i].Path, out[j].Path); c != 0 {
 			return c < 0
 		}
-		return out[i].FileVer < out[j].FileVer
+		if out[i].FileVer != out[j].FileVer {
+			return out[i].FileVer < out[j].FileVer
+		}
+		return string(out[i].ObjectID[:]) < string(out[j].ObjectID[:])
 	})
-	return out
+	return out, opaquePacked
 }
 
 // finish sorts extents, drops duplicates (preferring scanned over resynced

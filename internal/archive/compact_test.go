@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 
+	"stash/internal/blob"
 	"stash/internal/vfs"
 	"stash/internal/wire"
 )
@@ -95,6 +96,7 @@ func TestCompact(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			partly := hasPartlyDeadPacked(w, want)
 			res, err := w.Compact(ctx, CompactOptions{})
 			if err != nil {
 				t.Fatal(err)
@@ -103,7 +105,7 @@ func TestCompact(t *testing.T) {
 			if res.From != 0 || res.To == 0 || res.Versions != len(want) || res.DestBytes >= res.SourceBytes {
 				t.Fatalf("%+v", res)
 			}
-			if res.RepackedObjects == 0 {
+			if partly && res.RepackedObjects == 0 {
 				t.Fatal("partly dead PACKED frames were not repacked")
 			}
 			checkWriter(t, w, want)
@@ -436,4 +438,29 @@ func TestCompactRegroup(t *testing.T) {
 	if rep, err := w.Verify(context.Background()); err != nil || !rep.OK() {
 		t.Fatalf("%v %+v", err, rep.Groups)
 	}
+}
+
+// hasPartlyDeadPacked reports whether a PACKED frame holds live and dead
+// objects (how the group commit batches small Puts depends on timing).
+func hasPartlyDeadPacked(w *Writer, want map[string][]byte) bool {
+	found := false
+	for _, bv := range w.blobs {
+		if bv == nil {
+			continue
+		}
+		bv.r.Hop(func(f blob.HopFrame) error {
+			if f.Trailer.BlockType != wire.BlockPacked {
+				return nil
+			}
+			live := 0
+			for _, e := range f.Entries {
+				if _, ok := want[e.Path]; ok {
+					live++
+				}
+			}
+			found = found || (live > 0 && live < len(f.Entries))
+			return nil
+		})
+	}
+	return found
 }
