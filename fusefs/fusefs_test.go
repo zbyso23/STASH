@@ -206,16 +206,12 @@ func TestMountTree(t *testing.T) {
 	}
 }
 
-// With Refresh the mount follows a writer; a file opened before keeps
-// reading its version, even across a compaction that replaces the
-// generation (the snapshot is pinned).
-func TestMountRefresh(t *testing.T) {
+// §18.2: a mount keeps one generation for its lifetime. Commits and a
+// compaction by a writer after the mount are not visible, and the pinned
+// generation stays readable; a new mount shows the new state.
+func TestMountKeepsSnapshot(t *testing.T) {
 	dir := create(t, stash.CreateOptions{}, stash.Options{}, map[string][]byte{"x": []byte("version one")})
-	s, mnt := mount(t, dir, Options{Refresh: time.Hour})
-	f, err := os.Open(filepath.Join(mnt, "x"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, mnt := mount(t, dir, Options{})
 	a, err := stash.Open(dir, stash.Options{})
 	if err != nil {
 		t.Fatal(err)
@@ -226,19 +222,17 @@ func TestMountRefresh(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.Close()
-	if err := s.Refresh(); err != nil {
-		t.Fatal(err)
-	}
-	b := make([]byte, 100)
-	n, _ := f.ReadAt(b, 0)
-	if string(b[:n]) != "version one" {
-		t.Fatalf("open file reads %q", b[:n])
-	}
-	f.Close()
-	time.Sleep(1100 * time.Millisecond) // entry/attr timeout of a refreshing mount
 	got := tree(t, mnt)
+	if string(got["x"]) != "version one" || got["y"] != nil {
+		t.Fatalf("mounted snapshot changed: %q %q", got["x"], got["y"])
+	}
+	_, mnt2 := mount(t, dir, Options{})
+	got = tree(t, mnt2)
 	if string(got["x"]) != "version two, longer" || string(got["y"]) != "new" {
-		t.Fatalf("after refresh %q %q", got["x"], got["y"])
+		t.Fatalf("new mount %q %q", got["x"], got["y"])
+	}
+	if _, err := Mount(dir, t.TempDir(), Options{Read: stash.ReadOptions{NoPin: true}}); !errors.Is(err, stash.ErrInvalid) {
+		t.Fatalf("unpinned mount: %v", err)
 	}
 }
 

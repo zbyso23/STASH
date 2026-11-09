@@ -4,7 +4,9 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io/fs"
 	"path"
 	"strconv"
 	"strings"
@@ -103,12 +105,17 @@ func (p *Pin) Release() error {
 
 // pinnedGenerations returns the generations with an unexpired pin. A pin
 // file that does not decode counts as a pin that never expires: GC must not
-// delete what it cannot rule out.
+// delete what it cannot rule out. Only a missing pin directory or a pin
+// removed meanwhile means "no pin"; any other error reading them stops GC
+// (§13.1.1: when in doubt, keep the old generation).
 func pinnedGenerations(fsys vfs.FS, now time.Time) (map[uint64]bool, error) {
 	out := map[uint64]bool{}
 	ents, err := fsys.ReadDir(PinDir)
-	if err != nil {
+	if errors.Is(err, fs.ErrNotExist) {
 		return out, nil // no pins
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reading reader pins: %w (GC stopped)", err)
 	}
 	for _, e := range ents {
 		n := e.Name()
@@ -120,8 +127,11 @@ func pinnedGenerations(fsys vfs.FS, now time.Time) (map[uint64]bool, error) {
 			continue
 		}
 		b, err := vfs.ReadFile(fsys, path.Join(PinDir, n), 64)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue // released meanwhile
+		}
 		if err != nil {
-			continue // removed meanwhile
+			return nil, fmt.Errorf("reading reader pin %s: %w (GC stopped)", n, err)
 		}
 		if len(b) == 20 && [8]byte(b[:8]) == pinMagic && binary.LittleEndian.Uint32(b[16:]) == wire.CRC32C(b[:16]) &&
 			int64(binary.LittleEndian.Uint64(b[8:])) < now.UnixNano() {

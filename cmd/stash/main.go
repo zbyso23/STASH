@@ -72,7 +72,7 @@ func init() {
 		{name: "gc", args: "<archive>", help: "remove unused old generations", minArgs: 1, maxArgs: 1, run: cmdGC},
 		{name: "recover", args: "<archive>", help: "raw recovery scan from the blob files (read-only; exit 3 on damage)", minArgs: 1, maxArgs: 1, run: cmdRecover, flags: recoverFlags},
 		{name: "salvage", args: "<archive> <new-archive>", help: "recover the current versions into a new archive", minArgs: 2, maxArgs: 2, run: cmdSalvage, flags: recoverFlags},
-		{name: "mount", args: "<archive> <mountpoint>", help: "mount the archive read-only (FUSE) until interrupted or unmounted", minArgs: 2, maxArgs: 2, run: cmdMount, flags: mountFlags},
+		{name: "mount", args: "<archive> <mountpoint>", help: "mount a read-only snapshot of the archive (FUSE) until interrupted or unmounted", minArgs: 2, maxArgs: 2, run: cmdMount, flags: mountFlags},
 		{name: "enroll", args: "<archive>", help: "make an archive HARDENED with -anchor (after full verification)", minArgs: 1, maxArgs: 1, run: cmdEnroll, flags: operatorFlags},
 		{name: "leave-hardened", args: "<archive>", help: "make a HARDENED archive STANDARD again", minArgs: 1, maxArgs: 1, run: cmdLeave, flags: operatorFlags},
 		{name: "authorize", args: "<archive>", help: "authorize a verified local state that leads the anchor", minArgs: 1, maxArgs: 1, run: cmdAuthorize, flags: operatorFlags},
@@ -85,6 +85,7 @@ var (
 	anchorDir  string
 	ackRollbak bool
 	adopt      bool
+	policyName string
 )
 
 func commonFlags(fl *flag.FlagSet) {
@@ -92,6 +93,25 @@ func commonFlags(fl *flag.FlagSet) {
 	fl.StringVar(&anchorDir, "anchor", "", "directory of the file Generation Anchor (HARDENED)")
 	fl.BoolVar(&ackRollbak, "acknowledge-allocator-rollback", false, "continue after a reviewed ErrAllocatorRollback (operator decision)")
 	fl.BoolVar(&adopt, "adopt-unanchored", false, "keep manifest records written after the last anchor advance (operator decision)")
+	fl.StringVar(&policyName, "policy", "", "expected security policy: standard or hardened (or $STASH_POLICY); with -anchor hardened is implied")
+}
+
+// policy is the expected security policy from the command line or
+// environment, never from the archive's storage (SPEC §15A.2).
+func policy() (stash.Policy, error) {
+	s := policyName
+	if s == "" {
+		s = os.Getenv("STASH_POLICY")
+	}
+	switch strings.ToLower(s) {
+	case "":
+		return stash.PolicyAuto, nil
+	case "standard":
+		return stash.PolicyStandard, nil
+	case "hardened":
+		return stash.PolicyHardened, nil
+	}
+	return 0, fmt.Errorf("%w: policy %q (standard or hardened)", stash.ErrInvalid, s)
 }
 
 func usage(w io.Writer) {
@@ -125,7 +145,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		usage(stderr)
 		return exitUsage
 	}
-	keyFile, anchorDir, ackRollbak, adopt = "", "", false, false
+	keyFile, anchorDir, ackRollbak, adopt, policyName = "", "", false, false, ""
 	fl := flag.NewFlagSet("stash "+c.name, flag.ContinueOnError)
 	fl.SetOutput(stderr)
 	fl.Usage = func() {
@@ -273,7 +293,11 @@ func openWriter(dir string, extra func(*stash.Options)) (*stash.Archive, error) 
 	if err != nil {
 		return nil, err
 	}
-	o := stash.Options{Key: key, Anchor: a, AcknowledgeAllocatorRollback: ackRollbak, AdoptUnanchored: adopt}
+	pol, err := policy()
+	if err != nil {
+		return nil, err
+	}
+	o := stash.Options{Key: key, Anchor: a, AcknowledgeAllocatorRollback: ackRollbak, AdoptUnanchored: adopt, Policy: pol}
 	if extra != nil {
 		extra(&o)
 	}
@@ -289,7 +313,11 @@ func openReader(dir string) (*stash.Reader, error) {
 	if err != nil {
 		return nil, err
 	}
-	return stash.OpenReadOnlyWith(dir, stash.ReadOptions{Key: key, Anchor: a})
+	pol, err := policy()
+	if err != nil {
+		return nil, err
+	}
+	return stash.OpenReadOnlyWith(dir, stash.ReadOptions{Key: key, Anchor: a, Policy: pol})
 }
 
 // ---- create / info
@@ -614,6 +642,11 @@ func cmdExport(e *env, _ *flag.FlagSet, args []string) error {
 		return err
 	}
 	defer r.Close()
+	root, err := openExportRoot(args[1])
+	if err != nil {
+		return err
+	}
+	defer root.Close()
 	var n int
 	var failed []string
 	for _, p := range r.List() {
@@ -622,8 +655,7 @@ func cmdExport(e *env, _ *flag.FlagSet, args []string) error {
 		}
 		o, err := r.OpenObject(p)
 		if err == nil {
-			// archive paths are clean relative paths (no "..", SPEC §6.4.5)
-			err = writeFile(filepath.Join(args[1], filepath.FromSlash(p)), o)
+			err = root.write(p, o)
 			o.Close()
 		}
 		if err != nil {
@@ -999,13 +1031,11 @@ func cmdAuthorize(e *env, _ *flag.FlagSet, args []string) error {
 // ---- mount
 
 var (
-	mRefresh    time.Duration
 	mAllowOther bool
 	mDebug      bool
 )
 
 func mountFlags(fl *flag.FlagSet) {
-	fl.DurationVar(&mRefresh, "refresh", 0, "follow a writer: open a new snapshot at this interval (e.g. 30s); 0 mounts one fixed snapshot")
 	fl.BoolVar(&mAllowOther, "allow-other", false, "let other users access the mount")
 	fl.BoolVar(&mDebug, "debug", false, "log every FUSE request")
 }
@@ -1019,17 +1049,17 @@ func cmdMount(e *env, _ *flag.FlagSet, args []string) error {
 	if err != nil {
 		return err
 	}
-	logf := func(s string) { fmt.Fprintln(e.stderr, s) }
-	srv, err := fusefs.Mount(args[0], args[1], fusefs.Options{Read: stash.ReadOptions{Key: key, Anchor: a},
-		Refresh: mRefresh, AllowOther: mAllowOther, Debug: mDebug, Log: logf})
+	pol, err := policy()
 	if err != nil {
 		return err
 	}
-	mode := "fixed snapshot"
-	if mRefresh > 0 {
-		mode = "refreshed every " + mRefresh.String()
+	logf := func(s string) { fmt.Fprintln(e.stderr, s) }
+	srv, err := fusefs.Mount(args[0], args[1], fusefs.Options{Read: stash.ReadOptions{Key: key, Anchor: a, Policy: pol},
+		AllowOther: mAllowOther, Debug: mDebug, Log: logf})
+	if err != nil {
+		return err
 	}
-	fmt.Fprintf(e.stderr, "mounted %s on %s (read-only, %s); Ctrl-C or umount ends it\n", args[0], args[1], mode)
+	fmt.Fprintf(e.stderr, "mounted %s on %s (read-only snapshot; mount again to see later commits); Ctrl-C or umount ends it\n", args[0], args[1])
 	done := make(chan struct{})
 	go func() {
 		select {

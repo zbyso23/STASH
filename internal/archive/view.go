@@ -444,11 +444,13 @@ type ReaderOptions struct {
 	Anchor anchor.Anchor
 	// Key is the DEK of an encrypted archive.
 	Key []byte
+	// Policy is the expected security policy (§15A.2).
+	Policy Policy
 }
 
 // OpenReaderWith opens a read-only snapshot with options.
 func OpenReaderWith(fsys vfs.FS, o ReaderOptions) (*Reader, error) {
-	if err := checkPolicy(fsys, o.Anchor); err != nil {
+	if err := checkPolicy(context.Background(), fsys, o.Anchor, o.Policy); err != nil {
 		return nil, err
 	}
 	if o.Anchor == nil {

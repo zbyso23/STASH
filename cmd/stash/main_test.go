@@ -281,3 +281,68 @@ func TestMountCommand(t *testing.T) {
 		t.Fatal("still mounted")
 	}
 }
+
+// export never leaves its destination: a symbolic link already in it, to a
+// directory or to a file outside, is refused and the outside is untouched.
+func TestExportRefusesSymlinks(t *testing.T) {
+	dir := t.TempDir()
+	arch, dst, outside := filepath.Join(dir, "arch"), filepath.Join(dir, "dst"), filepath.Join(dir, "outside")
+	ok(t, "create", arch)
+	must(t, cli(t, "evil", "put", arch, "-", "-as", "backup/config.txt"))
+	must(t, cli(t, "evil", "put", arch, "-", "-as", "top.txt"))
+	must(t, cli(t, "fine", "put", arch, "-", "-as", "ok/fine.txt"))
+	os.MkdirAll(outside, 0o755)
+	victim := filepath.Join(outside, "victim.txt")
+	os.WriteFile(victim, []byte("original"), 0o644)
+	os.MkdirAll(dst, 0o755)
+	os.Symlink(outside, filepath.Join(dst, "backup")) // directory link
+	os.Symlink(victim, filepath.Join(dst, "top.txt")) // file link
+	r := cli(t, "", "export", arch, dst)
+	if r.code != exitError || strings.Count(r.stderr, "refusing") != 2 {
+		t.Fatalf("export: %+v", r)
+	}
+	if b, _ := os.ReadFile(victim); string(b) != "original" {
+		t.Fatalf("victim overwritten: %q", b)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "config.txt")); err == nil {
+		t.Fatal("wrote through the directory link")
+	}
+	if b, _ := os.ReadFile(filepath.Join(dst, "ok", "fine.txt")); string(b) != "fine" {
+		t.Fatalf("safe object not exported: %q", b)
+	}
+	// re-export over existing regular files replaces them
+	ok(t, "export", arch, filepath.Join(dir, "dst2"))
+	os.WriteFile(filepath.Join(dir, "dst2", "top.txt"), []byte("stale"), 0o644)
+	ok(t, "export", arch, filepath.Join(dir, "dst2"))
+	if b, _ := os.ReadFile(filepath.Join(dir, "dst2", "top.txt")); string(b) != "evil" {
+		t.Fatalf("re-export: %q", b)
+	}
+}
+
+// The expected policy comes from the command line or $STASH_POLICY, never
+// from the archive's storage.
+func TestPolicyFlag(t *testing.T) {
+	dir := t.TempDir()
+	arch, anc := filepath.Join(dir, "arch"), filepath.Join(dir, "anchor")
+	os.MkdirAll(anc, 0o755)
+	ok(t, "create", arch, "-anchor", anc)
+	os.Remove(filepath.Join(arch, "policy.hardened")) // tampering
+	if r := cli(t, "", "ls", arch, "-anchor", anc); r.code != exitError || !strings.Contains(r.stderr, "rollback") {
+		t.Fatalf("anchor, marker removed: %+v", r)
+	}
+	if r := cli(t, "", "ls", arch, "-policy", "hardened"); r.code != exitError || !strings.Contains(r.stderr, "anchor") {
+		t.Fatalf("-policy hardened: %+v", r)
+	}
+	os.Setenv("STASH_POLICY", "hardened")
+	r := cli(t, "", "ls", arch)
+	os.Unsetenv("STASH_POLICY")
+	if r.code != exitError {
+		t.Fatalf("STASH_POLICY: %+v", r)
+	}
+	if r := cli(t, "", "ls", arch, "-policy", "bogus"); r.code != exitError {
+		t.Fatal(r)
+	}
+	plain := filepath.Join(dir, "plain")
+	ok(t, "create", plain)
+	ok(t, "ls", plain, "-policy", "standard")
+}

@@ -489,3 +489,50 @@ func TestHardenedRootReconstruction(t *testing.T) {
 		t.Fatal("no crash point between the anchor and the root")
 	}
 }
+
+// §15A.2: the expected policy comes from trusted configuration. A
+// configured anchor makes a missing marker a security incident; an
+// explicit PolicyHardened refuses to open without the anchor; an explicit
+// PolicyStandard refuses a HARDENED archive.
+func TestPolicyFromConfiguration(t *testing.T) {
+	a := anchor.NewMemory()
+	fsys := vfs.NewCrashFS()
+	if _, err := Create(fsys, hcfg(a)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenWriter(fsys, Options{Policy: PolicyStandard}); !errors.Is(err, ErrAnchorRequired) {
+		t.Fatalf("PolicyStandard on HARDENED: %v", err)
+	}
+	if _, err := OpenWriter(fsys, Options{Anchor: a, Policy: PolicyStandard}); !errors.Is(err, ErrAnchorRequired) {
+		t.Fatalf("anchor with PolicyStandard: %v", err)
+	}
+	// the storage administrator deletes the marker
+	fsys.Remove(PolicyName)
+	if _, err := OpenWriter(fsys, Options{Anchor: a}); !errors.Is(err, ErrRollback) {
+		t.Fatalf("writer, marker removed: %v", err)
+	}
+	if _, err := OpenReaderWith(fsys, ReaderOptions{Anchor: a}); !errors.Is(err, ErrRollback) {
+		t.Fatalf("reader, marker removed: %v", err)
+	}
+	if _, err := OpenWriter(fsys, Options{Policy: PolicyHardened}); !errors.Is(err, ErrAnchorRequired) {
+		t.Fatalf("PolicyHardened without anchor: %v", err)
+	}
+	if _, err := OpenReaderWith(fsys, ReaderOptions{Policy: PolicyHardened}); !errors.Is(err, ErrAnchorRequired) {
+		t.Fatalf("reader PolicyHardened without anchor: %v", err)
+	}
+	// PolicyAuto without an anchor follows the marker (documented)
+	w, err := OpenWriter(fsys, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	// a STANDARD archive with an anchor that knows nothing of it
+	plain := vfs.NewCrashFS()
+	mustCreate(t, plain)
+	if _, err := OpenWriter(plain, Options{Anchor: a}); !errors.Is(err, ErrAnchorRequired) || errors.Is(err, ErrRollback) {
+		t.Fatalf("anchor for a STANDARD archive: %v", err)
+	}
+	if _, err := OpenWriter(plain, Options{Policy: Policy(9)}); !errors.Is(err, wire.ErrInvalid) {
+		t.Fatal(err)
+	}
+}

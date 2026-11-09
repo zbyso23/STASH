@@ -67,6 +67,9 @@ type Options struct {
 	// the anchored values (§2.1.3.5): an operator decision after the
 	// security incident was reported.
 	AcknowledgeAllocatorRollback bool
+	// Policy is the expected security policy from trusted configuration
+	// (§15A.2); see Policy.
+	Policy Policy
 }
 
 // Health reports conditions found when opening (§13.9).
@@ -153,7 +156,7 @@ func OpenWriter(fsys vfs.FS, opt Options) (w *Writer, err error) {
 			w = nil
 		}
 	}()
-	if err := checkPolicy(fsys, opt.Anchor); err != nil {
+	if err := checkPolicy(context.Background(), fsys, opt.Anchor, opt.Policy); err != nil {
 		return nil, err
 	}
 	if opt.Anchor != nil {

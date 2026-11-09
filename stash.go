@@ -294,7 +294,28 @@ type Options struct {
 	// AcknowledgeAllocatorRollback continues an encrypted HARDENED archive
 	// after ErrAllocatorRollback was reviewed, from the anchored values.
 	AcknowledgeAllocatorRollback bool
+	// Policy is the expected security policy. With an Anchor, HARDENED is
+	// expected whatever the storage says.
+	Policy Policy
 }
+
+// Policy is the security policy an opener expects (SPEC §15A.2). It must
+// come from configuration the archive's storage cannot change: the local
+// HARDENED marker lives on that storage and only guards against mistakes.
+type Policy = archive.Policy
+
+const (
+	// PolicyAuto (default) follows the local marker when no Anchor is
+	// configured; an adversary controlling the storage can delete the
+	// marker. Configure PolicyHardened (or an Anchor) where HARDENED
+	// guarantees matter.
+	PolicyAuto = archive.PolicyAuto
+	// PolicyStandard requires a STANDARD archive.
+	PolicyStandard = archive.PolicyStandard
+	// PolicyHardened requires a HARDENED archive and its Anchor; a
+	// missing marker is then ErrRollback.
+	PolicyHardened = archive.PolicyHardened
+)
 
 // Archive is an archive opened for writing. Its methods are safe for
 // concurrent use; concurrent writes share fsyncs (group commit).
@@ -306,7 +327,7 @@ type Archive struct {
 // running crash recovery (torn tails, open transactions, indexes).
 func Open(dir string, o Options) (*Archive, error) {
 	w, err := archive.OpenWriter(vfs.OS{Root: dir}, archive.Options{MaxExtent: o.MaxExtent, UncompressedExtents: o.UncompressedExtents, PackThreshold: o.PackThreshold, VerifyAll: o.VerifyAll,
-		Anchor: o.Anchor, AdoptUnanchored: o.AdoptUnanchored, Key: o.Key, AcknowledgeAllocatorRollback: o.AcknowledgeAllocatorRollback})
+		Anchor: o.Anchor, AdoptUnanchored: o.AdoptUnanchored, Key: o.Key, AcknowledgeAllocatorRollback: o.AcknowledgeAllocatorRollback, Policy: o.Policy})
 	if err != nil {
 		return nil, err
 	}
@@ -466,6 +487,8 @@ type ReadOptions struct {
 	Anchor Anchor
 	// Key opens an encrypted archive.
 	Key []byte
+	// Policy is the expected security policy (see Options.Policy).
+	Policy Policy
 }
 
 // OpenReadOnly opens a snapshot of the archive in dir for reading. It pins
@@ -475,7 +498,7 @@ func OpenReadOnly(dir string) (*Reader, error) { return OpenReadOnlyWith(dir, Re
 
 // OpenReadOnlyWith is OpenReadOnly with options.
 func OpenReadOnlyWith(dir string, o ReadOptions) (*Reader, error) {
-	r, err := archive.OpenReaderWith(vfs.OS{Root: dir}, archive.ReaderOptions{Pin: !o.NoPin, PinTTL: o.PinTTL, Anchor: o.Anchor, Key: o.Key})
+	r, err := archive.OpenReaderWith(vfs.OS{Root: dir}, archive.ReaderOptions{Pin: !o.NoPin, PinTTL: o.PinTTL, Anchor: o.Anchor, Key: o.Key, Policy: o.Policy})
 	if err != nil {
 		return nil, err
 	}

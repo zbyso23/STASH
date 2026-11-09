@@ -339,25 +339,37 @@ No SPEC change in M16–M17.
 
 ## Milestone 18 — read-only FUSE mount (done)
 
-`fusefs` (public package, `github.com/hanwen/go-fuse/v2` v2.7.2, pure Go) and `stash mount <archive> <mountpoint> [-refresh 30s] [-allow-other] [-debug]`.
+`fusefs` (public package, `github.com/hanwen/go-fuse/v2` v2.7.2, pure Go) and `stash mount <archive> <mountpoint> [-allow-other] [-debug]`.
 
 | Topic | Behavior |
 |---|---|
 | tree | a snapshot (`stash.Reader`, pinned, §13.1.1) lists the live objects; each object is a regular file (0444), each component of its path a directory (0555). An object whose path is also a directory prefix ("a" next to "a/b") is hidden behind the directory, reported by `Server.Shadowed` and logged; `stash get` still reads it |
 | reads | through `Object.ReadAt` (frames verified, repaired from parity, never zero-filled); damaged committed data without parity fails with EIO; open files and concurrent reads of one file are safe |
-| caching | a fixed snapshot uses one-hour entry and attribute timeouts and `FOPEN_KEEP_CACHE` (versions are immutable, §9.5) |
-| `Refresh` | a new snapshot at the interval (`Server.Refresh` on demand) so the mount follows a writer; timeouts drop to one second and the page cache is not kept. A file opened before keeps reading its version, even across a compaction that replaced the generation (its snapshot stays pinned until the last open file closes). A failed refresh keeps the previous snapshot |
-| inodes | stable per path across snapshots, never shared by two paths |
+| snapshot | one validated, pinned generation for the mount's lifetime (§18.2): later commits and compactions are not visible; mount again to see them. An unpinned `ReadOptions.NoPin` is refused. Entry and attribute timeouts of one hour and `FOPEN_KEEP_CACHE` (versions are immutable, §9.5) |
+| inodes | one per path, never shared by two paths |
 | metadata | objects have no timestamps (§9): every entry shows the snapshot's open time; xattrs `user.stash.version` (file_ver) and `user.stash.extents`; statfs reports logical bytes and object count |
 | writes | refused: mounted `ro`, opens for writing fail with EROFS |
 | keys, HARDENED | `-key-file`/`$STASH_KEY` and `-anchor` as for the other commands; a HARDENED mount shows the anchored state |
 | end | Ctrl-C / SIGTERM unmounts (retried while files are open), as does an external `umount` |
 
-Tests (real mounts through `/dev/fuse`; skipped where FUSE is unavailable): the whole tree of a BASELINE and of an encrypted RS + zstd archive (Czech names, empty and 3 MiB files, a 301-entry directory, shadowing) read through the mount and compared; attributes, sorted readdir, ENOENT, refused write/create/remove, xattrs, statfs; 8 goroutines of random ReadAt on one open file; refresh after new versions and a compaction while an old file stays open; EIO on damage without parity with the intact last extent still readable; damage repaired from RS parity; `stash mount` serving until its context ends. `-race` clean.
+Tests (real mounts through `/dev/fuse`; skipped where FUSE is unavailable): the whole tree of a BASELINE and of an encrypted RS + zstd archive (Czech names, empty and 3 MiB files, a 301-entry directory, shadowing) read through the mount and compared; attributes, sorted readdir, ENOENT, refused write/create/remove, xattrs, statfs; 8 goroutines of random ReadAt on one open file; the snapshot unchanged after new versions and a compaction by a writer, a new mount showing them, an unpinned mount refused; EIO on damage without parity with the intact last extent still readable; damage repaired from RS parity; `stash mount` serving until its context ends. `-race` clean.
 
 Throughput in this container: 256 MiB of random data compared through the mount in 0.43 s (cold, including reading the source file); cached re-reads about 4 GB/s.
 
 No SPEC change.
+
+## Audit fixes after M18 (external review)
+
+| Finding | Fix |
+|---|---|
+| FUSE `-refresh` replaced the snapshot inside one mount, against §18.2 | removed: a mount holds one pinned generation for its lifetime; a new mount shows later commits |
+| `export` could follow symbolic links already present in the destination | `cmd/stash/export.go`: every component is opened relative to its parent with `O_NOFOLLOW`; a link or non-directory in the path, or a non-regular file at the final name, is refused; files are created as a temporary next to the final name and renamed over it (`renameat`), never written through a link |
+| GC treated any error reading `pins/` or a pin file as "no pins" | only `fs.ErrNotExist` means no pin (or released meanwhile); any other error stops GC and keeps the old generation (§13.1.1), also for the GC after a compaction |
+| HARDENED was decided by the local marker file alone | the expected policy comes from configuration: `Options.Policy` / `ReadOptions.Policy` (`PolicyAuto`, `PolicyStandard`, `PolicyHardened`), CLI `-policy` or `$STASH_POLICY`. A configured anchor implies HARDENED: if the marker is missing while the anchor holds state for the archive, the open fails with `ErrRollback` (tampering, an interrupted enrollment, or HARDENED was left). `PolicyHardened` without an anchor and `PolicyStandard` on a marked archive fail with `ErrAnchorRequired`. `PolicyAuto` (default) still follows the marker when no anchor is configured and is documented as not protecting against a hostile storage administrator |
+
+Tests: `TestGCStopsOnPinReadError` (injected errors on the pin directory and on pin files; the pinned generation stays readable, GC succeeds after release), `TestPolicyFromConfiguration`, `TestMountKeepsSnapshot`, CLI `TestExportRefusesSymlinks` (directory and file links to an outside directory: refused, outside untouched, safe objects exported, regular files replaced on re-export) and `TestPolicyFlag`.
+
+No SPEC change: the marker and the policy configuration are implementation-defined; §15A.2 already requires a configured anchor.
 
 ## Next milestones
 

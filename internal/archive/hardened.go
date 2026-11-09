@@ -136,9 +136,42 @@ func loadAnchor(ctx context.Context, a anchor.Anchor, id [32]byte) (anchor.State
 	return st, nil
 }
 
+// Policy is the security policy an opener expects, from configuration the
+// archive's storage cannot change (§15A.2). The local marker PolicyName
+// lives on that storage, so whoever controls it can delete it: it only
+// guards against opening a HARDENED archive by mistake, never as the sole
+// authority.
+type Policy int
+
+const (
+	// PolicyAuto follows the local marker when no anchor is configured.
+	// It does not protect against an adversary who controls the storage:
+	// a deleted marker opens the archive as STANDARD. Deployments that
+	// need HARDENED guarantees configure PolicyHardened or an anchor.
+	PolicyAuto Policy = iota
+	// PolicyStandard: the archive must be STANDARD (no marker).
+	PolicyStandard
+	// PolicyHardened: the archive must be HARDENED; an anchor is required
+	// and a missing marker is a security incident.
+	PolicyHardened
+)
+
 // checkPolicy enforces "never silently downgrade" and "no anti-rollback
-// without an anchor" (§15A.2).
-func checkPolicy(fsys vfs.FS, a anchor.Anchor) error {
+// without an anchor" (§15A.2). A configured anchor is trusted
+// configuration: it makes the opener expect HARDENED whatever the storage
+// says. A missing marker while the anchor holds state for the archive
+// means the marker was removed (ErrRollback); a marker without a
+// configured anchor fails closed.
+func checkPolicy(ctx context.Context, fsys vfs.FS, a anchor.Anchor, pol Policy) error {
+	if pol < PolicyAuto || pol > PolicyHardened {
+		return fmt.Errorf("%w: unknown policy %d", wire.ErrInvalid, pol)
+	}
+	if pol == PolicyStandard && a != nil {
+		return fmt.Errorf("%w: an anchor was given with policy STANDARD", ErrAnchorRequired)
+	}
+	if pol == PolicyHardened && a == nil {
+		return fmt.Errorf("%w: policy HARDENED needs the archive's generation anchor (§15A.2)", ErrAnchorRequired)
+	}
 	hard, err := isHardened(fsys)
 	if err != nil {
 		return err
@@ -147,7 +180,16 @@ func checkPolicy(fsys vfs.FS, a anchor.Anchor) error {
 	case hard && a == nil:
 		return fmt.Errorf("%w: the archive is HARDENED; open it with its generation anchor (leaving HARDENED is an explicit operator action)", ErrAnchorRequired)
 	case !hard && a != nil:
-		return fmt.Errorf("%w: the archive is STANDARD; enroll it first", ErrAnchorRequired)
+		id, err := archiveIDOf(fsys)
+		if err != nil {
+			return fmt.Errorf("%w: a generation anchor is configured but the policy marker is missing and the archive cannot be identified: %v", ErrRollback, err)
+		}
+		if _, err := a.Load(ctx, id); errors.Is(err, anchor.ErrNotFound) {
+			return fmt.Errorf("%w: the archive is STANDARD; enroll it first", ErrAnchorRequired)
+		} else if err != nil {
+			return fmt.Errorf("%w: %v", ErrAnchorUnavailable, err)
+		}
+		return fmt.Errorf("%w: the anchor holds state for this archive but the policy marker %s is missing: removed by tampering, an interrupted enrollment, or HARDENED was left (then open without the anchor)", ErrRollback, PolicyName)
 	}
 	return nil
 }

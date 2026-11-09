@@ -26,16 +26,12 @@ import (
 type Options struct {
 	// Read opens the archive (key, anchor of a HARDENED archive).
 	Read stash.ReadOptions
-	// Refresh, when positive, opens a new snapshot at this interval, so
-	// the mount follows commits of a writer. A file opened before keeps
-	// reading the version it opened. Zero mounts one fixed snapshot.
-	Refresh time.Duration
 	// AllowOther lets other users access the mount (needs
 	// user_allow_other in /etc/fuse.conf for a non-root user).
 	AllowOther bool
 	// Debug logs every FUSE request.
 	Debug bool
-	// Log receives notices (shadowed paths, refresh failures); nil: none.
+	// Log receives notices (shadowed paths); nil: none.
 	Log func(string)
 }
 
@@ -52,20 +48,20 @@ type root struct {
 	opt     Options
 
 	mu   sync.RWMutex
-	snap *snapshot
+	snap *snapshot // nil after unmount
 
 	inoMu sync.Mutex
 	inos  map[string]uint64 // "d:path" / "f:path" -> inode number
 	next  uint64
-
-	stop chan struct{}
-	done chan struct{}
 }
 
 // Mount opens a snapshot of the archive in dir and mounts it read-only at
 // mountpoint. Call Unmount (or unmount the directory) to end it, and Wait
 // to block until then.
 func Mount(dir, mountpoint string, o Options) (*Server, error) {
+	if o.Read.NoPin {
+		return nil, fmt.Errorf("%w: a mount pins its generation (SPEC §18.2)", stash.ErrInvalid)
+	}
 	r, err := stash.OpenReadOnlyWith(dir, o.Read)
 	if err != nil {
 		return nil, err
@@ -75,13 +71,10 @@ func Mount(dir, mountpoint string, o Options) (*Server, error) {
 		r.Close()
 		return nil, err
 	}
-	rt := &root{archive: dir, opt: o, snap: s, inos: map[string]uint64{}, next: 2, stop: make(chan struct{}), done: make(chan struct{})}
+	rt := &root{archive: dir, opt: o, snap: s, inos: map[string]uint64{}, next: 2}
 	rt.dirNode.root = rt
 	rt.logShadowed(s)
-	timeout := time.Hour
-	if o.Refresh > 0 {
-		timeout = min(o.Refresh, time.Second)
-	}
+	timeout := time.Hour // the snapshot never changes
 	srv, err := fs.Mount(mountpoint, rt, &fs.Options{
 		EntryTimeout: &timeout, AttrTimeout: &timeout, NegativeTimeout: &timeout,
 		MountOptions: fuse.MountOptions{
@@ -93,13 +86,7 @@ func Mount(dir, mountpoint string, o Options) (*Server, error) {
 		s.release()
 		return nil, err
 	}
-	sv := &Server{srv: srv, root: rt}
-	if o.Refresh > 0 {
-		go rt.refresher()
-	} else {
-		close(rt.done)
-	}
-	return sv, nil
+	return &Server{srv: srv, root: rt}, nil
 }
 
 // Unmount unmounts the file system and closes the snapshot once no file
@@ -120,8 +107,6 @@ func (s *Server) Wait() {
 func (s *Server) close() { s.closed.Do(s.doClose) }
 
 func (s *Server) doClose() {
-	close(s.root.stop)
-	<-s.root.done
 	s.root.mu.Lock()
 	snap := s.root.snap
 	s.root.snap = nil
@@ -142,54 +127,10 @@ func (s *Server) Shadowed() []string {
 	return append([]string(nil), snap.shadowed...)
 }
 
-// Refresh opens a new snapshot now (a mount with Options.Refresh does
-// this periodically).
-func (s *Server) Refresh() error { return s.root.refresh() }
-
 func (rt *root) logShadowed(s *snapshot) {
 	if rt.opt.Log != nil && len(s.shadowed) > 0 {
 		rt.opt.Log(fmt.Sprintf("%d objects are hidden by directories of the same name (e.g. %q); read them with stash get", len(s.shadowed), s.shadowed[0]))
 	}
-}
-
-func (rt *root) refresher() {
-	defer close(rt.done)
-	t := time.NewTicker(rt.opt.Refresh)
-	defer t.Stop()
-	for {
-		select {
-		case <-rt.stop:
-			return
-		case <-t.C:
-			if err := rt.refresh(); err != nil && rt.opt.Log != nil {
-				rt.opt.Log("refresh: " + err.Error() + " (the previous snapshot stays mounted)")
-			}
-		}
-	}
-}
-
-func (rt *root) refresh() error {
-	r, err := stash.OpenReadOnlyWith(rt.archive, rt.opt.Read)
-	if err != nil {
-		return err
-	}
-	s, err := newSnapshot(r)
-	if err != nil {
-		r.Close()
-		return err
-	}
-	rt.mu.Lock()
-	old := rt.snap
-	if old == nil { // unmounted meanwhile
-		rt.mu.Unlock()
-		s.release()
-		return nil
-	}
-	rt.snap = s
-	rt.mu.Unlock()
-	rt.logShadowed(s)
-	old.release()
-	return nil
 }
 
 // current returns the current snapshot with a reference, or nil after
@@ -203,9 +144,8 @@ func (rt *root) current() *snapshot {
 	return rt.snap
 }
 
-// ino returns the stable inode number of a directory or file path: the
-// same path keeps its number across snapshots, distinct paths never share
-// one.
+// ino returns the inode number of a directory or file path; distinct
+// paths never share one.
 func (rt *root) ino(dir bool, p string) uint64 {
 	k := "f:" + p
 	if dir {
@@ -393,11 +333,8 @@ func (f *fileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 		s.release()
 		return nil, 0, errno(err)
 	}
-	var fl uint32
-	if f.root.opt.Refresh == 0 {
-		fl = fuse.FOPEN_KEEP_CACHE // versions are immutable (SPEC §9.5)
-	}
-	return &handle{snap: s, info: in, obj: o}, fl, 0
+	// versions are immutable (SPEC §9.5) and the snapshot fixed
+	return &handle{snap: s, info: in, obj: o}, fuse.FOPEN_KEEP_CACHE, 0
 }
 
 func (h *handle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
