@@ -480,7 +480,7 @@ type ReadOptions struct {
 	// then remove the generation while the snapshot is open.
 	NoPin bool
 	// PinTTL is the pin lifetime between background renewals (default 10
-	// minutes); a crashed reader's pin expires after it.
+	// minutes, at least 3 seconds); a crashed reader's pin expires after it.
 	PinTTL time.Duration
 	// Anchor is required for a HARDENED archive: the snapshot is the
 	// anchored state, never bytes written after the last anchor advance.

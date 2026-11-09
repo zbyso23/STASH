@@ -371,7 +371,19 @@ Tests: `TestGCStopsOnPinReadError` (injected errors on the pin directory and on 
 
 No SPEC change: the marker and the policy configuration are implementation-defined; §15A.2 already requires a configured anchor.
 
+## Audit fixes, part 2 (findings 5–8)
+
+| Finding | Fix |
+|---|---|
+| 5. `RemoveAll` (GC) followed a planted symbolic link and deleted files outside the archive | `vfs.OS` (Unix) resolves every name component by component from an open Root with `openat(O_NOFOLLOW)` and the other `*at` calls: a link anywhere inside the archive is refused with `vfs.ErrSymlink`, `Stat` describes a link itself (`fstatat(AT_SYMLINK_NOFOLLOW)`), so `RemoveAll` unlinks a link and never descends into its target; `unlinkat`/`renameat` never follow the last component. Names cannot be absolute or climb with `..`. Only regular files are opened (`O_NONBLOCK` keeps a planted FIFO from blocking the open, then it is refused). The writer lock uses the same safe open |
+| 6. `ReplaceFileStream` opened the predictable `name.tmp` with `O_TRUNC` | the temporary file is `name.tmp-<16 hex random>`, created with `O_CREATE\|O_EXCL` (and `O_NOFOLLOW` through `vfs.OS`); the rename replaces a link at `name` itself, never its target. A crash may leave a `.tmp-*` file behind; no reader looks at those names |
+| 7. the physical index (and the manifest state) are held in RAM | not fixed in this step; see the next milestones. Measured size: 56 bytes per frame in memory (plus a transient copy while merging and 8 bytes per frame while validating offsets at load); the manifest state holds a location per extent of every live version, the same order. Record counts are bounded by the blob size, so the memory is proportional to valid data, not amplified by forged values, but it grows with the archive (≈15 GB per PiB of 4 MiB frames) |
+| 8. a pin TTL under three nanoseconds made `time.NewTicker(0)` panic in the renewal goroutine | `MinPinTTL` = 3 s; a smaller or negative TTL is `ErrInvalid` (0 still means the default) |
+
+Tests: `vfs`: a tree with links to an outside directory and file removed by `RemoveAll` (the outside intact, also when the tree root itself is a link); `ReplaceFile` with a planted `root.current.tmp` link and with a link at the final name (outside intact, the link replaced by a regular file); every operation through a directory link or on a file link refused; `..` and absolute names refused; a planted FIFO refused without blocking; ordinary operations unchanged. `archive`: GC of a retired generation containing links on the real file system (outside intact, generation removed); pin TTLs of 1 ns, 1 s and −1 s refused. Non-Unix builds keep the plain implementation (documented as trusted storage only).
+
 ## Next milestones
 
-19. Emergency Pruning (§13.9).
-20. Optionally a writable FUSE mount (new versions on close), if wanted.
+19. Bounded-memory metadata (audit finding 7): a paged physical index searched on disk (the sorted index file is already a binary-searchable array of 64-byte records) with a bounded page cache and an in-memory delta merged by streaming rewrite; offset-uniqueness validation by a streaming check; then a paged manifest state.
+20. Emergency Pruning (§13.9).
+21. Optionally a writable FUSE mount (new versions on close), if wanted.

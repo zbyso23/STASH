@@ -45,9 +45,16 @@ type Pin struct {
 	err  error
 }
 
+// MinPinTTL is the shortest pin lifetime: pins are renewed every third of
+// it, which must stay a usable, non-zero period.
+const MinPinTTL = 3 * time.Second
+
 func pinGeneration(fsys vfs.FS, gen uint64, ttl time.Duration) (*Pin, error) {
-	if ttl <= 0 {
+	if ttl == 0 {
 		ttl = DefaultPinTTL
+	}
+	if ttl < MinPinTTL {
+		return nil, fmt.Errorf("%w: pin TTL %v below the minimum %v", wire.ErrInvalid, ttl, MinPinTTL)
 	}
 	var r [8]byte
 	if _, err := rand.Read(r[:]); err != nil {

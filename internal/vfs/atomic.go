@@ -2,6 +2,8 @@ package vfs
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"io"
 	"io/fs"
@@ -22,11 +24,19 @@ func ReplaceFile(fsys FS, name string, data []byte) error {
 
 // ReplaceFileStream is ReplaceFile for content produced by fill, which may
 // be larger than memory should hold at once (index rebuilds, §10.5). If
-// fill fails, the temporary file is removed and name is untouched.
+// fill fails, the temporary file is removed and name is untouched. The
+// temporary file has an unpredictable name and is created exclusively
+// (O_EXCL; OS also refuses links), so nothing planted beforehand is opened
+// or truncated; the rename replaces name itself, never what a link at
+// name points to.
 func ReplaceFileStream(fsys FS, name string, fill func(io.Writer) error) error {
 	dir := path.Dir(name)
-	tmp := name + ".tmp"
-	f, err := fsys.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	var r [8]byte
+	if _, err := rand.Read(r[:]); err != nil {
+		return err
+	}
+	tmp := name + ".tmp-" + hex.EncodeToString(r[:])
+	f, err := fsys.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return err
 	}
@@ -93,7 +103,9 @@ func (tooLarge) Error() string { return "file larger than allowed" }
 var errTooLarge error = tooLarge{}
 
 // RemoveAll removes name and everything below it, then syncs the parent
-// directory. A crash part way leaves a partially removed tree.
+// directory. A crash part way leaves a partially removed tree. Stat does
+// not follow links, so a link inside the tree is removed itself and what
+// it points to is never touched.
 func RemoveAll(fsys FS, name string) error {
 	st, err := fsys.Stat(name)
 	if err != nil {
