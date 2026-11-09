@@ -242,6 +242,29 @@ SPEC change E1-24: the post-Mark delta may be merged by its net effect per path,
 
 Not yet: Emergency Pruning (§13.9) and health records of degraded groups, `PARITY_GROUP` records in the destination (optional).
 
+## Milestone 13 — HARDENED policy and the Generation Anchor (done, unencrypted archives)
+
+| Where | Content | SPEC |
+|---|---|---|
+| `internal/anchor` | `State` (archive_id, generation_id, root_digest, manifest_length, manifest_digest, reservations), `Newer` (lexicographic on generation and manifest length; equal pair only with componentwise larger reservations), `Anchor` interface (`Create` refuses an existing state, `Load`, compare-and-advance `Advance` that rejects stale and non-advancing updates); providers `Memory` (tests: outages, rollback of the anchor itself) and `File` (one file per archive, atomic durable replacement under a lock, a damaged file is an outage, never "no anchor") | §2.1.2 |
+| `internal/archive/hardened.go` | the policy marker `policy.hardened` (implementation-defined, outside the normative names): a HARDENED archive never opens without its anchor, an anchor for a STANDARD archive is a configuration error | §15A.2 |
+| | `Create` with an anchor: generation 0 durable, marker, the anchor's initial state, then `root.current`. `Enroll`: full verification, then the anchor's first state, then the marker, with operator and log required. `LeaveHardened` and `AuthorizeAnchorTransition` (verify the local generation that leads the anchor, then advance) are explicit operator actions | §2.1.2.1, §13.6.1 |
+| | open (§11.8): anchor loaded (unreachable means a failure, never a downgrade); root equal → `root_digest` and manifest prefix (length and SHA-256) checked; root ahead of the anchor → fail closed; root missing, damaged or behind → the anchored generation must verify completely and match the rebuilt root bytes, and a writer then installs the root (an interrupted switch or creation completes); anything else is `ErrRollback` | §2.1.2.1, §11.8, §16.7 |
+| | unanchored manifest bytes are truncated before the journal opens, or adopted with `Options.AdoptUnanchored` (operator decision) and anchored; cold-start `ADD_ABORT`s are anchored at open | §10.4.1 |
+| `commit.go` | commit advance after the manifest sync, one per group commit batch, with a running SHA-256 so each advance hashes only the new bytes. A failed advance fails the batch and poisons the writer until reopen, because the commit's state is unknown | §10.4.1 |
+| `compact.go` | switch advance before `root.current` (§13.6.1 steps 6-9); if the advance fails the destination is kept, because the anchor may already name it, and GC refuses to run | §13.6.1 |
+| `view.go` | `OpenReaderWith{Anchor, Pin}`: the snapshot is the anchored generation and manifest length; unanchored bytes are never applied | §10.4.1 |
+
+Public API: `CreateOptions.Anchor`, `Options.Anchor`, `Options.AdoptUnanchored`, `ReadOptions.Anchor`, `stash.Enroll`, `stash.LeaveHardened`, `stash.AuthorizeAnchorTransition`, `stash.NewFileAnchor`, `stash.NewMemoryAnchor`, errors `ErrRollback`, `ErrAnchorRequired`, `ErrAnchorUnavailable`.
+
+Tests (§17.11): creation and refusal of a second anchor; enrollment after verification (a damaged archive is refused) and no archive byte changed except the marker and the implementation's checkpoint file; monotonic advances with non-consecutive generation ids; commit advance per batch; manifest truncated or altered below the anchored length; storage rolled back to an earlier valid state; anchor unavailable at open and during a commit (no downgrade, the Put fails, the unanchored record is truncated at reopen); stale and replayed advances; `root_digest` mismatch; root ahead of the anchor (fail closed, then the authorized flow); the anchor missing; unanchored bytes ignored by a reader, truncated by default, adopted on request; crash after the switch advance and before the root (reopen completes the switch) and with the anchored generation damaged or missing (incident); crash between the anchor creation and the first root write (root rebuilt); 140 crash points of a HARDENED workload plus compaction with the anchor state captured at each crash: every reported Put survives and every state opens.
+
+Not applicable until encryption: binding allocator reservations in the anchor (§2.1.3.5; the reservation type and `alloc.OnReserve` exist).
+
+Benchmark (4 cores, this container's disk, file anchor on the same disk): 64 KiB Puts with 16 writers take about 430 MB/s HARDENED vs 555 MB/s STANDARD. Each batch pays one more durable replace.
+
+No SPEC change in this milestone.
+
 ## Next milestones
 
-13. HARDENED anchor (§2.1.2, §13.6.1). Then encryption, zstd, CLI, FUSE.
+14. Encryption (§15, including §2.1.3.5 reservation binding). Then zstd, CLI, FUSE.

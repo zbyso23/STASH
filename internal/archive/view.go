@@ -1,6 +1,7 @@
 package archive
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"stash/internal/anchor"
 	"time"
 
 	"stash/internal/blob"
@@ -416,7 +419,58 @@ func OpenReader(fsys vfs.FS, pool *bufpool.Pool) (*Reader, error) {
 	if err != nil {
 		return nil, err
 	}
-	return openReaderAt(fsys, pool, root)
+	return openReaderAt(fsys, pool, root, 0, false)
+}
+
+// ReaderOptions configure OpenReaderWith.
+type ReaderOptions struct {
+	Pool *bufpool.Pool
+	// Pin registers a reader pin (§13.1.1) with PinTTL (0: default).
+	Pin    bool
+	PinTTL time.Duration
+	// Anchor is required for a HARDENED archive (§11.8): the snapshot is
+	// the anchored generation and manifest prefix; unanchored bytes are
+	// never applied.
+	Anchor anchor.Anchor
+}
+
+// OpenReaderWith opens a read-only snapshot with options.
+func OpenReaderWith(fsys vfs.FS, o ReaderOptions) (*Reader, error) {
+	if err := checkPolicy(fsys, o.Anchor); err != nil {
+		return nil, err
+	}
+	if o.Anchor == nil {
+		if o.Pin {
+			return OpenReaderPinned(fsys, o.Pool, o.PinTTL)
+		}
+		return OpenReader(fsys, o.Pool)
+	}
+	ctx := context.Background()
+	root, st, err := resolveHardened(ctx, fsys, o.Anchor, o.Pool, false)
+	if err != nil {
+		return nil, err
+	}
+	var pin *Pin
+	if o.Pin {
+		if pin, err = pinGeneration(fsys, root.GenerationID, o.PinTTL); err != nil {
+			return nil, err
+		}
+		// re-check: a switch may have happened before the pin existed
+		if again, err := loadAnchor(ctx, o.Anchor, root.ArchiveID); err != nil || again.GenerationID != st.GenerationID {
+			pin.Release()
+			if err == nil {
+				err = fmt.Errorf("generation changed while pinning; retry")
+			}
+			return nil, err
+		}
+	}
+	r, err := openReaderAt(fsys, o.Pool, root, int64(st.ManifestLength), true)
+	if err != nil {
+		pin.Release()
+		return nil, err
+	}
+	r.pin = pin
+	return r, nil
 }
 
 // OpenReaderPinned opens the archive for reading and pins the generation
@@ -445,7 +499,7 @@ func OpenReaderPinned(fsys vfs.FS, pool *bufpool.Pool, ttl time.Duration) (*Read
 			}
 			return nil, fmt.Errorf("generation keeps changing while pinning")
 		}
-		r, err := openReaderAt(fsys, pool, root)
+		r, err := openReaderAt(fsys, pool, root, 0, false)
 		if err != nil {
 			pin.Release()
 			return nil, err
@@ -455,7 +509,9 @@ func OpenReaderPinned(fsys vfs.FS, pool *bufpool.Pool, ttl time.Duration) (*Read
 	}
 }
 
-func openReaderAt(fsys vfs.FS, pool *bufpool.Pool, root wire.Root) (*Reader, error) {
+// openReaderAt opens generation root.GenerationID; with limited, only
+// manifest.jsonl[0:limit] is applied (a HARDENED reader snapshot, §10.4.1).
+func openReaderAt(fsys vfs.FS, pool *bufpool.Pool, root wire.Root, limit int64, limited bool) (*Reader, error) {
 	if pool == nil {
 		pool = bufpool.Default
 	}
@@ -464,9 +520,14 @@ func openReaderAt(fsys vfs.FS, pool *bufpool.Pool, root wire.Root) (*Reader, err
 	if err != nil {
 		return nil, err
 	}
-	st, _, err := manifest.Load(fsys, gen, h, manifest.LoadOptions{})
-	if err != nil {
-		return nil, err
+	var st *manifest.State
+	if limited && limit == 0 {
+		st = manifest.NewState(h, manifest.DefaultLimits)
+	} else {
+		st, _, err = manifest.Load(fsys, gen, h, manifest.LoadOptions{Limit: limit})
+		if err != nil {
+			return nil, err
+		}
 	}
 	r := &Reader{view: view{fsys: fsys, gen: gen, h: h, pool: pool}, st: st}
 	if _, err := r.openBlobs(false, h.ParityScheme != wire.ParityNone); err != nil {

@@ -117,6 +117,14 @@ func (w *Writer) commit(r *commitReq) error {
 // commitBatch makes the frames of every request durable, appends the
 // records, and syncs the manifest once (§10.4 ordering).
 func (w *Writer) commitBatch(batch []*commitReq) {
+	if err := w.hard.failed; err != nil {
+		for _, r := range batch {
+			if r.err == nil {
+				r.err = err
+			}
+		}
+		return
+	}
 	blobs := map[int]bool{}
 	for _, r := range batch {
 		for b := range r.blobs {
@@ -165,7 +173,12 @@ func (w *Writer) commitBatch(batch []*commitReq) {
 	if !appended {
 		return
 	}
-	if err := w.journal.Sync(); err != nil {
+	err := w.journal.Sync()
+	if err == nil && w.hard.anchor != nil {
+		// §10.4.1: durable only once the anchor covers the records
+		err = w.advanceCommit(context.Background())
+	}
+	if err != nil {
 		for _, r := range batch {
 			if r.err == nil {
 				r.err = err

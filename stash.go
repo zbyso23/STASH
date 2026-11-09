@@ -5,7 +5,8 @@
 // codec, VARIABLE and FIXED frame modes, optional XOR or Reed-Solomon
 // parity with repair on read, small objects packed into shared frames,
 // compaction with repair and regrouping, full verification, and raw
-// recovery from blob files alone. One writer per
+// recovery from blob files alone. HARDENED policy binds freshness to an
+// external Generation Anchor (anti-rollback). One writer per
 // archive (an exclusive lock on writer.lock); any number of readers.
 //
 //	err := stash.Create(dir, stash.CreateOptions{})
@@ -26,6 +27,7 @@ import (
 	"os"
 	"time"
 
+	"stash/internal/anchor"
 	"stash/internal/archive"
 	"stash/internal/canonpath"
 	"stash/internal/manifest"
@@ -54,6 +56,16 @@ var (
 	ErrUnsupported = wire.ErrUnsupported
 	ErrInvalid     = wire.ErrInvalid
 	ErrResource    = wire.ErrResource
+	// ErrRollback: HARDENED found rollback, stale storage or tampering
+	// against the Generation Anchor (a security incident; nothing falls
+	// back to older state).
+	ErrRollback = archive.ErrRollback
+	// ErrAnchorRequired: a HARDENED archive opened without its anchor, or
+	// an anchor given for a STANDARD archive.
+	ErrAnchorRequired = archive.ErrAnchorRequired
+	// ErrAnchorUnavailable: the anchor cannot be reached; HARDENED does
+	// not downgrade, the operation fails.
+	ErrAnchorUnavailable = archive.ErrAnchorUnavailable
 )
 
 // FrameMode selects the physical frame geometry (SPEC §3).
@@ -111,6 +123,10 @@ type CreateOptions struct {
 	MaxFrameSize int
 	// Parity: none by default. Needs at least 2 blobs.
 	Parity Parity
+	// Anchor makes the archive HARDENED (SPEC §15A.2): its freshness is
+	// bound to this external Generation Anchor, which must live where the
+	// archive's storage cannot roll it back.
+	Anchor Anchor
 }
 
 // Create creates a new archive in dir, which must be empty or absent.
@@ -158,6 +174,7 @@ func Create(dir string, o CreateOptions) error {
 	default:
 		return errors.Join(ErrInvalid, errors.New("stash: unknown parity scheme"))
 	}
+	cfg.Anchor = o.Anchor
 	_, err := archive.Create(vfs.OS{Root: dir}, cfg)
 	return err
 }
@@ -174,6 +191,13 @@ type Options struct {
 	// verified before the last clean close (slower; payload damage is then
 	// found at open instead of on read).
 	VerifyAll bool
+	// Anchor is required for a HARDENED archive and refused for a
+	// STANDARD one; a HARDENED archive never opens without it.
+	Anchor Anchor
+	// AdoptUnanchored keeps manifest records written after the last anchor
+	// advance (a crash in between) instead of discarding them. It is an
+	// operator decision: their content is not authenticated.
+	AdoptUnanchored bool
 }
 
 // Archive is an archive opened for writing. Its methods are safe for
@@ -185,7 +209,8 @@ type Archive struct {
 // Open opens the archive in dir for writing, taking the writer lock and
 // running crash recovery (torn tails, open transactions, indexes).
 func Open(dir string, o Options) (*Archive, error) {
-	w, err := archive.OpenWriter(vfs.OS{Root: dir}, archive.Options{MaxExtent: o.MaxExtent, PackThreshold: o.PackThreshold, VerifyAll: o.VerifyAll})
+	w, err := archive.OpenWriter(vfs.OS{Root: dir}, archive.Options{MaxExtent: o.MaxExtent, PackThreshold: o.PackThreshold, VerifyAll: o.VerifyAll,
+		Anchor: o.Anchor, AdoptUnanchored: o.AdoptUnanchored})
 	if err != nil {
 		return nil, err
 	}
@@ -340,6 +365,9 @@ type ReadOptions struct {
 	// PinTTL is the pin lifetime between background renewals (default 10
 	// minutes); a crashed reader's pin expires after it.
 	PinTTL time.Duration
+	// Anchor is required for a HARDENED archive: the snapshot is the
+	// anchored state, never bytes written after the last anchor advance.
+	Anchor Anchor
 }
 
 // OpenReadOnly opens a snapshot of the archive in dir for reading. It pins
@@ -349,13 +377,7 @@ func OpenReadOnly(dir string) (*Reader, error) { return OpenReadOnlyWith(dir, Re
 
 // OpenReadOnlyWith is OpenReadOnly with options.
 func OpenReadOnlyWith(dir string, o ReadOptions) (*Reader, error) {
-	var r *archive.Reader
-	var err error
-	if o.NoPin {
-		r, err = archive.OpenReader(vfs.OS{Root: dir}, nil)
-	} else {
-		r, err = archive.OpenReaderPinned(vfs.OS{Root: dir}, nil, o.PinTTL)
-	}
+	r, err := archive.OpenReaderWith(vfs.OS{Root: dir}, archive.ReaderOptions{Pin: !o.NoPin, PinTTL: o.PinTTL, Anchor: o.Anchor})
 	if err != nil {
 		return nil, err
 	}
@@ -452,4 +474,50 @@ func Salvage(ctx context.Context, rc *Recovery, dir string, versions []*Recovere
 		return SalvageResult{}, err
 	}
 	return rc.Salvage(ctx, vfs.OS{Root: dir}, versions)
+}
+
+// Anchor is a Generation Anchor provider (SPEC §2.1.2): monotonic
+// compare-and-advance state per archive, kept outside the archive's
+// storage. Implement it over a trusted service, or use NewFileAnchor.
+type Anchor = anchor.Anchor
+
+// AnchorState is what an anchor stores.
+type AnchorState = anchor.State
+
+// NewFileAnchor returns the reference anchor: one file per archive in dir,
+// replaced atomically under a lock. dir must be on storage that is not
+// rolled back together with the archive (another host, a versioned or
+// WORM store), or the anchor protects nothing.
+func NewFileAnchor(dir string) (Anchor, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	return anchor.File{FS: vfs.OS{Root: dir}}, nil
+}
+
+// NewMemoryAnchor returns an in-process anchor (tests only: it is lost
+// with the process).
+func NewMemoryAnchor() *anchor.Memory { return anchor.NewMemory() }
+
+// Enroll switches an existing STANDARD archive to HARDENED (SPEC
+// §2.1.2.1): the archive is verified completely, the anchor's first state
+// is created from it, and a local policy marker is written. operator and
+// log are required; keep the logged record outside the archive. No
+// archive wire byte changes.
+func Enroll(ctx context.Context, dir string, a Anchor, operator string, log func(string)) (AnchorState, error) {
+	return archive.Enroll(ctx, vfs.OS{Root: dir}, a, archive.EnrollOptions{Operator: operator, Log: log})
+}
+
+// LeaveHardened returns an archive to STANDARD (an explicit operator
+// action; the anchor's state is left for the operator to retire).
+func LeaveHardened(dir, operator string, log func(string)) error {
+	return archive.LeaveHardened(vfs.OS{Root: dir}, operator, log)
+}
+
+// AuthorizeAnchorTransition is the operator's recovery flow for a
+// root.current that names a newer generation than the anchor (SPEC
+// §13.6.1): that generation is verified completely and the anchor is
+// advanced to it.
+func AuthorizeAnchorTransition(ctx context.Context, dir string, a Anchor, operator string, log func(string)) error {
+	return archive.AuthorizeAnchorTransition(ctx, vfs.OS{Root: dir}, a, operator, log)
 }

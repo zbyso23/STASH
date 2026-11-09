@@ -142,6 +142,9 @@ func (w *Writer) GC() ([]uint64, error) {
 }
 
 func (w *Writer) gcLocked() ([]uint64, error) {
+	if w.hard.failed != nil {
+		return nil, w.hard.failed // the anchor may name another generation
+	}
 	root, err := readRoot(w.fsys)
 	if err != nil {
 		return nil, err

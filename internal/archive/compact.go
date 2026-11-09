@@ -220,7 +220,16 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 	res.Versions = len(final)
 	res.SourceBytes, res.DestBytes = blobBytes(src), blobBytes(d.view)
 
-	// Switch (§13.6, STANDARD): root.current names the destination
+	// Switch (§13.6): HARDENED advances the anchor first (§13.6.1 steps
+	// 6-9); an error leaves the destination in place, because the anchor
+	// may name it already, and the writer needs a reopen
+	if w.hard.anchor != nil {
+		if err := w.advanceSwitch(ctx, d, id); err != nil {
+			switched = true // keep the destination directory
+			d.closeGeneration()
+			return res, err
+		}
+	}
 	root := wire.Root{GenerationID: id, ArchiveID: dh.ArchiveID}
 	if err := vfs.ReplaceFile(w.fsys, RootName, root.AppendBinary(nil)); err != nil {
 		return res, err

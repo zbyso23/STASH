@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 
 	"stash/internal/alloc"
+	"stash/internal/anchor"
 	"stash/internal/blob"
 	"stash/internal/bufpool"
 	"stash/internal/index"
@@ -42,6 +43,15 @@ type Options struct {
 	// at open instead of being reported on read.
 	VerifyAll bool
 	Limits    manifest.Limits
+	// Anchor is the Generation Anchor of a HARDENED archive (§2.1.2); it
+	// is required for a HARDENED archive and refused for a STANDARD one.
+	Anchor anchor.Anchor
+	// AdoptUnanchored keeps manifest records beyond the anchored length
+	// (a crash between the manifest fsync and the commit advance) and
+	// anchors them, instead of truncating them (§10.4.1). It is an
+	// operator-authorized recovery action: unencrypted records are not
+	// authenticated.
+	AdoptUnanchored bool
 }
 
 // Health reports conditions found when opening (§13.9).
@@ -59,6 +69,9 @@ type Health struct {
 	// Checkpointed counts frames below verified checkpoints whose payload
 	// hashes were not recomputed at open (E1-23).
 	Checkpointed int
+	// UnanchoredBytes counts manifest bytes beyond the anchored length
+	// that were truncated (HARDENED, §10.4.1); AdoptedBytes those adopted.
+	UnanchoredBytes, AdoptedBytes int64
 	// ParityWarning is set when the writable blobs cannot hold a parity
 	// group so that losing one whole blob is survivable (§7.4).
 	ParityWarning string
@@ -96,6 +109,7 @@ type Writer struct {
 	rr      atomic.Uint32
 	health  Health
 	opened  bool // OpenWriter completed
+	hard    hardenedState
 }
 
 // OpenWriter takes the writer lock and opens the current generation for
@@ -123,6 +137,17 @@ func OpenWriter(fsys vfs.FS, opt Options) (w *Writer, err error) {
 			w = nil
 		}
 	}()
+	if err := checkPolicy(fsys, opt.Anchor); err != nil {
+		return nil, err
+	}
+	if opt.Anchor != nil {
+		// §11.8: may complete an interrupted switch or creation
+		_, st, err := resolveHardened(context.Background(), fsys, opt.Anchor, opt.Pool, true)
+		if err != nil {
+			return nil, err
+		}
+		w.hard = hardenedState{anchor: opt.Anchor, anchored: st}
+	}
 	root, err := readRoot(fsys)
 	if err != nil {
 		return nil, err
@@ -185,6 +210,11 @@ func (w *Writer) openGeneration(gen string, h *wire.ArchiveHeader) (err error) {
 		}
 	}
 
+	if w.hard.anchor != nil {
+		if err := w.prepareManifest(gen, opt.AdoptUnanchored); err != nil {
+			return err
+		}
+	}
 	// manifest: torn tail, allocator checks against the fold, cold-start aborts
 	j, st, res, err := manifest.OpenJournal(fsys, gen, h, manifest.LoadOptions{
 		Limits:    opt.Limits,
@@ -200,6 +230,12 @@ func (w *Writer) openGeneration(gen string, h *wire.ArchiveHeader) (err error) {
 		return err
 	}
 	w.journal = j
+	if w.hard.anchor != nil {
+		// cold-start ADD_ABORTs and adopted records are anchored now
+		if err := w.advanceCommit(context.Background()); err != nil {
+			return err
+		}
+	}
 	w.health.TornManifestBytes = res.Load.Torn
 	w.health.AbortedOnStart = res.Aborted
 

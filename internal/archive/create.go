@@ -1,13 +1,16 @@
 package archive
 
 import (
+	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"fmt"
 	"io/fs"
 	"os"
 	"path"
 
 	"stash/internal/alloc"
+	"stash/internal/anchor"
 	"stash/internal/blob"
 	"stash/internal/manifest"
 	"stash/internal/vfs"
@@ -23,6 +26,9 @@ type Config struct {
 	// Parity scheme and code (§7); zero values mean no parity.
 	ParityScheme     wire.ParityScheme
 	ParityK, ParityM uint8
+	// Anchor creates a HARDENED archive (§2.1.2.1): generation 0 durable,
+	// the policy marker, the anchor's initial state, then root.current.
+	Anchor anchor.Anchor
 }
 
 // Create creates a new STANDARD archive in an empty directory (§2.1,
@@ -79,7 +85,18 @@ func Create(fsys vfs.FS, cfg Config) (*wire.ArchiveHeader, error) {
 		return nil, err
 	}
 	root := wire.Root{GenerationID: h.GenerationID, ArchiveID: h.ArchiveID}
-	if err := vfs.ReplaceFile(fsys, RootName, root.AppendBinary(nil)); err != nil {
+	rb := root.AppendBinary(nil)
+	if cfg.Anchor != nil {
+		if err := writePolicy(fsys, h.ArchiveID); err != nil {
+			return nil, err
+		}
+		empty := sha256.Sum256(nil)
+		st := anchor.State{ArchiveID: h.ArchiveID, GenerationID: h.GenerationID, RootDigest: anchor.RootDigest(rb), ManifestDigest: empty}
+		if err := cfg.Anchor.Create(context.Background(), st); err != nil {
+			return nil, err
+		}
+	}
+	if err := vfs.ReplaceFile(fsys, RootName, rb); err != nil {
 		return nil, err
 	}
 	return h, nil

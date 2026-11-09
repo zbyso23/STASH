@@ -548,3 +548,78 @@ func BenchmarkRecover64M(b *testing.B) {
 		rc.Close()
 	}
 }
+
+func TestPublicHardened(t *testing.T) {
+	ctx := context.Background()
+	anc, err := stash.NewFileAnchor(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := stash.Create(dir, stash.CreateOptions{Anchor: anc}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stash.Open(dir, stash.Options{}); !errors.Is(err, stash.ErrAnchorRequired) {
+		t.Fatal(err)
+	}
+	a, err := stash.Open(dir, stash.Options{Anchor: anc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Put("x", []byte("anchored"))
+	a.Put("y", rnd(1, 100000))
+	if _, err := a.Compact(ctx, stash.CompactOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	a.Close()
+	r, err := stash.OpenReadOnlyWith(dir, stash.ReadOptions{Anchor: anc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := r.Get("x"); string(got) != "anchored" {
+		t.Fatal("read")
+	}
+	r.Close()
+	// enrollment of a STANDARD archive
+	dir2, b := newArchive(t, stash.CreateOptions{})
+	b.Put("z", []byte("1"))
+	b.Close()
+	if _, err := stash.Enroll(ctx, dir2, anc, "tester", func(string) {}); err != nil {
+		t.Fatal(err)
+	}
+	if b, err = stash.Open(dir2, stash.Options{Anchor: anc}); err != nil {
+		t.Fatal(err)
+	}
+	b.Close()
+}
+
+// BenchmarkPut64KParallelHardened: 64 writers, every commit batch advances
+// a file anchor (one more durable replace per batch).
+func BenchmarkPut64KParallelHardened(b *testing.B) {
+	anc, _ := stash.NewFileAnchor(b.TempDir())
+	dir := b.TempDir()
+	stash.Create(dir, stash.CreateOptions{Anchor: anc})
+	a, err := stash.Open(dir, stash.Options{Anchor: anc})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer a.Close()
+	d := rnd(1, 64<<10)
+	b.SetBytes(int64(len(d)))
+	b.SetParallelism(16)
+	var n int64
+	var mu sync.Mutex
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			mu.Lock()
+			n++
+			p := fmt.Sprintf("p/%d", n)
+			mu.Unlock()
+			if _, err := a.Put(p, d); err != nil {
+				b.Error(err)
+				return
+			}
+		}
+	})
+}

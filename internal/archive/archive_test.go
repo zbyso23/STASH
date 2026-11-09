@@ -135,6 +135,11 @@ type snapFS struct {
 	snaps []*vfs.CrashFS
 	every int
 	n     int
+	// onSnap, if set, captures external state with every snapshot
+	// (the HARDENED anchor, which a crash of the archive storage does not
+	// roll back).
+	onSnap func() any
+	ext    []any
 }
 
 func (s *snapFS) count() int {
@@ -149,6 +154,9 @@ func (s *snapFS) snap() {
 	s.n++
 	if s.every <= 1 || s.n%s.every == 0 {
 		s.snaps = append(s.snaps, s.CrashFS.Crash(vfs.CrashTear, s.rng))
+		if s.onSnap != nil {
+			s.ext = append(s.ext, s.onSnap())
+		}
 	}
 }
 
