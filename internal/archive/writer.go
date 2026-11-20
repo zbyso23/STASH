@@ -106,6 +106,10 @@ type Health struct {
 	// verification (§13.9).
 	PruneRecords  int
 	ForeignHealth []string
+	// Unrecoverable counts standing UNRECOVERABLE markers: paths whose
+	// version a prune gave up and that were neither written nor deleted
+	// since.
+	Unrecoverable int64
 }
 
 // Writer is the single writer of an archive (§12.1). Put, Delete and Get
@@ -239,6 +243,9 @@ func (w *Writer) openGeneration(gen string, h *wire.ArchiveHeader) (err error) {
 		}
 	}
 	w.view = &view{fsys: fsys, gen: gen, h: h, pool: opt.Pool, k: w.keys, env: w.env, kv: w.stEnv.Table()}
+	if w.view.lost, err = openLostSet(fsys, w.keys, h.GenerationID, true); err != nil {
+		return err
+	}
 	if h.Encrypted() && h.GenerationID > seal.MaxGenerationID {
 		return fmt.Errorf("%w: generation %d", seal.ErrNonceLimit, h.GenerationID)
 	}
@@ -557,7 +564,9 @@ func (w *Writer) Header() *wire.ArchiveHeader {
 func (w *Writer) Health() Health {
 	w.genMu.RLock()
 	defer w.genMu.RUnlock()
-	return w.health
+	h := w.health
+	h.Unrecoverable = w.view.lost.count()
+	return h
 }
 
 // maxExtent is the largest stored DATA payload for path in one frame,
@@ -654,7 +663,22 @@ func (w *Writer) Delete(p string) error {
 		return err
 	}
 	defer w.release(p)
-	return w.commit(&commitReq{del: true, path: p})
+	// an UNRECOVERABLE marker is cleared first: a crash in between leaves
+	// the live version, never a deleted path still reported as lost
+	u, err := w.view.lost.lookup(p)
+	if err != nil {
+		return err
+	}
+	if u != nil {
+		if err := w.view.lost.clear(p); err != nil {
+			return err
+		}
+	}
+	err = w.commit(&commitReq{del: true, path: p})
+	if u != nil && errors.Is(err, ErrNotFound) {
+		return nil // the loss is acknowledged
+	}
+	return err
 }
 
 // Get returns the content of the current version of p.
@@ -668,7 +692,7 @@ func (w *Writer) Get(p string) ([]byte, error) {
 		return nil, err
 	}
 	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrNotFound, p)
+		return nil, w.notFound(p)
 	}
 	return w.read(p, v)
 }
@@ -686,7 +710,7 @@ func (w *Writer) Open(p string) (*Object, error) {
 		return nil, err
 	}
 	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrNotFound, p)
+		return nil, w.notFound(p)
 	}
 	return w.object(p, v), nil
 }
@@ -702,7 +726,7 @@ func (w *Writer) Stat(p string) (*manifest.Version, error) {
 		return nil, err
 	}
 	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrNotFound, p)
+		return nil, w.notFound(p)
 	}
 	return v, nil
 }

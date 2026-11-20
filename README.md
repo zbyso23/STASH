@@ -6,7 +6,7 @@
 
 It stores data in immutable, grid-aligned frames distributed across one or more append-only blobs. Frames carry enough physical and recovery metadata to be discovered, validated, and reconstructed without trusting normal indexes or the primary manifest.
 
-> **Project status:** 🌀 STASH 2.0 Revision R10 is frozen at wire version `0x0006`. R10 completes R9: it defines encodings R9 left open, closes nonce-reuse and rollback gaps found in review, and keeps the R8/R9 binary structure layouts unchanged. Erratum E1, applied before any implementation existed, is part of R10 (SPEC §20.5). The project is now in the Go reference-implementation phase, developed with a test-first conformance workflow.
+> **Project status:** 🌀 STASH 2.0 Revision R11 is frozen at wire version `0x0006`. R11 is R10 with its Erratum E1 consolidated after the Go reference implementation was built against it (SPEC §20.6); it changes no byte on disk. R10 completed R9: it defined encodings R9 left open, closed nonce-reuse and rollback gaps found in review, and kept the R8/R9 binary structure layouts unchanged. The Go reference implementation covers the whole specification and is in external review.
 
 ## Why 🌀 STASH exists
 
@@ -48,7 +48,7 @@ CRC32C, content hashes, and AEAD authentication detect damage or tampering. They
 
 ### Deliberately narrow algorithm surface
 
-🌀 STASH R10 intentionally keeps the algorithm matrix small:
+🌀 STASH R11 intentionally keeps the algorithm matrix small:
 
 ```text
 HASH
@@ -92,7 +92,7 @@ Geometry, parity, blob count, PACKED support, and `MAX_FRAME_SIZE` remain orthog
 
 ### Security policies
 
-R10 separates data-processing profiles from deployment security policy.
+R11 separates data-processing profiles from deployment security policy.
 
 ```text
 STANDARD
@@ -286,7 +286,7 @@ A deployment may rotate a KEK/KMS wrapping key without changing frame bytes. Cha
 
 🌀 STASH provides strong structural validation, content-integrity checks, authenticated encryption when enabled, and optional erasure recovery.
 
-R10 distinguishes:
+R11 distinguishes:
 
 ```text
 integrity
@@ -478,15 +478,15 @@ If persistent indexes are missing, the adapter may construct temporary in-memory
 
 The normative format definition is:
 
-- [`SPEC.md`](SPEC.md) — **🌀 STASH 2.0 Revision R10** (with Erratum E1), wire version `0x0006`
+- [`SPEC.md`](SPEC.md) — **🌀 STASH 2.0 Revision R11** (R10 with Erratum E1 consolidated), wire version `0x0006`
 
 The specification defines binary layouts, manifest encoding, invariants, validation order, recovery behavior, concurrency, parity, compaction, encryption, resource limits, security policies, and required conformance tests.
 
-R10 keeps the R8/R9 binary on-disk structure layouts unchanged and adds the Allocator State file. Erratum E1 (SPEC §20.5) adds the `ADD_ABORT` manifest operation, Allocator State kind 4, and a keyed object identifier for encrypted archives; it was applied before any implementation or media existed. R10 readers open R9 media, except media that violates rules R10 tightened (listed in SPEC §20.2); R10 writers initialize Allocator State for R9 archives through an explicit step.
+R11 keeps the R8/R9 binary on-disk structure layouts unchanged; R10 added the Allocator State file. Erratum E1 (SPEC §20.5) adds the `ADD_ABORT` manifest operation, Allocator State kind 4, and a keyed object identifier for encrypted archives; it was applied before any implementation or media existed. R11 readers open R9 media, except media that violates rules R10 tightened (listed in SPEC §20.2); R11 writers initialize Allocator State for R9 archives through an explicit step. R11 itself adds one behavioral rule (a version given up by Emergency Pruning is reported as UNRECOVERABLE, never as absent) and keeps the `-R10` names of the HKDF info strings, which are part of the key derivation (SPEC §20.6).
 
 If this README and the specification disagree, **the specification wins**.
 
-> **🌀 STASH 2.0 R10 is frozen at wire version `0x0006`. R10 does not change the R8/R9 binary wire format. Any future on-disk format change requires a new wire-version revision backed by implementation or conformance evidence.**
+> **🌀 STASH 2.0 R11 is frozen at wire version `0x0006`. R11 does not change the R8/R9 binary wire format. Any future on-disk format change requires a new wire-version revision backed by implementation or conformance evidence.**
 
 ## Development approach
 
@@ -495,7 +495,7 @@ The reference implementation is developed with strict TDD.
 Every new behavior follows:
 
 ```text
-R10 invariant
+R11 invariant
     ↓
 failing test
     ↓
@@ -510,7 +510,7 @@ fuzz / crash / recovery validation where applicable
 exit gate
 ```
 
-The R10 required test matrix is part of the specification and is **not optional implementation guidance**.
+The R11 required test matrix is part of the specification and is **not optional implementation guidance**.
 
 Implementation milestones progress approximately through:
 
@@ -616,17 +616,17 @@ Package boundaries should follow dependency direction rather than mirror every s
 - Mixing frame-size modes inside one archive
 - Network protocol or distributed consensus
 - IAM/RBAC policy model
-- A built-in vendor-specific trusted anti-rollback service (R10 defines the abstraction/policy, not a mandatory provider)
+- A built-in vendor-specific trusted anti-rollback service (R11 defines the abstraction/policy, not a mandatory provider)
 - Atomic multi-path transactions (including atomic rename)
 - Sharing frames between versions of an object
 
 ## Contributing
 
-The project is now entering the reference-implementation and conformance phase.
+The Go reference implementation is complete; the project is in external review and interoperability testing.
 
 Early contributions are most valuable in:
 
-- independent review of R10 invariants;
+- independent review of R11 invariants;
 - independently constructed binary golden vectors;
 - adversarial recovery and corruption fixtures;
 - Go binary-codec and bounded-allocation review;

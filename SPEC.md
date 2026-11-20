@@ -1,7 +1,7 @@
 # 🌀 STASH
 
 ## Version 2.0 — Consolidated Specification
-### Revision R10 with Erratum E1 — Specification Completion and Crash/Nonce Safety
+### Revision R11 — R10 with Erratum E1, consolidated after the reference implementation
 
 **Status:** Final / Frozen Specification  
 **Target:** Server / enterprise / datacenter / petabyte-scale storage  
@@ -10,17 +10,17 @@
 
 R10 is a completion and safety revision over R9. It was produced from an independent review of R9 that found internal contradictions, nonce-reuse hazards after crashes, a gap in HARDENED freshness, and several areas left undefined in a way that prevented two independent implementations from interoperating. The full list of changes and their rationale is §20.
 
-**Erratum E1** (2026-11) closes defects found by a second review of R10, before any implementation or any wire `0x0006` media under the earlier rules existed (§20.5). E1 is therefore folded into R10 at wire `0x0006` rather than published as a new wire version. Besides clarifications, E1 changes three parser-visible semantics: the keyed `object_id` of encrypted archives (§6.5), the `ADD_ABORT` manifest operation (§10.3.1), and Allocator State kind 4 (§2.1.3). It changes no binary structure layout. Wherever this document says R10, it means R10 with E1.
+**R11** (2026-11) consolidates R10 and its Erratum E1 (E1-1 to E1-25, §20.5) into one text after the Go reference implementation was built against it. R11 changes no byte on disk and no parsing rule: media written by a conforming R10-with-E1 implementation is R11 media, and the wire version stays `0x0006`. R11 adds one behavioral rule found necessary during implementation (§13.9, versions given up by Emergency Pruning) and states which identifiers keep the R10 name (§20.6). R11 descends from R10, which is a completion and safety revision over R9 (next paragraph); §20 lists both.
 
-R10 retains wire version `0x0006`. The 64-byte Archive Header, 16-byte Frame Prefix, 96-byte Master Trailer, 4096-byte base quantum, Pre-Trailer encodings, `root.current`, the index container, and the parity recovery-shard encoding remain byte-for-byte unchanged. R10 changes are of three kinds:
+R10, and with it R11, retains wire version `0x0006`. The 64-byte Archive Header, 16-byte Frame Prefix, 96-byte Master Trailer, 4096-byte base quantum, Pre-Trailer encodings, `root.current`, the index container, and the parity recovery-shard encoding remain byte-for-byte unchanged. R10 changes are of three kinds:
 
 1. **Definitions of previously undefined encodings** (encrypted manifest envelope plaintext, Reed-Solomon coding matrix, PACKED manifest references, LINK_MANIFEST hash scope). No interoperable R9 media could depend on these, because R9 did not define them.
 2. **New auxiliary durable state** outside the frame/manifest/root/index structures: the 64-byte Allocator State file (§2.1.3). R9 readers never read it; R10 writers require it.
 3. **Tightened semantic rules** (file version allocation, live-state fold, `logical_length` ceiling, torn-tail handling, strict JSON, resynchronization). Each is listed in §20.2 together with its effect on existing R9 media.
 
-> **R10 keeps the R8/R9 binary wire format unchanged at wire version `0x0006`. Further changes to binary structures require a future wire-version revision backed by implementation evidence from conformance testing, fuzzing, crash injection, recovery testing, interoperability testing, security analysis, or measured performance results.**
+> **R11 keeps the R8/R9 binary wire format unchanged at wire version `0x0006`. Further changes to binary structures require a future wire-version revision backed by implementation evidence from conformance testing, fuzzing, crash injection, recovery testing, interoperability testing, security analysis, or measured performance results.**
 
-R10 preserves the core 🌀 STASH model:
+R11 preserves the core 🌀 STASH model:
 
 - append-only storage;
 - immutable committed frames;
@@ -61,9 +61,9 @@ Encryption is an explicit qualification to priority 4: without the appropriate k
 
 ## 0.2 Threat model and residual risks
 
-R10 protects against accidental corruption, torn/incomplete writes when durability ordering is followed, payload substitution detectable by hashes/AEAD, and loss covered by configured parity or another intact copy.
+R11 protects against accidental corruption, torn/incomplete writes when durability ordering is followed, payload substitution detectable by hashes/AEAD, and loss covered by configured parity or another intact copy.
 
-R10 distinguishes three security properties:
+R11 distinguishes three security properties:
 
 - **integrity** — stored state has not been modified without detection;
 - **authenticity** — encrypted/authenticated state was produced under the expected archive key;
@@ -75,7 +75,7 @@ A malicious storage administrator who can restore an entire older but previously
 
 The same holds **inside one generation**: `manifest.jsonl` is append-only, so every byte prefix ending at a record boundary is a previously valid state with the same `generation_id`. Truncating the manifest (and optionally the blob tails) to such a prefix is a rollback even though no generation switch occurred.
 
-Deployments that require rollback detection MUST maintain trusted external monotonic state outside the rollback-capable archive storage namespace. R10 defines this optional capability as a **Generation Anchor** (§2.1.2, §10.4.1 and §13.6.1).
+Deployments that require rollback detection MUST maintain trusted external monotonic state outside the rollback-capable archive storage namespace. R11 defines this optional capability as a **Generation Anchor** (§2.1.2, §10.4.1 and §13.6.1).
 
 The external anchor MUST bind:
 
@@ -97,13 +97,13 @@ In an encrypted archive the Frame Prefix and Master Trailer remain plaintext. `o
 
 Acceptable implementations include KMS/HSM metadata, a TPM-backed monotonic record, a write-once audit service, a remote control-plane database with compare-and-swap/monotonic semantics, or an equivalent trust domain not rolled back together with the archive storage.
 
-R10 does not define cross-tenant convergent encryption, remote attestation, IAM/RBAC, or a network protocol.
+R11 does not define cross-tenant convergent encryption, remote attestation, IAM/RBAC, or a network protocol.
 
 ---
 
 # 1. Terminology
 
-R10 uses the following terms normatively:
+R11 uses the following terms normatively:
 
 - **BASE_QUANTUM** — 4096 bytes.
 - **Grid-Aligned Variable Frame** — a frame whose physical size is `N * BASE_QUANTUM`, where `N >= 1` and the archive is in `VARIABLE` mode.
@@ -209,7 +209,7 @@ Every byte of `root.current` is determined by `generation_id` and `archive_id`. 
 
 ### 2.1.2 Optional Generation Anchor — external, non-wire state
 
-The Generation Anchor is **not** part of the 🌀 STASH on-disk wire format. R9 and R10 do not add fields to `root.current`, the Archive Header, frames, manifests, or indexes.
+The Generation Anchor is **not** part of the 🌀 STASH on-disk wire format. R9, R11 and R11 do not add fields to `root.current`, the Archive Header, frames, manifests, or indexes.
 
 A Generation Anchor implementation MUST provide monotonic compare-and-advance semantics for one `archive_id`. It stores:
 
@@ -262,7 +262,7 @@ The exact Go API is non-normative. The required semantics are:
 - **Leaving HARDENED.** Disabling HARDENED is an explicit operator action. It MUST NOT happen automatically on anchor errors (§15A.2).
 - **Root reconstruction.** When the anchor names generation `G` and local `root.current` is missing (a crash between `Create` and the root write) or names a generation lower than `G` (a crash in §13.6.1 between steps 9 and 10), a HARDENED opener verifies generation `G` completely (§11), rebuilds the 64 root bytes for `G` (§2.1.1), requires their SHA-256 to equal the anchored `root_digest`, and installs them with the §2.1.1 replacement protocol. If verification or the digest check fails, §13.6.1 applies: no silent fallback.
 
-R10 security policy behavior:
+R11 security policy behavior:
 
 ```text
 STANDARD
@@ -286,7 +286,7 @@ although `SECURE + HARDENED` is the recommended configuration for adversarial en
 
 ### 2.1.3 Allocator State — 64 bytes
 
-R10 adds one auxiliary durable structure. It reserves ranges of identifiers before they are used, so that an identifier that may have reached storage in a torn or uncommitted write is never handed out again after a crash. For encrypted archives this is what makes the numeric nonce construction of §15.5 safe across crashes.
+R11 adds one auxiliary durable structure. It reserves ranges of identifiers before they are used, so that an identifier that may have reached storage in a torn or uncommitted write is never handed out again after a crash. For encrypted archives this is what makes the numeric nonce construction of §15.5 safe across crashes.
 
 | Offset | Size | Field | Type | Requirement |
 |---|---:|---|---|---|
@@ -419,7 +419,7 @@ frames/blob-00.stash
 frames/blob-FE.stash
 ```
 
-`blob_ordinal` is uint8 on disk, but R10 supports at most 255 active blobs, so valid ordinals are `0x00..0xFE` (`0..254`). `0xFF` is not a valid active blob ordinal.
+`blob_ordinal` is uint8 on disk, but R11 supports at most 255 active blobs, so valid ordinals are `0x00..0xFE` (`0..254`). `0xFF` is not a valid active blob ordinal.
 
 Historical generations MAY reuse the same ordinal values because generation identity separates them. `blob_ordinal` MUST NOT be treated as a globally monotonically increasing archive identifier.
 
@@ -459,7 +459,7 @@ Consequences that implementations MUST handle:
 3. Implementations using direct I/O that requires absolute 4 KiB alignment MUST perform read-modify-write of the shared page from an aligned bounded buffer.
 4. On storage that does not guarantee atomic page writes, a power loss during step 2 can damage the tail of an already committed frame. That damage is detected by the outer Pre-Trailer CRC (§6.4) and is repaired only by parity or another copy. Deployments on such storage SHOULD enable parity.
 
-R10 does not change this geometry, because it is part of the frozen `0x0006` wire layout.
+R11 does not change this geometry, because it is part of the frozen `0x0006` wire layout.
 
 ## 3.2 VARIABLE mode — `frame_size_mode = 0x00`
 
@@ -527,7 +527,7 @@ New archives SHOULD default to `VARIABLE` unless `FIXED` is explicitly selected.
 | `VARIABLE` | General enterprise archival use. Reduces padding and permits frame sizes to match local stored representations while retaining quantum-boundary recovery. Every modification rewrites the modified object version in full (§9.5). |
 | `FIXED` | Deterministic direct-slot geometry. Optimized for workloads where maximum recovery-scan parallelism and direct physical arithmetic justify increased padding. |
 
-R10 defines no additional frame-size modes. `frame_size_mode` remains immutable for the entire archive lifetime.
+R11 defines no additional frame-size modes. `frame_size_mode` remains immutable for the entire archive lifetime.
 
 ## 3.6 Workload fit
 
@@ -553,7 +553,7 @@ This does not make database workloads categorically unsupported: append logs, im
 
 # 4. Hash Algorithms and Hash Scope
 
-R10 deliberately exposes only two payload-hash algorithms:
+R11 deliberately exposes only two payload-hash algorithms:
 
 | Value | Algorithm | Digest |
 |---|---|---:|
@@ -634,7 +634,7 @@ ZSTD_DEFAULT = level 3
 ZSTD_DENSE   = level 9
 ```
 
-R10 does **not** claim that independent Zstandard implementations or library versions necessarily produce byte-identical compressed output from equal logical input.
+R11 does **not** claim that independent Zstandard implementations or library versions necessarily produce byte-identical compressed output from equal logical input.
 
 ```text
 equal logical data != guaranteed equal compressed bytes
@@ -671,7 +671,7 @@ compression STORE
 encryption  NONE
 ```
 
-A minimal conformant R10 reader/writer MUST support BASELINE and MUST additionally support:
+A minimal conformant R11 reader/writer MUST support BASELINE and MUST additionally support:
 
 - VARIABLE geometry;
 - DATA frames;
@@ -683,7 +683,7 @@ A minimal conformant R10 reader/writer MUST support BASELINE and MUST additional
 - raw physical scanning;
 - logical reconstruction of non-packed DATA.
 
-A BASELINE-only implementation MAY omit writing FIXED, PACKED, parity, encryption, and compaction, but it MUST safely recognize and reject unsupported R10 features rather than misparse them.
+A BASELINE-only implementation MAY omit writing FIXED, PACKED, parity, encryption, and compaction, but it MUST safely recognize and reject unsupported R11 features rather than misparse them.
 
 ### SECURE
 
@@ -743,7 +743,7 @@ The 🌀 STASH Go reference implementation MUST support BASELINE, SECURE, and FA
 
 # 6. Frame Binary Format
 
-R10 retains a fixed 16-byte Frame Prefix at the start and a fixed 96-byte Master Trailer at the end of every frame.
+R11 retains a fixed 16-byte Frame Prefix at the start and a fixed 96-byte Master Trailer at the end of every frame.
 
 ```text
 [ Frame Prefix: 16 B ]
@@ -783,7 +783,7 @@ frame_quanta == max_frame_quanta
 
 ## 6.2 Master Trailer — 96 bytes
 
-R10 retains the larger self-describing trailer because non-packed DATA frames must carry logical placement information directly in raw storage.
+R11 retains the larger self-describing trailer because non-packed DATA frames must carry logical placement information directly in raw storage.
 
 | Offset | Size | Field | Type | Description |
 |---|---:|---|---|---|
@@ -977,7 +977,7 @@ logical_length >= 0
 
 ### 6.6.1 Logical length ceiling
 
-To bound decompression and reconstruction work by a value that is already validated before allocation, R10 fixes:
+To bound decompression and reconstruction work by a value that is already validated before allocation, R11 fixes:
 
 ```text
 non-packed DATA:  logical_length        <= MAX_FRAME_SIZE
@@ -1007,15 +1007,15 @@ A frame represents:
 
 Physical discovery order MUST NOT define object order.
 
-## 6.7 R10 logical object metadata scope
+## 6.7 R11 logical object metadata scope
 
-R10 logical objects are byte streams identified by canonical path plus `file_ver`. The format does not define POSIX mode bits, uid/gid, timestamps, symlinks, hardlinks, xattrs, ACLs, device nodes, or sparse-hole semantics. Those are application metadata outside the core format unless a future revision defines them. Zero-byte objects are representable by the single zero-length DATA frame of §6.4.5.
+R11 logical objects are byte streams identified by canonical path plus `file_ver`. The format does not define POSIX mode bits, uid/gid, timestamps, symlinks, hardlinks, xattrs, ACLs, device nodes, or sparse-hole semantics. Those are application metadata outside the core format unless a future revision defines them. Zero-byte objects are representable by the single zero-length DATA frame of §6.4.5.
 
 ---
 
 # 7. Parity / Erasure Coding
 
-R10 retains exactly two non-zero parity algorithms:
+R11 retains exactly two non-zero parity algorithms:
 
 | Value | Scheme | Tolerance |
 |---|---|---|
@@ -1211,7 +1211,7 @@ The order of entries inside `loc`, `ADD_EXTENT`, index files, or physical blob d
 
 ## 9.3 Logical Recovery Grid
 
-R10 retains the R8 conceptual 4 KiB Logical Recovery Grid:
+R11 retains the R8 conceptual 4 KiB Logical Recovery Grid:
 
 ```text
 logical_quantum_index = logical_offset / 4096
@@ -1246,7 +1246,7 @@ Workloads that modify large data incrementally SHOULD model it as many immutable
 
 ## 9.6 Absolute logical offsets and insert/delete operations
 
-R10 retains the absolute `logical_offset` model and stores absolute `logical_offset` in every non-packed DATA Master Trailer and repeats it in that DATA frame's Pre-Trailer. Within one version, extents are laid out by absolute offset. Because every new version is written in full (§9.5), insert/delete operations do not cause any additional rewrite beyond the full rewrite of the new version; they only determine how the new version's extents are partitioned.
+R11 retains the absolute `logical_offset` model and stores absolute `logical_offset` in every non-packed DATA Master Trailer and repeats it in that DATA frame's Pre-Trailer. Within one version, extents are laid out by absolute offset. Because every new version is written in full (§9.5), insert/delete operations do not cause any additional rewrite beyond the full rewrite of the new version; they only determine how the new version's extents are partitioned.
 
 VARIABLE mode does **not** promise insertion-stable frame identity. Its benefit is variable physical allocation, reduced padding, and freedom from fixed physical slot boundaries. R9 text claiming that tail growth or local overwrites "can stay local" is withdrawn: it contradicted §4.2 and §6.5.
 
@@ -1270,7 +1270,7 @@ Manifest writes are serialized through one logical manifest commit stream even w
 
 `MAX_MANIFEST_LINE_BYTES = 1 MiB`.
 
-Readers MUST reject a line exceeding the bound rather than buffer unbounded data. Unknown `op` values are unsupported R10 semantics and MUST fail closed rather than be ignored.
+Readers MUST reject a line exceeding the bound rather than buffer unbounded data. Unknown `op` values are unsupported R11 semantics and MUST fail closed rather than be ignored.
 
 ### 10.1.1 Canonical JSON representation
 
@@ -1303,7 +1303,7 @@ A linked submanifest always belongs to the same archive and generation as its pa
 
 ### 10.1.2 Normative operation set
 
-R10 recognizes exactly: `ADD`, `DEL`, `ADD_BEGIN`, `ADD_EXTENT`, `ADD_COMMIT`, `ADD_ABORT`, `LINK_MANIFEST`, encrypted envelope counterparts (`ADD_ENC`, `DEL_ENC`, `ADD_BEGIN_ENC`, `ADD_EXTENT_ENC`, `ADD_COMMIT_ENC`, `ADD_ABORT_ENC`, `LINK_MANIFEST_ENC`), and the optional operational redundancy record `PARITY_GROUP`. Emergency-prune audit storage is implementation health metadata, not a logical file-state manifest operation.
+R11 recognizes exactly: `ADD`, `DEL`, `ADD_BEGIN`, `ADD_EXTENT`, `ADD_COMMIT`, `ADD_ABORT`, `LINK_MANIFEST`, encrypted envelope counterparts (`ADD_ENC`, `DEL_ENC`, `ADD_BEGIN_ENC`, `ADD_EXTENT_ENC`, `ADD_COMMIT_ENC`, `ADD_ABORT_ENC`, `LINK_MANIFEST_ENC`), and the optional operational redundancy record `PARITY_GROUP`. Emergency-prune audit storage is implementation health metadata, not a logical file-state manifest operation.
 
 Encryption selects the form strictly:
 
@@ -1377,7 +1377,7 @@ A DEL whose `file_ver` does not match the current version, or that names an abse
 
 ### 10.2.3 Rename
 
-R10 has no atomic rename. A rename is a new object (§6.5): the writer commits the new path first (ADD or ADD_BEGIN..ADD_COMMIT) and then commits DEL of the old path. A crash between the two leaves both paths present; no crash point loses data. Applications needing atomic multi-path changes MUST implement them above the archive.
+R11 has no atomic rename. A rename is a new object (§6.5): the writer commits the new path first (ADD or ADD_BEGIN..ADD_COMMIT) and then commits DEL of the old path. A crash between the two leaves both paths present; no crash point loses data. Applications needing atomic multi-path changes MUST implement them above the archive.
 
 ## 10.3 Large object transactions: `ADD_BEGIN` / `ADD_EXTENT` / `ADD_COMMIT`
 
@@ -1476,7 +1476,7 @@ Truncating a torn tail is not an in-place modification of committed data, becaus
 
 Normal hot-path operation maintains one index per `(generation_id, blob_ordinal)`. It maps `frame_hash` to one or more candidate physical records and remains fully rebuildable from raw blob scans.
 
-R10 retains the R8 interoperable index container because stale cross-generation indexes must be detectable without guessing. The file begins with a 64-byte header:
+R11 retains the R8 interoperable index container because stale cross-generation indexes must be detectable without guessing. The file begins with a 64-byte header:
 
 | Offset | Size | Field |
 |---|---:|---|
@@ -1640,7 +1640,7 @@ It MUST NOT derive or guess the decryption nonce from the frame's **current** ph
 
 ## 11.8 Anti-rollback-aware open and recovery
 
-When STANDARD policy is used, archive opening follows normal R10 validation and no external freshness proof is required.
+When STANDARD policy is used, archive opening follows normal R11 validation and no external freshness proof is required.
 
 When HARDENED policy is configured:
 
@@ -1758,7 +1758,7 @@ destination generation durable
 -> report switch durable
 ```
 
-For HARDENED policy, R10 requires the Generation Anchor protocol of §13.6.1.
+For HARDENED policy, R11 requires the Generation Anchor protocol of §13.6.1.
 
 Old generations remain intact until the switch is durable.
 
@@ -1836,13 +1836,15 @@ Emergency Pruning MUST:
 
 Emergency Pruning MUST NOT be used merely because a healthy resource is temporarily unreachable.
 
-The storage format of `EMERGENCY_PRUNE` events and DEGRADED/UNRECOVERABLE health state is implementation-defined in R10. An implementation that opens an archive without understanding another implementation's health metadata MUST treat the parity protection state as **unknown** and MUST NOT report original protection levels as intact; it SHOULD run a full parity verification before claiming any protection level.
+A logical object version given up by Emergency Pruning leaves the live state, because a manifest record must cover `[0, logical_length)` (§10.2). Its path MUST NOT then be reported as absent or deleted (R11-1): until the path receives a new version or is explicitly deleted, a lookup of it MUST fail with an error distinct from "not found" that names the version as UNRECOVERABLE. A tool that synchronizes or replicates archives would otherwise take the loss for a deletion and spread it. An explicit delete of such a path acknowledges the loss and MUST persist that acknowledgement before the deletion is reported.
+
+The storage format of `EMERGENCY_PRUNE` events and DEGRADED/UNRECOVERABLE health state is implementation-defined in R11. An implementation that opens an archive without understanding another implementation's health metadata MUST treat the parity protection state as **unknown** and MUST NOT report original protection levels as intact; it SHOULD run a full parity verification before claiming any protection level.
 
 ---
 
 # 14. Legacy Compatibility
 
-R10 uses the unchanged R8 wire version `0x0006`.
+R11 uses the unchanged R8 wire version `0x0006`.
 
 Readers MUST dispatch on Archive Header `version` and MUST NOT parse older layouts using R8 structures.
 
@@ -1852,17 +1854,17 @@ At minimum:
 - `0x0003` — R3/R4/R5 family;
 - `0x0004` — R6 development wire layout;
 - `0x0005` — R7;
-- `0x0006` — R8/R9/R10 semantic revision family.
+- `0x0006` — R8/R9/R10/R11 semantic revision family.
 
-R10 implementations MUST reject unsupported wire versions rather than guess. "Recognize" in §19 means: identify the legacy version and fail with a distinct unsupported-legacy-version error, without parsing any further field. Every legacy layout carries ASCII `STSH` at offset `0x00` and a little-endian uint16 version at offset `0x04`; recognition reads only these six bytes. R8, R9 and R10 are byte-compatible at wire `0x0006`; semantic/security policy differences are implementation/deployment behavior, not new media bytes.
+R11 implementations MUST reject unsupported wire versions rather than guess. "Recognize" in §19 means: identify the legacy version and fail with a distinct unsupported-legacy-version error, without parsing any further field. Every legacy layout carries ASCII `STSH` at offset `0x00` and a little-endian uint16 version at offset `0x04`; recognition reads only these six bytes. R8, R9 and R11 are byte-compatible at wire `0x0006`; semantic/security policy differences are implementation/deployment behavior, not new media bytes.
 
-Legacy v1.21 `.sf` and `SUB` syntax remains migration-only and is not valid R10 syntax.
+Legacy v1.21 `.sf` and `SUB` syntax remains migration-only and is not valid R11 syntax.
 
 ---
 
 # 15. Encryption — Normative Enterprise Profile
 
-R10 retains the R8 encryption algorithm unchanged: AES-256-GCM. Encryption is enabled exactly when Archive Header `flags & 0x01 != 0` (`ENCRYPTED`). When enabled, the following construction is normative.
+R11 retains the R8 encryption algorithm unchanged: AES-256-GCM. Encryption is enabled exactly when Archive Header `flags & 0x01 != 0` (`ENCRYPTED`). When enabled, the following construction is normative.
 
 ## 15.1 Archive DEK
 
@@ -1965,7 +1967,7 @@ Encrypted DATA/PACKED payloads, encrypted DATA/PACKED Pre-Trailers, and encrypte
 
 ## 15.4 Frame AAD
 
-R10 frame payload and encrypted Pre-Trailer AEAD bind only stable bytes that are available from the frame itself after manifest loss and remain unchanged during byte-preserving compaction.
+R11 frame payload and encrypted Pre-Trailer AEAD bind only stable bytes that are available from the frame itself after manifest loss and remain unchanged during byte-preserving compaction.
 
 Canonical AAD is:
 
@@ -1989,7 +1991,7 @@ A byte-preserving compactor MUST retain all AAD-covered frame metadata unchanged
 
 ## 15.5 Collision-free numeric nonce construction
 
-R10 retains the R8 numeric nonce construction unchanged; BLAKE3-based/truncated-hash nonce derivation remains forbidden.
+R11 retains the R8 numeric nonce construction unchanged; BLAKE3-based/truncated-hash nonce derivation remains forbidden.
 
 For encrypted archives only, implementations MUST enforce before encryption:
 
@@ -2175,15 +2177,15 @@ With keys, recovery reads the nonce directly from the stored `nonce || ciphertex
 
 ## 15.11 Encryption and deduplication
 
-R10 retains the R8 distinction between logical/content identity and ciphertext identity. Standard R10 encryption does not guarantee that identical plaintext written independently produces identical ciphertext.
+R11 retains the R8 distinction between logical/content identity and ciphertext identity. Standard R11 encryption does not guarantee that identical plaintext written independently produces identical ciphertext.
 
-Convergent/content-derived encryption and cross-tenant plaintext deduplication are outside R10.
+Convergent/content-derived encryption and cross-tenant plaintext deduplication are outside R11.
 
 ---
 
 # 15A. Security Policies — STANDARD and HARDENED
 
-R10 defines two deployment policies. These are not wire identifiers and do not modify the archive bytes.
+R11 defines two deployment policies. These are not wire identifiers and do not modify the archive bytes.
 
 ## 15A.1 STANDARD
 
@@ -2261,7 +2263,7 @@ Unsigned overflow MUST fail closed.
 
 ## 16.2 Geometry
 
-A conformant R10 implementation MUST preserve:
+A conformant R11 implementation MUST preserve:
 
 - `ARCHIVE_HEADER_SIZE == 64` and `FRAME_AREA_START == 0x40`;
 - `FRAME_PREFIX_SIZE == 16`;
@@ -2300,7 +2302,7 @@ A conformant R10 implementation MUST preserve:
 
 ## 16.5 Parity
 
-- R10 retains the R8 parity IDs NONE, XOR, and Reed-Solomon; parity operates over the exact canonical recovery shard defined in §7.2.
+- R11 retains the R8 parity IDs NONE, XOR, and Reed-Solomon; parity operates over the exact canonical recovery shard defined in §7.2.
 - Every parity group is self-describing.
 - Group members have identical `frame_quanta`.
 - Active parity spans at least two blobs.
@@ -2344,9 +2346,9 @@ A conformant R10 implementation MUST preserve:
 
 ---
 
-# 17. Required R10 Conformance Harness and Test Matrix
+# 17. Required R11 Conformance Harness and Test Matrix
 
-The R10 required test matrix is part of the specification and is not optional implementation guidance.
+The R11 required test matrix is part of the specification and is not optional implementation guidance.
 
 ## 17.1 Independent golden vectors
 
@@ -2488,7 +2490,7 @@ XOR
 Reed-Solomon
 ```
 
-and reject every reserved parity identifier. Equal member physical size and multi-blob spread invariants MUST be tested. Reed-Solomon parity MUST be byte-identical to the golden vectors of §17.1, which MUST be produced by an implementation independent of the one under test. Short groups, the per-group invariants of §7, parity regrouping (§13.7.1), the 112-byte padding boundary of §7.2, `group_id` conflicts in raw recovery, `group_id` allocation across a crash, and repair through compaction including a lost PARITY frame (§7.3.1) MUST be tested. Emergency Pruning tests MUST verify parity health is downgraded/rebuilt explicitly rather than silently lost.
+and reject every reserved parity identifier. Equal member physical size and multi-blob spread invariants MUST be tested. Reed-Solomon parity MUST be byte-identical to the golden vectors of §17.1, which MUST be produced by an implementation independent of the one under test. Short groups, the per-group invariants of §7, parity regrouping (§13.7.1), the 112-byte padding boundary of §7.2, `group_id` conflicts in raw recovery, `group_id` allocation across a crash, and repair through compaction including a lost PARITY frame (§7.3.1) MUST be tested. Emergency Pruning tests MUST verify parity health is downgraded/rebuilt explicitly rather than silently lost, and that a pruned path is reported UNRECOVERABLE, not absent, until it is rewritten or explicitly deleted (R11-1).
 
 ## 17.9 Cryptography
 
@@ -2620,7 +2622,7 @@ A profile is a data-processing preset and is not stored as a separate wire ident
 
 The reference FUSE adapter is permanently read-only, calls only the public Go library API, pins one validated `generation_id` for the lifetime of a mount (registering a reader pin, §13.1.1), and returns `EROFS` for every mutation attempt. A missing persistent physical index MAY be replaced by a temporary in-memory index built by the library; the FUSE adapter MUST NOT modify archive blobs, manifests, persistent indexes, generations, or root metadata.
 
-# 19. R10 Production Readiness Checklist
+# 19. R11 Production Readiness Checklist
 
 - [ ] Every blob Archive Header is exactly 64 bytes and begins with `STSH`.
 - [ ] Header wire version is `0x0006`.
@@ -2653,6 +2655,7 @@ The reference FUSE adapter is permanently read-only, calls only the public Go li
 - [ ] Parity algorithms are only NONE/XOR/Reed-Solomon and reserved IDs fail closed.
 - [ ] Parity groups use equal `frame_quanta`, exact canonical recovery shards, and reconstruct complete missing frames without manifest.
 - [ ] Emergency Pruning performs parity-impact analysis.
+- [ ] A version given up by Emergency Pruning is reported UNRECOVERABLE, never as absent (R11-1).
 - [ ] Hash algorithms are only SHA-256/BLAKE3 and reserved IDs fail closed.
 - [ ] Compression profiles are only STORE/ZSTD_FAST/ZSTD_DEFAULT/ZSTD_DENSE and reserved IDs fail closed.
 - [ ] Every ZSTD payload is independently decodable and bounded by declared logical output limits.
@@ -2703,7 +2706,7 @@ The reference FUSE adapter is permanently read-only, calls only the public Go li
 
 ---
 
-# 20. Summary of R10 Changes
+# 20. Summary of R10 and R11 Changes
 
 R10 completes R9 and fixes defects found by an independent review. It retains wire version `0x0006` and every binary structure of R8/R9 byte for byte. R9's own additions (Generation Anchor, STANDARD/HARDENED, switch ordering) remain and are extended.
 
@@ -2855,16 +2858,26 @@ E1 was applied in 2026-11, before any implementation existed. It fixes defects f
 | E1-24 | Post-Mark delta merged by net effect per path; post-Mark groups keep their `group_id` only below the destination's allocation start | §13.4 | §7 asked a compactor to initialize the destination `groups.alloc` above every copied ID before allocating new ones, which a concurrent Sweep cannot do: groups written after the Mark are copied after the destination has allocated IDs for regrouping, and could collide |
 | E1-25 | Optional key-check value `HKDF(DEK, archive_id, "STASH-KEY-CHECK-R10")`, stored outside the wire format; a mismatching DEK is refused at open | §15.1.1 | A wrong DEK was detected only when the first authenticated structure failed; an archive with an empty manifest accepted any key and a writer would have sealed new frames with it, splitting the archive between two keys |
 
+## 20.6 Revision R11
+
+R11 (2026-11) folds Erratum E1 into the text and adds what the Go reference implementation showed to be necessary. It changes no binary structure, no parsing rule and no wire version: media written by a conforming R10-with-E1 implementation is R11 media.
+
+| ID | Change | Sections | Reason |
+|---|---|---|---|
+| R11-1 | A version given up by Emergency Pruning is reported as UNRECOVERABLE, never as absent, until the path is rewritten or explicitly deleted; the delete's acknowledgement is durable first | §13.9 | The text required health records but left the lookup result open; reporting "not found" makes a loss indistinguishable from a deletion for sync and replication tools |
+| R11-2 | Consolidation: "R10 with E1" is called R11; the E1 table (§20.5) stays as the record of those changes | front matter, all sections | One revision name for one text |
+| R11-3 | Identifiers keep their R10 names: the HKDF info strings `STASH-OBJECT-ID-KEY-R10` and `STASH-KEY-CHECK-R10` (and the R8 info strings of §15.2) are byte strings of the construction, not revision labels, and MUST NOT change | §15.1.1, §15.2, §6.5 | Renaming them would change every derived key and keyed `object_id` |
+
 # 21. README / Public Specification Requirements
 
-README material describing R10 MUST state:
+README material describing R11 MUST state:
 
 ```text
-🌀 STASH 2.0 Revision R10
+🌀 STASH 2.0 Revision R11
 wire version 0x0006
 ```
 
-It MUST make clear that R10 does not change the R8/R9 binary structure layouts, that it adds the Allocator State file, and that Erratum E1 is part of R10.
+It MUST make clear that R11 does not change the R8/R9 binary structure layouts, that R10 added the Allocator State file, and that R11 is R10 with Erratum E1 consolidated (§20.6).
 
 It MUST include:
 
@@ -2894,18 +2907,18 @@ FIXED    = deterministic slot geometry / maximum recovery parallelism
 
 It MUST state that every object version is self-contained, so a change or rename of an object rewrites that object, and it SHOULD recommend modeling incrementally changing data as many immutable objects.
 
-It MUST state that the R10 required test matrix is part of the specification and is not optional implementation guidance.
+It MUST state that the R11 required test matrix is part of the specification and is not optional implementation guidance.
 
 # 22. Freeze
 
-> **🌀 STASH 2.0 R10 is FROZEN at wire version `0x0006`. R10 does not change the R8/R9 binary wire format.**
+> **🌀 STASH 2.0 R11 is FROZEN at wire version `0x0006`. R11 does not change the R8/R9 binary wire format.**
 
-The next milestone is implementation:
+The implementation milestones, in order (the Go reference implementation has passed each of them; an independent second implementation and interoperability testing remain):
 
 ```text
 Go reference implementation
     ↓
-R10 semantic + 0x0006 wire conformance harness
+R11 semantic + 0x0006 wire conformance harness
     ↓
 golden vectors
     ↓
@@ -2924,7 +2937,7 @@ Any future change to on-disk bytes, field semantics required for parsing, manife
 
 Pure implementation, deployment-provider, or operational-policy changes do not.
 
-Erratum E1 (§20.5) is the single exception to this rule: it was made before any implementation or media existed. From the first published implementation on, every such change requires a new wire version.
+Erratum E1 (§20.5) is the single exception to this rule: it was made before any implementation or media existed. R11 (§20.6) changes none of these. From the first published implementation on, every such change requires a new wire version.
 
 ## License
 

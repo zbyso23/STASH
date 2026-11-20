@@ -63,6 +63,8 @@ type view struct {
 	// parity archive continue without it, §7.4).
 	unavailable map[uint8]error
 	repairs
+	// lost holds the generation's UNRECOVERABLE markers (lost.go)
+	lost *lostSet
 
 	// users counts open Objects; a retired view (an earlier generation
 	// after compaction) closes its files when the last one closes.
@@ -138,6 +140,7 @@ func (v *view) openBlobs(writeIndexes, tolerate bool) (statuses []index.Status, 
 
 func (v *view) close() {
 	v.closeOnce.Do(func() {
+		v.lost.close()
 		v.fdir.close()
 		for _, b := range v.blobs {
 			if b != nil {
@@ -683,6 +686,11 @@ func openReaderAt(fsys vfs.FS, pool *bufpool.Pool, root wire.Root, limit int64, 
 		}
 	}
 	r := &Reader{view: view{fsys: fsys, gen: gen, h: h, pool: pool, k: k, env: env, kv: senv.Table(), hints: st}, st: st, memClose: cleanup, stEnv: senv}
+	if r.lost, err = openLostSet(fsys, k, root.GenerationID, false); err != nil {
+		st.Close()
+		cleanup()
+		return nil, err
+	}
 	if _, err := r.openBlobs(false, h.ParityScheme != wire.ParityNone); err != nil {
 		r.close()
 		st.Close()
@@ -717,7 +725,7 @@ func (r *Reader) Stat(p string) (*manifest.Version, error) {
 		return nil, err
 	}
 	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrNotFound, p)
+		return nil, r.notFound(p)
 	}
 	return v, nil
 }
@@ -753,4 +761,18 @@ func (r *Reader) Close() error {
 		r.memClose()
 	}
 	return r.pin.Release()
+}
+
+// notFound is the error of a path without a live version: an
+// UNRECOVERABLE marker if one stands (never mistaken for a deletion),
+// ErrNotFound otherwise.
+func (v *view) notFound(p string) error {
+	u, err := v.lost.lookup(p)
+	if err != nil {
+		return err
+	}
+	if u != nil {
+		return u
+	}
+	return fmt.Errorf("%w: %s", ErrNotFound, p)
 }

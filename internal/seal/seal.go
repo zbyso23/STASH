@@ -33,6 +33,8 @@ const (
 	// InfoHealth keys the implementation's health records (Emergency
 	// Pruning, §13.9); like the key check it is not wire format.
 	InfoHealth = "STASH-HEALTH-AEAD-R10"
+	// InfoHealthMAC keys the path digests of UNRECOVERABLE markers.
+	InfoHealthMAC = "STASH-HEALTH-MAC-R10"
 )
 
 // Errors.
@@ -91,6 +93,7 @@ type Keys struct {
 	ArchiveID          [32]byte
 	frame, pt, man     cipher.AEAD
 	health             cipher.AEAD
+	healthMAC          [32]byte
 	objectID, keyCheck [32]byte
 }
 
@@ -125,7 +128,20 @@ func New(dek []byte, archiveID [32]byte) (*Keys, error) {
 	if k.health, err = gcm([32]byte(hk)); err != nil {
 		return nil, err
 	}
+	mk, err := hkdf.Key(sha256.New, dek, archiveID[:], InfoHealthMAC, 32)
+	if err != nil {
+		return nil, err
+	}
+	k.healthMAC = [32]byte(mk)
 	return k, nil
+}
+
+// HealthMAC is HMAC-SHA-256 of b under the health MAC key: the path digest
+// of an UNRECOVERABLE marker, which must not reveal the path.
+func (k *Keys) HealthMAC(b []byte) [32]byte {
+	m := hmac.New(sha256.New, k.healthMAC[:])
+	m.Write(b)
+	return [32]byte(m.Sum(nil))
 }
 
 // KeyCheck is the value stored in key.check (E1-25).

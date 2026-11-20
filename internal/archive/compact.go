@@ -6,11 +6,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"path"
 	"runtime"
 	"slices"
 	"sync"
+	"time"
 
 	"stash/internal/blob"
 	"stash/internal/frame"
@@ -71,6 +73,9 @@ type verKey struct {
 	ver  uint64
 }
 
+// compactTrace, when set (scale tests), receives each phase's duration.
+var compactTrace func(phase string, d time.Duration)
+
 // GCBlockedError reports a compaction that found committed extents it can
 // neither find nor rebuild: the generation is GC-blocked (§13.8). It
 // matches ErrMissingData. Extents is the count an Emergency Pruning must
@@ -118,6 +123,9 @@ type compactor struct {
 	repack     []*commitReq
 	repackSize int
 	prune      *EmergencyPrune
+	// claims serializes the check-and-delete of one wanted key ('L')
+	// between workers without a lock over the whole table
+	claims [64]sync.Mutex
 }
 
 // Compact runs Mark -> Sweep -> Freeze/Merge -> Switch -> GC (§13): the live
@@ -131,6 +139,13 @@ type compactor struct {
 // A committed extent that cannot be found or rebuilt fails the compaction
 // (the generation is GC-blocked, §13.8); nothing is switched.
 func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactResult, err error) {
+	t0 := time.Now()
+	mark := func(phase string) {
+		if compactTrace != nil {
+			compactTrace(phase, time.Since(t0))
+			t0 = time.Now()
+		}
+	}
 	w.compactMu.Lock()
 	defer w.compactMu.Unlock()
 	if opt.EmergencyPrune != nil {
@@ -152,7 +167,13 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 	// Mark (§13.1): the live state at one point
 	w.genMu.RLock()
 	src := w.view
-	c := &compactor{src: src, res: &res, tab: kvtab.New(src.kv),
+	// the working table takes most writes of a compaction: a larger
+	// in-memory delta than the default means fewer files and merges
+	tc := src.kv
+	if tc.MemLimit == 0 && tc.Budget.Limit() > 0 {
+		tc.MemLimit = tc.Budget.Limit() / 8
+	}
+	c := &compactor{src: src, res: &res, tab: kvtab.New(tc),
 		maxOrd: make([]uint64, src.h.BlobCount), hasOrd: make([]bool, src.h.BlobCount), regroup: map[uint32][]*frame.Spec{}}
 	defer c.tab.Close()
 	c.prune = opt.EmergencyPrune
@@ -200,6 +221,8 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 			if prepared != "" {
 				w.fsys.Remove(prepared) // else the next open removes it (to > root)
 			}
+			w.fsys.Remove(lostIndexName(id)) // likewise
+			w.fsys.Remove(clearedName(id))
 		}
 	}()
 	if err := d.openGeneration(GenDir(id), &dh); err != nil {
@@ -217,16 +240,22 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 	}
 	c.d, c.groupFloor = d, floor
 
+	mark("mark")
 	// Sweep (§13.2): concurrent with writes to the source
 	if err := c.copyVersions(ctx); err != nil {
 		return res, err
 	}
+	mark("sweep")
 	// §13.2.1: one record per live path in bytewise order
+	// a merge join: the snapshot ('S') and the destination locs ('D')
+	// are both in path order, so one forward pass reads every loc
+	dlocs := c.newLocJoin()
+	defer dlocs.close()
 	if err := c.eachPath('S', func(p string, ver uint64) error {
 		if gone, err := c.lost(p, ver); err != nil || gone {
 			return err
 		}
-		locs, err := c.sortedLocs(p, ver)
+		locs, err := dlocs.locs(p, ver)
 		if err == nil {
 			err = d.journal.Add(p, ver, locs)
 		}
@@ -240,10 +269,12 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 	if err := c.durable(); err != nil {
 		return res, err
 	}
+	mark("records+durable")
 	if err := c.verify(ctx, 'S', true); err != nil {
 		return res, err
 	}
 
+	mark("verify")
 	// Freeze/Merge (§13.5): no commit against the old root from here on
 	w.genMu.Lock()
 	defer w.genMu.Unlock()
@@ -361,6 +392,10 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 		res.Prune = &r
 	}
 
+	if err := c.foldLost(id); err != nil {
+		return res, err
+	}
+	mark("freeze")
 	// Switch (§13.6): HARDENED advances the anchor first (§13.6.1 steps
 	// 6-9); an error leaves the destination in place, because the anchor
 	// may name it already, and the writer needs a reopen
@@ -408,6 +443,7 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 		}
 		w.health.PruneRecords++
 	}
+	mark("switch")
 	// GC (§13): old generations nothing pins any more
 	if !opt.KeepOld {
 		removed, err := w.gcLocked()
@@ -587,32 +623,35 @@ func (c *compactor) copyVersions(ctx context.Context) error {
 	// ungrouped frames holding a wanted entry are copied as they are
 	// found; groups holding one are queued ('q') and handled after
 	if err := run(func(send func(func() error) bool) error {
+		// the wanted check runs in the workers: the feeder only walks the
+		// frame directory, the lookups are spread over every core
 		return fd.each(func(m *hopMember) (bool, error) {
-			if done, err := c.has(frameKeyBytes('d', m.blob, m.off)); err != nil || done {
-				return err == nil, err
-			}
-			wanted := false
-			for _, e := range m.entries {
-				ok, err := c.has(liveKeyBytes(keyOf(m.blob, m.t.HashPayload, e, m.t.BlockType)))
-				if err != nil {
-					return false, err
+			return send(func() error {
+				if done, err := c.has(frameKeyBytes('d', m.blob, m.off)); err != nil || done {
+					return err
 				}
-				if wanted = ok; wanted {
-					break
+				wanted := false
+				for _, e := range m.entries {
+					ok, err := c.has(liveKeyBytes(keyOf(m.blob, m.t.HashPayload, e, m.t.BlockType)))
+					if err != nil {
+						return err
+					}
+					if wanted = ok; wanted {
+						break
+					}
 				}
-			}
-			if !wanted {
-				return true, nil
-			}
-			if g := m.t.GroupID; g != 0 {
-				q := binary.BigEndian.AppendUint32([]byte{'q'}, g)
-				done, err := c.has(binary.BigEndian.AppendUint32([]byte{'g'}, g))
-				if err == nil && !done {
-					err = c.tab.Put(q, nil)
+				if !wanted {
+					return nil
 				}
-				return err == nil, err
-			}
-			return send(func() error { return c.single(m) }), nil
+				if g := m.t.GroupID; g != 0 {
+					done, err := c.has(binary.BigEndian.AppendUint32([]byte{'g'}, g))
+					if err == nil && !done {
+						err = c.tab.Put(binary.BigEndian.AppendUint32([]byte{'q'}, g), nil)
+					}
+					return err
+				}
+				return c.single(m)
+			}), nil
 		})
 	}); err != nil {
 		return err
@@ -848,19 +887,23 @@ func (c *compactor) clear(tag byte) error {
 	}
 }
 
-// take claims the wanted entries of a frame of source blob b. full is true
-// when every entry is wanted. c.mu is held.
-func (c *compactor) takeLocked(b uint8, t *wire.MasterTrailer, entries []wire.Entry) (live []wire.Entry, full bool, err error) {
+// take claims the wanted entries of a frame of source blob b: each wanted
+// key is claimed once, by whichever worker deletes it first. full is true
+// when every entry is wanted.
+func (c *compactor) take(b uint8, t *wire.MasterTrailer, entries []wire.Entry) (live []wire.Entry, full bool, err error) {
 	for _, e := range entries {
 		k := liveKeyBytes(keyOf(b, t.HashPayload, e, t.BlockType))
+		mu := &c.claims[crc32.ChecksumIEEE(k)%uint32(len(c.claims))]
+		mu.Lock()
 		ok, err := c.has(k)
+		if err == nil && ok {
+			err = c.tab.Delete(k)
+		}
+		mu.Unlock()
 		if err != nil {
 			return nil, false, err
 		}
 		if ok {
-			if err := c.tab.Delete(k); err != nil {
-				return nil, false, err
-			}
 			live = append(live, e)
 		}
 	}
@@ -931,6 +974,50 @@ func (c *compactor) sortedLocs(p string, ver uint64) ([]manifest.Loc, error) {
 	return ls, it.Err()
 }
 
+// locJoin reads the destination locs ('D' keys) of versions visited in
+// path order with one forward iterator.
+type locJoin struct {
+	it  *kvtab.Iter
+	ok  bool
+	err error
+}
+
+func (c *compactor) newLocJoin() *locJoin {
+	j := &locJoin{it: c.tab.Iter([]byte{'D'})}
+	j.ok = j.it.Next()
+	return j
+}
+
+func (j *locJoin) close() { j.it.Close() }
+
+// locs returns the locs of (p, ver) in offset order; calls must come in
+// increasing key order.
+func (j *locJoin) locs(p string, ver uint64) ([]manifest.Loc, error) {
+	pfx := destPrefix(p, ver)
+	for j.ok && j.it.Key()[0] == 'D' && bytes.Compare(j.it.Key(), pfx) < 0 {
+		j.ok = j.it.Next()
+	}
+	var ls []manifest.Loc
+	for j.ok {
+		k, v := j.it.Key(), j.it.Value()
+		if !bytes.HasPrefix(k, pfx) {
+			break
+		}
+		if len(k) != len(pfx)+8 || len(v) != 1+32+8 {
+			return nil, kvtab.ErrTampered
+		}
+		ls = append(ls, manifest.Loc{Blob: v[0], Hash: [32]byte(v[1:33]), Offset: binary.BigEndian.Uint64(k[len(pfx):]),
+			Length: binary.BigEndian.Uint64(v[33:])})
+		j.ok = j.it.Next()
+	}
+	if !j.ok {
+		if err := j.it.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return ls, nil
+}
+
 // single handles an ungrouped frame.
 func (c *compactor) single(m *hopMember) error {
 	bv := c.src.blobs[m.blob]
@@ -946,14 +1033,12 @@ func (c *compactor) single(m *hopMember) error {
 	if t.HashPayload != m.t.HashPayload || t.GroupID != 0 {
 		return nil
 	}
-	c.mu.Lock()
 	err = c.tab.Put(frameKeyBytes('d', m.blob, m.off), nil)
 	var live []wire.Entry
 	var full bool
 	if err == nil {
-		live, full, err = c.takeLocked(m.blob, t, ref.Entries)
+		live, full, err = c.take(m.blob, t, ref.Entries)
 	}
-	c.mu.Unlock()
 	if err != nil || len(live) == 0 {
 		return err
 	}
@@ -1043,18 +1128,17 @@ func (c *compactor) group(g uint32, ms []*hopMember) error {
 	live := make([][]wire.Entry, k)
 	full := make([]bool, k)
 	any := false
-	c.mu.Lock()
 	for i := 0; i < k && err == nil; i++ {
 		if refs[i] != nil {
 			b := uint8(max(srcBlob[i], 0))
-			live[i], full[i], err = c.takeLocked(b, &refs[i].Trailer, refs[i].Entries)
+			live[i], full[i], err = c.take(b, &refs[i].Trailer, refs[i].Entries)
 			if srcBlob[i] < 0 {
 				// a member lost with its blob: its loc names the blob it
 				// was written to, which only the manifest knows; match any
 				// blob of the archive
 				for bb := 0; bb < int(h.BlobCount) && len(live[i]) < len(refs[i].Entries) && err == nil; bb++ {
 					var more []wire.Entry
-					more, _, err = c.takeLocked(uint8(bb), &refs[i].Trailer, refs[i].Entries)
+					more, _, err = c.take(uint8(bb), &refs[i].Trailer, refs[i].Entries)
 					live[i] = append(live[i], more...)
 				}
 				full[i] = len(live[i]) == len(refs[i].Entries)
@@ -1062,7 +1146,6 @@ func (c *compactor) group(g uint32, ms []*hopMember) error {
 			any = any || len(live[i]) > 0
 		}
 	}
-	c.mu.Unlock()
 	if err != nil {
 		return err
 	}

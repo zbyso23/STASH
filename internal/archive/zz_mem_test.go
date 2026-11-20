@@ -153,6 +153,8 @@ func TestZZMemory(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		compactTrace = func(ph string, d time.Duration) { t.Logf("RESULT compact-phase %s %.2fs", ph, d.Seconds()) }
+		defer func() { compactTrace = nil }()
 		start := time.Now()
 		res, err := w.Compact(context.Background(), CompactOptions{})
 		if err != nil {

@@ -80,6 +80,10 @@ type sst struct {
 	level  int
 	refs   int32 // iterators and the table
 	topMem int64
+	// filter skips the file for keys it does not hold (nil: none); its
+	// memory is reserved from the table's budget
+	filter    *bloom
+	filterRes interface{ Release() }
 }
 
 // sstWriter streams sorted records into a file.

@@ -1,4 +1,4 @@
-// Command stash is the command-line interface of the STASH 2.0 R10
+// Command stash is the command-line interface of the STASH 2.0 R11
 // reference implementation (SPEC.md). Run "stash help" for the commands.
 package main
 
@@ -688,7 +688,10 @@ var lsLong bool
 
 func lsFlags(fl *flag.FlagSet) {
 	fl.BoolVar(&lsLong, "l", false, "show size and version")
+	fl.BoolVar(&lsPruned, "pruned", false, "list the UNRECOVERABLE paths an emergency prune gave up instead")
 }
+
+var lsPruned bool
 
 func cmdLs(e *env, _ *flag.FlagSet, args []string) error {
 	r, err := openReader(args[0])
@@ -699,6 +702,14 @@ func cmdLs(e *env, _ *flag.FlagSet, args []string) error {
 	prefix := ""
 	if len(args) > 1 {
 		prefix = args[1]
+	}
+	if lsPruned {
+		return r.Unrecoverable(func(u stash.UnrecoverableError) bool {
+			if strings.HasPrefix(u.Path, prefix) {
+				fmt.Fprintf(e.stdout, "UNRECOVERABLE  v%d  pruned into generation %d  %s\n", u.FileVer, u.PrunedInto, u.Path)
+			}
+			return true
+		})
 	}
 	tw := tabwriter.NewWriter(e.stdout, 2, 8, 2, ' ', tabwriter.AlignRight)
 	if err := r.Walk(prefix, "", func(in stash.Info) bool {
@@ -786,7 +797,7 @@ func cmdVerify(e *env, _ *flag.FlagSet, args []string) error {
 	}
 	if h := a.Health(); h.PruneRecords > 0 || len(h.ForeignHealth) > 0 {
 		if h.PruneRecords > 0 {
-			fmt.Fprintf(w, "pruned    %d emergency prunes gave data up (stash health -v)\n", h.PruneRecords)
+			fmt.Fprintf(w, "pruned    %d emergency prunes gave data up (stash health -v); %d paths still UNRECOVERABLE (stash ls -pruned)\n", h.PruneRecords, h.Unrecoverable)
 		}
 		for _, n := range h.ForeignHealth {
 			fmt.Fprintf(w, "unknown   health/%s: another implementation's health metadata (parity state checked above)\n", n)

@@ -97,7 +97,7 @@ func TestEmergencyPrune(t *testing.T) {
 	if res.Prune == nil || res.Prune.LostExtents != 1 || res.Prune.LostVersions != 1 || len(res.Removed) != 1 {
 		t.Fatalf("result %+v %+v", res, res.Prune)
 	}
-	if _, err := w.Get("x"); !errors.Is(err, ErrNotFound) {
+	if _, err := w.Get("x"); !isLost(err) {
 		t.Fatalf("x after prune: %v", err)
 	}
 	checkAll(t, w.Get, map[string][]byte{"y": data(4, 200), "z": data(3, 30000)})
@@ -180,7 +180,7 @@ func TestEmergencyPruneParityImpact(t *testing.T) {
 		got, err := w.Get(pth)
 		switch {
 		case lost[pth]:
-			if !errors.Is(err, ErrNotFound) {
+			if !isLost(err) {
 				t.Fatalf("%s lost but %v", pth, err)
 			}
 		case err != nil || !bytes.Equal(got, b):
@@ -309,7 +309,7 @@ func TestEmergencyPruneCrash(t *testing.T) {
 			if len(recs) != 1 || !recs[0].Committed || recs[0].To != w2.h.GenerationID {
 				t.Fatalf("snapshot %d: records %+v", i, recs)
 			}
-			if _, err := w2.Get("obj/k"); !errors.Is(err, ErrNotFound) {
+			if _, err := w2.Get("obj/k"); !isLost(err) {
 				t.Fatalf("snapshot %d: obj/k %v", i, err)
 			}
 		}
@@ -357,7 +357,7 @@ func TestEmergencyPruneHardened(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer r.Close()
-	if _, err := r.Get("x"); !errors.Is(err, ErrNotFound) {
+	if _, err := r.Get("x"); !isLost(err) {
 		t.Fatal(err)
 	}
 	if recs, _, err := r.PruneRecords(); err != nil || len(recs) != 1 || !recs[0].Committed {
@@ -382,4 +382,140 @@ func TestEmergencyPruneNothingLost(t *testing.T) {
 		t.Fatalf("record left: %v", ents)
 	}
 	checkAll(t, w.Get, map[string][]byte{"x": data(1, 50000)})
+}
+
+// isLost: the error of a pruned path is UNRECOVERABLE and missing data,
+// never "not found" (a sync tool must not take it for a deletion).
+func isLost(err error) bool {
+	var u *UnrecoverableError
+	return errors.As(err, &u) && errors.Is(err, ErrUnrecoverable) && errors.Is(err, ErrMissingData) && !errors.Is(err, ErrNotFound)
+}
+
+func pruneOne(t *testing.T, key []byte, lose ...string) (*vfs.CrashFS, CompactResult) {
+	t.Helper()
+	fsys := vfs.NewCrashFS()
+	c := cfg
+	c.Key = key
+	if _, err := Create(fsys, c); err != nil {
+		t.Fatal(err)
+	}
+	w := eopen(t, fsys, key)
+	for i, p := range []string{"a", "b", "c", "d"} {
+		w.Put(p, data(20+i, 70000))
+	}
+	for _, p := range lose {
+		damageExtent(t, fsys, w, p, 0)
+	}
+	w.Close()
+	w = eopen(t, fsys, key)
+	defer w.Close()
+	res, err := w.Compact(context.Background(), CompactOptions{EmergencyPrune: prune(blockedCount(t, w))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fsys, res
+}
+
+// The marker lifecycle: a Put shadows it, a Delete clears it durably, a
+// normal compaction carries standing markers and drops cleared ones.
+func TestUnrecoverableMarkers(t *testing.T) {
+	for _, key := range [][]byte{nil, testKey} {
+		fsys, res := pruneOne(t, key, "a", "b", "c")
+		w := eopen(t, fsys, key)
+		ctx := context.Background()
+		for _, p := range []string{"a", "b", "c"} {
+			_, err := w.Get(p)
+			var u *UnrecoverableError
+			if !isLost(err) || !errors.As(err, &u) || u.Path != p || u.PrunedInto != res.To {
+				t.Fatalf("%s: %v", p, err)
+			}
+			if _, err := w.Stat(p); !isLost(err) {
+				t.Fatal(err)
+			}
+			if _, err := w.Open(p); !isLost(err) {
+				t.Fatal(err)
+			}
+		}
+		if _, err := w.Get("never"); !errors.Is(err, ErrNotFound) || isLost(err) {
+			t.Fatal(err)
+		}
+		if h := w.Health(); h.Unrecoverable != 3 {
+			t.Fatalf("health %+v", h)
+		}
+		var listed []string
+		w.Unrecoverable(func(u UnrecoverableError) bool { listed = append(listed, u.Path); return true })
+		if strings.Join(listed, ",") != "a,b,c" {
+			t.Fatalf("listed %v", listed)
+		}
+		// a restores from elsewhere; b is acknowledged; c stays lost
+		w.Put("a", data(1, 10))
+		if err := w.Delete("b"); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Delete("b"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("second delete: %v", err)
+		}
+		// a written again and then deleted is deleted, not lost
+		if err := w.Delete("a"); err != nil {
+			t.Fatal(err)
+		}
+		w.Close()
+		for round := 0; round < 2; round++ {
+			w = eopen(t, fsys, key)
+			for _, p := range []string{"a", "b"} {
+				if _, err := w.Get(p); !errors.Is(err, ErrNotFound) || isLost(err) {
+					t.Fatalf("round %d %s: %v", round, p, err)
+				}
+			}
+			if _, err := w.Get("c"); !isLost(err) {
+				t.Fatalf("round %d c: %v", round, err)
+			}
+			checkAll(t, w.Get, map[string][]byte{"d": data(23, 70000)})
+			if h := w.Health(); h.Unrecoverable != 1 {
+				t.Fatalf("round %d health %+v", round, h)
+			}
+			if round == 0 {
+				if _, err := w.Compact(ctx, CompactOptions{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			w.Close()
+		}
+		ents, _ := fsys.ReadDir(HealthDir)
+		var names []string
+		for _, e := range ents {
+			names = append(names, e.Name())
+		}
+		if len(names) != 3 { // the prune record, the current index and log
+			t.Fatalf("health files %v", names)
+		}
+		if key != nil {
+			for _, n := range names {
+				b, _ := vfs.ReadFile(fsys, HealthDir+"/"+n, 1<<20)
+				if bytes.Contains(b, []byte("\x00c\x00")) {
+					t.Fatalf("%s names a path", n)
+				}
+			}
+		}
+		r, err := OpenReaderWith(fsys, ReaderOptions{Key: key})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.Get("c"); !isLost(err) {
+			t.Fatal(err)
+		}
+		r.Close()
+	}
+}
+
+// A damaged marker index fails the open, never hides a loss.
+func TestUnrecoverableIndexDamaged(t *testing.T) {
+	fsys, res := pruneOne(t, nil, "a")
+	damage(t, fsys, lostIndexName(res.To), 20, 1)
+	if _, err := OpenWriter(fsys, Options{}); !errors.Is(err, wire.ErrCorrupt) {
+		t.Fatal(err)
+	}
+	if _, err := OpenReaderWith(fsys, ReaderOptions{}); !errors.Is(err, wire.ErrCorrupt) {
+		t.Fatal(err)
+	}
 }

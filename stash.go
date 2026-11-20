@@ -1,4 +1,4 @@
-// Package stash is the public API of the STASH 2.0 R10 reference
+// Package stash is the public API of the STASH 2.0 R11 reference
 // implementation (wire 0x0006, SPEC.md).
 //
 // Scope: the BASELINE, SECURE and FAST profiles (SPEC §5.2): SHA-256 or
@@ -74,6 +74,11 @@ var (
 	// ErrAnchorUnavailable: the anchor cannot be reached; HARDENED does
 	// not downgrade, the operation fails.
 	ErrAnchorUnavailable = archive.ErrAnchorUnavailable
+	// ErrUnrecoverable: the path's version was given up by an Emergency
+	// Pruning (the error is an *UnrecoverableError). It matches
+	// ErrMissingData, never ErrNotFound, so a loss is not mistaken for a
+	// deletion. A Put restores the path; a Delete acknowledges the loss.
+	ErrUnrecoverable = archive.ErrUnrecoverable
 	// ErrPruneRefused: an Emergency Pruning without the required
 	// authorization, or whose losses differ from the confirmed count.
 	ErrPruneRefused = archive.ErrPruneRefused
@@ -490,6 +495,9 @@ type CompactResult = archive.CompactResult
 // encrypted archive) is written before anything is switched or deleted.
 type EmergencyPrune = archive.EmergencyPrune
 
+// UnrecoverableError names a version an Emergency Pruning gave up.
+type UnrecoverableError = archive.UnrecoverableError
+
 // GCBlockedError is the error of a compaction that found committed
 // extents it can neither find nor rebuild.
 type GCBlockedError = archive.GCBlockedError
@@ -505,6 +513,11 @@ type (
 // health metadata this implementation does not understand (another
 // implementation's: parity protection is then unknown until Verify).
 func (a *Archive) PruneRecords() ([]PruneRecord, []string, error) { return a.w.PruneRecords() }
+
+// Unrecoverable streams the paths whose version an Emergency Pruning gave
+// up and that were neither written nor deleted since, until fn returns
+// false.
+func (a *Archive) Unrecoverable(fn func(UnrecoverableError) bool) error { return a.w.Unrecoverable(fn) }
 
 // PruneDetails streams the lost extents, UNRECOVERABLE versions and
 // affected parity groups of a record.
@@ -631,6 +644,9 @@ func (r *Reader) Walk(prefix, start string, fn func(Info) bool) error {
 // PruneRecords lists the archive's EMERGENCY_PRUNE records (see
 // Archive.PruneRecords).
 func (r *Reader) PruneRecords() ([]PruneRecord, []string, error) { return r.r.PruneRecords() }
+
+// Unrecoverable streams the snapshot's UNRECOVERABLE paths.
+func (r *Reader) Unrecoverable(fn func(UnrecoverableError) bool) error { return r.r.Unrecoverable(fn) }
 
 // PruneDetails streams the details of a record.
 func (r *Reader) PruneDetails(record string, fn func(PruneDetail) error) error {

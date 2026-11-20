@@ -380,6 +380,15 @@ func TestEmergencyPruneCLI(t *testing.T) {
 	if !strings.Contains(h.stdout, "by ops: disk sector loss") || !strings.Contains(h.stdout, "UNRECOVERABLE") {
 		t.Fatal(h.stdout)
 	}
+	l := ok(t, "ls", arch, "-pruned")
+	if !strings.Contains(l.stdout, "UNRECOVERABLE") {
+		t.Fatal(l.stdout)
+	}
+	lost := strings.Fields(strings.Split(l.stdout, "\n")[0])
+	g := cli(t, "", "get", arch, lost[len(lost)-1])
+	if g.code != exitError || !strings.Contains(g.stderr, "UNRECOVERABLE") {
+		t.Fatalf("get of a pruned path: %d %s", g.code, g.stderr)
+	}
 	v := ok(t, "verify", arch)
 	if !strings.Contains(v.stdout, "pruned    1 emergency prunes") {
 		t.Fatal(v.stdout)

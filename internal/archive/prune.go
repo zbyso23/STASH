@@ -410,6 +410,17 @@ func settlePrunes(fsys vfs.FS, root uint64) (committed int, foreign []string, er
 	for _, e := range ents {
 		n := e.Name()
 		to, prepared, ok := parsePruneName(n)
+		if g, hg := healthGen(n); hg {
+			// markers of an aborted compaction (g > root) or of a removed
+			// generation go; GC removes them with their generation
+			if _, err := fsys.Stat(GenDir(g)); g > root || (g < root && errors.Is(err, fs.ErrNotExist)) {
+				if err := fsys.Remove(HealthDir + "/" + n); err != nil {
+					return committed, foreign, err
+				}
+				changed = true
+			}
+			continue
+		}
 		switch {
 		case !ok && strings.Contains(n, ".tmp-"):
 			fsys.Remove(HealthDir + "/" + n) // an interrupted replacement
@@ -547,6 +558,9 @@ func (v *view) PruneRecords() ([]PruneRecord, []string, error) {
 	var foreign []string
 	for _, e := range ents {
 		to, prepared, ok := parsePruneName(e.Name())
+		if _, hg := healthGen(e.Name()); hg {
+			continue
+		}
 		if !ok {
 			if !strings.Contains(e.Name(), ".tmp-") {
 				foreign = append(foreign, e.Name())

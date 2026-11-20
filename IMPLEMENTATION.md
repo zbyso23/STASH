@@ -1,6 +1,6 @@
 # STASH Go reference implementation — status
 
-Spec: `SPEC.md` (STASH 2.0 R10 with Erratum E1, wire `0x0006`). Go 1.24+.
+Spec: `SPEC.md` (STASH 2.0 R11 = R10 with Erratum E1 consolidated, wire `0x0006`). Go 1.24+.
 
 ## Milestone 1 — wire constants and fixed-size structures (done)
 
@@ -500,9 +500,28 @@ Emergency Pruning is a compaction that the operator authorizes to give up what c
 | reading | `PruneRecords` (writer and reader) checks each trailer and reports unknown names in `health/` as foreign: another implementation's health metadata, so parity protection is unknown until a verify; `Health.PruneRecords`, `Health.ForeignHealth` | §13.9 last paragraph |
 | CLI | the blocked error names the exact command; `stash compact -emergency-prune N -operator NAME -reason TEXT`; `stash health [-v]`; `stash verify` mentions prune records and foreign health metadata | |
 
-Choices: an UNRECOVERABLE version leaves the live state (a manifest record must cover `[0, L)`), so `Get` returns `ErrNotFound`; the record says why. What is still readable of a lost version can be salvaged before the prune (`stash salvage`).
+UNRECOVERABLE markers (`lost.go`): an UNRECOVERABLE version leaves the live state (a manifest record must cover `[0, L)`), but its path does not read as missing. `Get`, `Stat` and `Open` of a path without a live version fail with `*UnrecoverableError` (path, file_ver, the generation of the prune and its record), which matches `ErrUnrecoverable` and `ErrMissingData` and never `ErrNotFound`, so a sync or replication tool cannot take a loss for a deletion. A Put shadows the marker; a Delete clears it durably (the clear is logged before the DEL, so a crash can only leave a live version, never a deleted path reported as lost) and succeeds even when nothing is live (acknowledging the loss). Per generation in `health/`: `unrecoverable-<gen>.idx`, fixed 48-byte records sorted by path digest (HMAC-SHA-256 under HKDF info `STASH-HEALTH-MAC-R10` in an encrypted archive, else SHA-256 with a domain prefix), a SHA-256 trailer checked at open (a damaged index fails the open), looked up by binary search with nothing per marker in memory; `cleared-<gen>.log`, 36-byte CRC'd records appended by Delete (torn tail truncated). Every compaction folds both into the destination's index before the switch; GC removes them with their generation. `Writer.Unrecoverable`/`Reader.Unrecoverable` list the standing paths (`stash ls -pruned`), `Health.Unrecoverable` counts them. What is still readable of a lost version can be salvaged before the prune (`stash salvage`).
 
-Tests: refusal without operator/reason, with a wrong count and with nothing lost (no generation and no record left behind); the pruned version is gone, the others intact, the record lists extent, version and event, verify and a later normal compaction pass; a tampered record is reported as damaged; XOR 2+1 with two of three blobs lost: UNRECOVERABLE groups, survivors regrouped, every destination group healthy, every object either intact or listed; encrypted: no path or reason in the clear, details readable with the key; foreign health metadata reported; HARDENED: the anchor advances and a reader opens the pruned generation; 96 crash points through a prune: before the switch nothing is lost and no record is committed, after it the record is committed and the version gone, never a prepared record left after open; CLI end to end.
+Tests: refusal without operator/reason, with a wrong count and with nothing lost (no generation and no record left behind); the pruned version is gone, the others intact, the record lists extent, version and event, verify and a later normal compaction pass; a tampered record is reported as damaged; XOR 2+1 with two of three blobs lost: UNRECOVERABLE groups, survivors regrouped, every destination group healthy, every object either intact or listed; encrypted: no path or reason in the clear, details readable with the key; foreign health metadata reported; HARDENED: the anchor advances and a reader opens the pruned generation; 96 crash points through a prune: before the switch nothing is lost and no record is committed, after it the record is committed and the version gone, never a prepared record left after open; CLI end to end. Markers: Get, Stat and Open report the loss and never ErrNotFound, a never-written path stays ErrNotFound; a Put shadows, a Delete acknowledges (a second Delete is ErrNotFound), written-then-deleted reads as deleted; both survive reopen and a normal compaction, and the files are folded (three files left in `health/`); encrypted indexes name no path; a reader sees the markers; a damaged index fails the open of writer and reader; the CLI shows `ls -pruned` and a get of a pruned path fails with UNRECOVERABLE.
+
+## Compaction speed-up (2026-11-15)
+
+Profiling 10^6 small objects showed the Sweep (20 s of 42 s at 1 GiB) waiting on locks and on lookups that searched every file of the working table, not on the copy itself. A merge join of the wanted extents with the frames was not taken: the frames would then be read in hash order, i.e. randomly, which a disk pays for far more than the table lookups. Instead:
+
+- `kvtab`: an in-memory bloom filter per file (10 bits per key, reserved from the budget, none when the budget refuses) lets a lookup skip files that cannot hold the key; a lookup searches the files without the table lock (files are reference-counted), so writers never queue behind a block read.
+- the compactor claims wanted keys with 64 striped locks instead of one lock over the table, and the wanted check of a frame runs in the workers instead of the single feeder.
+- the compaction's working table gets an eighth of the memory limit as its in-memory delta (fewer files and merges).
+- the destination records are written by a merge join of the snapshot (`S`) and the destination locs (`D`), both in path order: one forward pass instead of a seek per path.
+
+10^6 small objects, this container (4 cores): 128 MiB 49 → 35 s (peak heap 113 MB), 1 GiB 34 → 28 s (peak heap 575 MB). Running merges beside flushes was tried and dropped (0.6 s, more concurrency in the table). The remaining serial part is the table's flush and merge goroutine.
+
+## SPEC R11 (2026-11-15)
+
+`SPEC.md` is now Revision R11: R10 with Erratum E1 consolidated, no wire change. R11-1 (a pruned version is reported UNRECOVERABLE, never absent) is what M20's markers implement; R11-3 records that the HKDF info strings keep their `-R10` names. The R10-with-E1 text is kept in `history/SPEC-R10-E1-final.md` of the project files. The implementation's own health identifiers (`STASH-HEALTH-AEAD-R10`, `STASH-HEALTH-MAC-R10`) keep their names for the same reason.
+
+## Security policy default (decided 2026-11-15)
+
+`PolicyAuto` stays the default. The library enforces the invariants of the chosen policy (HARDENED never silently becomes STANDARD; no HARDENED open without its anchor; a missing marker with a configured anchor is `ErrRollback`); choosing the policy is the operator's configuration. Without an anchor `PolicyAuto` behaves as `PolicyStandard`, with one as `PolicyHardened`, so it weakens nothing. Deployments that need anti-rollback configure an anchor or `-policy hardened` / `$STASH_POLICY=hardened`. No warning is printed for unconfigured opens: it would be noise for the common STANDARD case.
 
 ## Next milestones
 

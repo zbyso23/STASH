@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"os"
 	"path"
 	"slices"
@@ -145,6 +146,7 @@ const (
 // Table is a sorted key-value table. Values are opaque; Put of an existing
 // key replaces it. It is safe for concurrent use.
 type Table struct {
+	seed maphash.Seed // of the file filters
 	cfg  Config
 	mac  *macer
 	sess string
@@ -156,15 +158,17 @@ type Table struct {
 	// stays readable (newer than every file) until the file replaces it.
 	// busy: the flush and the level merges after it are running; done
 	// is signalled when they end.
-	imm    map[string][]byte
-	busy   bool
-	done   *sync.Cond
-	memMax int64
-	res    *membudget.Reservation
-	runs   []*sst // oldest first
-	seq    int
-	closed bool
-	err    error // sticky failure of a flush
+	imm  map[string][]byte
+	busy bool
+	// merging: a merger runs (after a flush, outside busy)
+	merging bool
+	done    *sync.Cond
+	memMax  int64
+	res     *membudget.Reservation
+	runs    []*sst // oldest first
+	seq     int
+	closed  bool
+	err     error // sticky failure of a flush
 
 	// view is the delta in key order, built by the first iterator after
 	// a change and shared, immutable, by iterators until the next change
@@ -178,7 +182,7 @@ func New(cfg Config) *Table {
 	rand.Read(key[:])
 	var s [6]byte
 	rand.Read(s[:])
-	t := &Table{cfg: cfg, mac: newMacer(key), sess: hex.EncodeToString(s[:]), mem: map[string][]byte{}}
+	t := &Table{cfg: cfg, mac: newMacer(key), sess: hex.EncodeToString(s[:]), mem: map[string][]byte{}, seed: maphash.MakeSeed()}
 	t.done = sync.NewCond(&t.mu)
 	if cfg.Scratch != nil {
 		want := cfg.MemLimit
@@ -252,20 +256,36 @@ func (t *Table) set(key, v []byte) error {
 // Get returns a copy of the value of key.
 func (t *Table) Get(key []byte) ([]byte, bool, error) {
 	t.mu.RLock()
-	defer t.mu.RUnlock()
 	if t.closed {
+		t.mu.RUnlock()
 		return nil, false, errors.New("kvtab: closed")
 	}
 	for _, m := range []map[string][]byte{t.mem, t.imm} {
 		if v, ok := m[string(key)]; ok {
+			t.mu.RUnlock()
 			if v[0] == 0 {
 				return nil, false, nil
 			}
 			return bytes.Clone(v[1:]), true, nil
 		}
 	}
+	// the files are searched without the lock (block reads may wait on
+	// the disk), so writers never queue behind a lookup
+	var runs []*sst
 	for i := len(t.runs) - 1; i >= 0; i-- {
-		cur := t.runs[i].seek(t.cache(), key)
+		if r := t.runs[i]; r.filter.mayHave(key) {
+			atomic.AddInt32(&r.refs, 1)
+			runs = append(runs, r)
+		}
+	}
+	t.mu.RUnlock()
+	defer func() {
+		for _, r := range runs {
+			t.release(r)
+		}
+	}()
+	for _, r := range runs {
+		cur := r.seek(t.cache(), key)
 		if cur.err != nil {
 			return nil, false, cur.err
 		}
@@ -304,7 +324,7 @@ func (t *Table) Bulk(fill func(add func(k, v []byte) error) error) error {
 			return nil
 		})
 	}
-	s, err := t.writeFile(baseLevel, func(add func(k, v []byte) error) error {
+	s, err := t.writeFile(baseLevel, 0, func(add func(k, v []byte) error) error {
 		var b []byte
 		return fill(func(k, v []byte) error {
 			if len(v) > MaxValue {
@@ -326,7 +346,7 @@ func (t *Table) Bulk(fill func(add func(k, v []byte) error) error) error {
 }
 
 // writeFile writes a new file filled by fill.
-func (t *Table) writeFile(level int, fill func(add func(k, v []byte) error) error) (*sst, error) {
+func (t *Table) writeFile(level int, expect uint64, fill func(add func(k, v []byte) error) error) (*sst, error) {
 	fsys, dir, err := t.cfg.Scratch()
 	if err != nil {
 		return nil, fmt.Errorf("kvtab: scratch space: %w", err)
@@ -341,15 +361,30 @@ func (t *Table) writeFile(level int, fill func(add func(k, v []byte) error) erro
 		return nil, err
 	}
 	s := &sst{id: fileIDs.Add(1), f: f, fsys: fsys, name: name, mac: t.mac, level: level, refs: 1}
+	if fl := newBloom(expect, t.seed); fl != nil {
+		if r := t.cfg.Budget.TryReserve(fl.bytes(), fl.bytes()); r != nil {
+			s.filter, s.filterRes = fl, r
+		}
+	}
 	ow := &offsetWriter{f: f}
 	w := newSSTWriter(ow, s.id, t.mac)
-	err = fill(w.add)
+	add := w.add
+	if s.filter != nil {
+		add = func(k, v []byte) error {
+			s.filter.add(k)
+			return w.add(k, v)
+		}
+	}
+	err = fill(add)
 	if err == nil {
 		err = w.finish()
 	}
 	if err != nil {
 		f.Close()
 		fsys.Remove(name)
+		if s.filterRes != nil {
+			s.filterRes.Release()
+		}
 		return nil, err
 	}
 	s.top, s.count, s.bytes = w.top, w.count, ow.off
@@ -386,7 +421,7 @@ func (t *Table) flushImm() error {
 		keys = append(keys, k)
 	}
 	slices.Sort(keys)
-	s, err := t.writeFile(0, func(add func(k, v []byte) error) error {
+	s, err := t.writeFile(0, uint64(len(imm)), func(add func(k, v []byte) error) error {
 		for _, k := range keys {
 			if err := add([]byte(k), imm[k]); err != nil {
 				return err
@@ -432,7 +467,11 @@ func (t *Table) mergeOnce() (bool, error) {
 	if lvl < 0 {
 		return false, nil
 	}
-	s, err := t.writeFile(lvl+1, func(add func(k, v []byte) error) error {
+	var expect uint64
+	for _, r := range in {
+		expect += r.count
+	}
+	s, err := t.writeFile(lvl+1, expect, func(add func(k, v []byte) error) error {
 		m := newMerge(t.cache(), nil, in, nil, false)
 		for m.next() {
 			if err := add(m.k, m.v); err != nil {
@@ -474,6 +513,9 @@ func orderOf(s *sst) int {
 func (t *Table) release(s *sst) {
 	if atomic.AddInt32(&s.refs, -1) == 0 {
 		t.cache().drop(s.id)
+		if s.filterRes != nil {
+			s.filterRes.Release()
+		}
 		s.f.Close()
 		s.fsys.Remove(s.name)
 	}

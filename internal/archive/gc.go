@@ -193,6 +193,11 @@ func (w *Writer) gcLocked() ([]uint64, error) {
 		if err := vfs.RemoveAll(w.fsys, GenDir(g)); err != nil {
 			return removed, err
 		}
+		for _, n := range []string{lostIndexName(g), clearedName(g)} {
+			if err := w.fsys.Remove(n); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return removed, err
+			}
+		}
 		removed = append(removed, g)
 	}
 	return removed, nil
