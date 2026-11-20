@@ -27,6 +27,9 @@ type CompactOptions struct {
 	// KeepOld leaves the previous generation on disk after the switch;
 	// GC removes it later.
 	KeepOld bool
+	// EmergencyPrune, when set, lets a GC-blocked compaction give up the
+	// extents that cannot be found or rebuilt (§13.9) instead of failing.
+	EmergencyPrune *EmergencyPrune
 }
 
 // CompactResult describes a compaction.
@@ -54,6 +57,8 @@ type CompactResult struct {
 	SourceBytes, DestBytes int64
 	// Removed lists the generations GC removed afterwards.
 	Removed []uint64
+	// Prune describes an Emergency Pruning (nil without one).
+	Prune *PruneReport
 }
 
 type liveKey struct {
@@ -65,6 +70,25 @@ type verKey struct {
 	path string
 	ver  uint64
 }
+
+// GCBlockedError reports a compaction that found committed extents it can
+// neither find nor rebuild: the generation is GC-blocked (§13.8). It
+// matches ErrMissingData. Extents is the count an Emergency Pruning must
+// confirm (EmergencyPrune.ExpectLostExtents).
+type GCBlockedError struct {
+	Extents int
+	Example string // one of them
+}
+
+func (e *GCBlockedError) Error() string {
+	ex := ""
+	if e.Example != "" {
+		ex = ", e.g. " + e.Example
+	}
+	return fmt.Sprintf("%v: %d committed extents cannot be found or rebuilt%s; the generation is GC-blocked (§13.8)", ErrMissingData, e.Extents, ex)
+}
+
+func (e *GCBlockedError) Unwrap() error { return ErrMissingData }
 
 // compactor copies the live frames of a source view into a destination
 // generation opened as a second Writer.
@@ -93,6 +117,7 @@ type compactor struct {
 	regroup    map[uint32][]*frame.Spec // by frame_quanta, fewer than parity_k each
 	repack     []*commitReq
 	repackSize int
+	prune      *EmergencyPrune
 }
 
 // Compact runs Mark -> Sweep -> Freeze/Merge -> Switch -> GC (§13): the live
@@ -108,6 +133,21 @@ type compactor struct {
 func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactResult, err error) {
 	w.compactMu.Lock()
 	defer w.compactMu.Unlock()
+	if opt.EmergencyPrune != nil {
+		if err := opt.EmergencyPrune.check(); err != nil {
+			return res, err
+		}
+	}
+	// records of earlier prunes are settled before a new one may start
+	w.genMu.Lock()
+	pr, foreign, err := settlePrunes(w.fsys, w.view.h.GenerationID)
+	if err == nil {
+		w.health.PruneRecords, w.health.ForeignHealth = pr, foreign
+	}
+	w.genMu.Unlock()
+	if err != nil {
+		return res, err
+	}
 
 	// Mark (§13.1): the live state at one point
 	w.genMu.RLock()
@@ -115,6 +155,7 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 	c := &compactor{src: src, res: &res, tab: kvtab.New(src.kv),
 		maxOrd: make([]uint64, src.h.BlobCount), hasOrd: make([]bool, src.h.BlobCount), regroup: map[uint32][]*frame.Spec{}}
 	defer c.tab.Close()
+	c.prune = opt.EmergencyPrune
 	w.stateMu.RLock()
 	err = w.journal.State().Walk("", "", func(p string, v *manifest.Version) bool {
 		if err = c.tab.Put(append([]byte{'S'}, p...), binary.BigEndian.AppendUint64(nil, v.FileVer)); err == nil {
@@ -151,10 +192,14 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 	d := &Writer{fsys: w.fsys, opt: w.opt, env: w.env, stEnv: w.stEnv, busy: map[string]bool{}, genAlloc: w.genAlloc, verAlloc: w.verAlloc, keys: w.keys,
 		health: Health{Sealed: map[uint8]error{}, TornBlobBytes: map[uint8]int64{}}}
 	switched := false
+	prepared := ""
 	defer func() {
 		if !switched {
 			d.closeGeneration()
 			vfs.RemoveAll(w.fsys, GenDir(id)) // an aborted attempt; its id is never reused
+			if prepared != "" {
+				w.fsys.Remove(prepared) // else the next open removes it (to > root)
+			}
 		}
 	}()
 	if err := d.openGeneration(GenDir(id), &dh); err != nil {
@@ -178,6 +223,9 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 	}
 	// §13.2.1: one record per live path in bytewise order
 	if err := c.eachPath('S', func(p string, ver uint64) error {
+		if gone, err := c.lost(p, ver); err != nil || gone {
+			return err
+		}
 		locs, err := c.sortedLocs(p, ver)
 		if err == nil {
 			err = d.journal.Add(p, ver, locs)
@@ -264,10 +312,18 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 			return res, err
 		}
 	}
-	if err := c.eachPath('Y', func(p string, ver uint64) error { return d.journal.Del(p, ver) }); err != nil {
+	if err := c.eachPath('Y', func(p string, ver uint64) error {
+		if gone, err := c.lost(p, ver); err != nil || gone {
+			return err // never recorded in the destination
+		}
+		return d.journal.Del(p, ver)
+	}); err != nil {
 		return res, err
 	}
 	if err := c.eachPath('X', func(p string, ver uint64) error {
+		if gone, err := c.lost(p, ver); err != nil || gone {
+			return err
+		}
 		locs, err := c.sortedLocs(p, ver)
 		if err == nil {
 			err = d.journal.Add(p, ver, locs)
@@ -286,6 +342,24 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 		return res, err
 	}
 	res.SourceBytes, res.DestBytes = blobBytes(src), blobBytes(d.view)
+	if c.prune != nil {
+		// §13.9: the losses must be what the operator confirmed, and the
+		// record is durable before anything is switched or deleted
+		r, err := c.pruneReport()
+		if err != nil {
+			return res, err
+		}
+		if r.LostExtents != c.prune.ExpectLostExtents {
+			return res, fmt.Errorf("%w: %d extents cannot be found or rebuilt now, the operator confirmed %d; nothing was changed",
+				ErrPruneRefused, r.LostExtents, c.prune.ExpectLostExtents)
+		}
+		prepared = pruneName(id, true)
+		if err := c.writePruneRecord(w.fsys, &r, src.h.GenerationID, id); err != nil {
+			return res, err
+		}
+		r.Record = pruneName(id, false)
+		res.Prune = &r
+	}
 
 	// Switch (§13.6): HARDENED advances the anchor first (§13.6.1 steps
 	// 6-9); an error leaves the destination in place, because the anchor
@@ -302,6 +376,7 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 		return res, err
 	}
 	switched = true
+	d.health.PruneRecords, d.health.ForeignHealth = w.health.PruneRecords, w.health.ForeignHealth
 	old, oldWriters, oldJournal := w.view, w.writers, w.journal
 	w.view, w.journal, w.seqAlloc, w.groupAlloc, w.ordAlloc, w.writers, w.health = d.view, d.journal, d.seqAlloc, d.groupAlloc, d.ordAlloc, d.writers, d.health
 	for _, bw := range oldWriters {
@@ -321,6 +396,18 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 		}
 	}
 
+	if prepared != "" {
+		// committed (§13.9 step 6 comes only after this): until the rename
+		// is durable an open settles the record by the root
+		err := w.fsys.Rename(prepared, pruneName(id, false))
+		if err == nil {
+			err = w.fsys.SyncDir(HealthDir)
+		}
+		if err != nil {
+			return res, fmt.Errorf("compaction switched to generation %d; committing the prune record: %w (the old generation is kept)", id, err)
+		}
+		w.health.PruneRecords++
+	}
 	// GC (§13): old generations nothing pins any more
 	if !opt.KeepOld {
 		removed, err := w.gcLocked()
@@ -589,19 +676,22 @@ func (c *compactor) copyVersions(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if n > 0 && c.prune != nil {
+		return c.markLost()
+	}
 	if n > 0 {
+		e := &GCBlockedError{Extents: n}
 		it := c.tab.Iter([]byte{'L'})
 		defer it.Close()
 		if it.Next() {
 			if k, ok := parseLiveKey(it.Key()); ok {
-				return fmt.Errorf("%w: %d committed extents cannot be found or rebuilt, e.g. %s v%d at %d (blob %02X); the generation is GC-blocked (§13.8)",
-					ErrMissingData, n, k.k.Path, k.k.FileVer, k.k.Offset, k.blob)
+				e.Example = fmt.Sprintf("%s v%d at %d (blob %02X)", k.k.Path, k.k.FileVer, k.k.Offset, k.blob)
 			}
 		}
 		if err := it.Err(); err != nil {
 			return err
 		}
-		return fmt.Errorf("%w: %d committed extents cannot be found or rebuilt; the generation is GC-blocked (§13.8)", ErrMissingData, n)
+		return e
 	}
 	return nil
 }
@@ -702,7 +792,13 @@ func (c *compactor) verifyFrames(ctx context.Context) error {
 	}
 	// every snapshot path is in the destination (and nothing else)
 	want := 0
-	if err := c.eachPath('S', func(string, uint64) error { want++; return nil }); err != nil {
+	if err := c.eachPath('S', func(p string, ver uint64) error {
+		if gone, err := c.lost(p, ver); err != nil || gone {
+			return err
+		}
+		want++
+		return nil
+	}); err != nil {
 		return err
 	}
 	if walked != want {
@@ -969,6 +1065,29 @@ func (c *compactor) group(g uint32, ms []*hopMember) error {
 	c.mu.Unlock()
 	if err != nil {
 		return err
+	}
+	if c.prune != nil {
+		present, dataLost, regrouped, rebuiltAny := 0, false, 0, false
+		for i, r := range refs {
+			if r != nil {
+				present++
+				if i < k && len(live[i]) > 0 {
+					regrouped++
+				}
+			} else if i < k {
+				dataLost = true
+			}
+			rebuiltAny = rebuiltAny || rebuilt[i]
+		}
+		switch {
+		case dataLost:
+			err = c.noteGroup(g, groupUnrecoverable, k, m, present, any, regrouped)
+		case rebuiltAny || present < n:
+			err = c.noteGroup(g, groupRebuilt, k, m, present, any, 0)
+		}
+		if err != nil {
+			return err
+		}
 	}
 	if !any {
 		return nil
@@ -1313,8 +1432,11 @@ func (c *compactor) verify(ctx context.Context, tag byte, full bool) error {
 		if err := c.verifyFrames(ctx); err != nil {
 			return err
 		}
-	} else if err := c.eachPath(tag, func(p string, _ uint64) error {
+	} else if err := c.eachPath(tag, func(p string, ver uint64) error {
 		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if gone, err := c.lost(p, ver); err != nil || gone {
 			return err
 		}
 		v, ok, err := st.Lookup(p)

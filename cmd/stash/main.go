@@ -69,6 +69,7 @@ func init() {
 		{name: "rm", args: "<archive> <path>...", help: "delete objects", minArgs: 2, maxArgs: -1, run: cmdRm},
 		{name: "verify", args: "<archive>", help: "read and check everything (exit 3 on damage)", minArgs: 1, maxArgs: 1, run: cmdVerify},
 		{name: "compact", args: "<archive>", help: "copy live data into a new generation, repairing damage", minArgs: 1, maxArgs: 1, run: cmdCompact, flags: compactFlags},
+		{name: "health", args: "<archive>", help: "list Emergency Pruning records (-v: what was lost)", minArgs: 1, maxArgs: 1, run: cmdHealth, flags: healthFlags},
 		{name: "gc", args: "<archive>", help: "remove unused old generations", minArgs: 1, maxArgs: 1, run: cmdGC},
 		{name: "recover", args: "<archive>", help: "raw recovery scan from the blob files (read-only; exit 3 on damage)", minArgs: 1, maxArgs: 1, run: cmdRecover, flags: recoverFlags},
 		{name: "salvage", args: "<archive> <new-archive>", help: "recover the current versions into a new archive", minArgs: 2, maxArgs: 2, run: cmdSalvage, flags: recoverFlags},
@@ -223,6 +224,11 @@ func explain(err error) error {
 		return fmt.Errorf("%w (another writer has the archive open)", err)
 	case errors.Is(err, stash.ErrNoWritableBlob):
 		return fmt.Errorf("%w (run stash compact)", err)
+	}
+	var be *stash.GCBlockedError
+	if errors.As(err, &be) {
+		return fmt.Errorf("%w (salvage what you can first; if the loss is permanent, never for a resource that is only unreachable: "+
+			"stash compact -emergency-prune %d -operator NAME -reason TEXT)", err, be.Extents)
 	}
 	return err
 }
@@ -778,6 +784,14 @@ func cmdVerify(e *env, _ *flag.FlagSet, args []string) error {
 	for _, p := range paths {
 		fmt.Fprintf(w, "FAILED    %s: %v\n", p, rep.Failed[p])
 	}
+	if h := a.Health(); h.PruneRecords > 0 || len(h.ForeignHealth) > 0 {
+		if h.PruneRecords > 0 {
+			fmt.Fprintf(w, "pruned    %d emergency prunes gave data up (stash health -v)\n", h.PruneRecords)
+		}
+		for _, n := range h.ForeignHealth {
+			fmt.Fprintf(w, "unknown   health/%s: another implementation's health metadata (parity state checked above)\n", n)
+		}
+	}
 	if !rep.OK() {
 		fmt.Fprintln(w, "result    PROBLEMS FOUND (stash compact repairs what parity can rebuild)")
 		return problems{"damage found"}
@@ -786,10 +800,17 @@ func cmdVerify(e *env, _ *flag.FlagSet, args []string) error {
 	return nil
 }
 
-var keepOld bool
+var (
+	keepOld     bool
+	pruneExpect int
+	pruneReason string
+)
 
 func compactFlags(fl *flag.FlagSet) {
 	fl.BoolVar(&keepOld, "keep-old", false, "keep the previous generation (stash gc removes it)")
+	fl.IntVar(&pruneExpect, "emergency-prune", 0, "give up the N extents a GC-blocked compaction reported (data loss; needs -operator and -reason)")
+	fl.StringVar(&operator, "operator", "", "operator name recorded with an emergency prune")
+	fl.StringVar(&pruneReason, "reason", "", "why the lost data is gone for good (recorded)")
 }
 
 func cmdCompact(e *env, _ *flag.FlagSet, args []string) error {
@@ -798,17 +819,81 @@ func cmdCompact(e *env, _ *flag.FlagSet, args []string) error {
 		return err
 	}
 	defer a.Close()
-	res, err := a.Compact(e.ctx, stash.CompactOptions{KeepOld: keepOld})
+	o := stash.CompactOptions{KeepOld: keepOld}
+	if pruneExpect != 0 || pruneReason != "" {
+		o.EmergencyPrune = &stash.EmergencyPrune{Operator: operator, Reason: pruneReason, ExpectLostExtents: pruneExpect}
+	}
+	res, err := a.Compact(e.ctx, o)
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(e.stdout, "generation %d -> %d: %d versions, %s -> %s\n", res.From, res.To, res.Versions, size(res.SourceBytes), size(res.DestBytes))
 	fmt.Fprintf(e.stdout, "frames copied %d, rebuilt %d, regrouped %d; parity recomputed %d; small objects repacked %d\n",
 		res.CopiedFrames, res.RebuiltFrames, res.RewrittenFrames, res.RecomputedParity, res.RepackedObjects)
+	if p := res.Prune; p != nil {
+		fmt.Fprintf(e.stdout, "EMERGENCY PRUNE: %d extents lost, %d versions UNRECOVERABLE (removed from the live state); "+
+			"parity groups: %d unrecoverable (%d surviving members regrouped), %d rebuilt; record %s\n",
+			p.LostExtents, p.LostVersions, p.UnrecoverableGroups, p.RegroupedMembers, p.RebuiltGroups, p.Record)
+	}
 	if len(res.Removed) > 0 {
 		fmt.Fprintf(e.stdout, "removed generations %v\n", res.Removed)
 	}
 	return a.Close()
+}
+
+var healthVerbose bool
+
+func healthFlags(fl *flag.FlagSet) {
+	fl.BoolVar(&healthVerbose, "v", false, "list the lost extents, versions and parity groups")
+}
+
+func cmdHealth(e *env, _ *flag.FlagSet, args []string) error {
+	r, err := openReader(args[0])
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	recs, foreign, err := r.PruneRecords()
+	if err != nil {
+		return err
+	}
+	w := e.stdout
+	for _, n := range foreign {
+		fmt.Fprintf(w, "UNKNOWN   health/%s: health metadata of another implementation; parity protection is unknown until stash verify\n", n)
+	}
+	if len(recs) == 0 {
+		fmt.Fprintln(w, "no emergency prunes")
+	}
+	for _, rc := range recs {
+		who := fmt.Sprintf("%s by %s: %s", rc.Time.Format(time.RFC3339), rc.Operator, rc.Reason)
+		if rc.Sealed {
+			who = "(sealed: pass the key)"
+		}
+		fmt.Fprintf(w, "PRUNE     generation %d -> %d, %s\n", rc.From, rc.To, who)
+		fmt.Fprintf(w, "          %d extents lost, %d versions UNRECOVERABLE; groups %d unrecoverable (%d members regrouped), %d rebuilt",
+			rc.LostExtents, rc.LostVersions, rc.UnrecoverableGroups, rc.RegroupedMembers, rc.RebuiltGroups)
+		if len(rc.UnavailableBlobs) > 0 {
+			fmt.Fprintf(w, "; blobs unavailable %v", rc.UnavailableBlobs)
+		}
+		fmt.Fprintln(w)
+		if !healthVerbose {
+			continue
+		}
+		if err := r.PruneDetails(rc.Record, func(d stash.PruneDetail) error {
+			switch d.Kind {
+			case "object":
+				fmt.Fprintf(w, "  object  %s v%d %s\n", d.Path, d.FileVer, d.Status)
+			case "extent":
+				fmt.Fprintf(w, "  extent  %s v%d at %d (blob %02X, %s)\n", d.Path, d.FileVer, d.Offset, d.Blob, d.Hash)
+			case "group":
+				fmt.Fprintf(w, "  group   %d (k=%d m=%d, %d present) %s -> %s\n", d.GroupID, d.K, d.M, d.Present, d.Status, d.Dest)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func cmdGC(e *env, _ *flag.FlagSet, args []string) error {

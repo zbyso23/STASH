@@ -100,6 +100,12 @@ type Health struct {
 	// ParityWarning is set when the writable blobs cannot hold a parity
 	// group so that losing one whole blob is survivable (§7.4).
 	ParityWarning string
+	// PruneRecords counts committed EMERGENCY_PRUNE records (§13.9);
+	// ForeignHealth lists health metadata this implementation does not
+	// understand: its parity protection state is unknown until a full
+	// verification (§13.9).
+	PruneRecords  int
+	ForeignHealth []string
 }
 
 // Writer is the single writer of an archive (§12.1). Put, Delete and Get
@@ -214,6 +220,9 @@ func OpenWriter(fsys vfs.FS, opt Options) (w *Writer, err error) {
 		return nil, err
 	}
 	if err := w.openGeneration(gen, h); err != nil {
+		return nil, err
+	}
+	if w.health.PruneRecords, w.health.ForeignHealth, err = settlePrunes(fsys, root.GenerationID); err != nil {
 		return nil, err
 	}
 	w.opened = true

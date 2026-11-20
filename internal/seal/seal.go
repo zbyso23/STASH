@@ -30,6 +30,9 @@ const (
 	InfoManifest   = "STASH-MANIFEST-AEAD-R8"
 	InfoObjectID   = "STASH-OBJECT-ID-KEY-R10"
 	InfoKeyCheck   = "STASH-KEY-CHECK-R10"
+	// InfoHealth keys the implementation's health records (Emergency
+	// Pruning, §13.9); like the key check it is not wire format.
+	InfoHealth = "STASH-HEALTH-AEAD-R10"
 )
 
 // Errors.
@@ -87,6 +90,7 @@ func Derive(dek []byte, archiveID [32]byte) (Derived, error) {
 type Keys struct {
 	ArchiveID          [32]byte
 	frame, pt, man     cipher.AEAD
+	health             cipher.AEAD
 	objectID, keyCheck [32]byte
 }
 
@@ -112,6 +116,13 @@ func New(dek []byte, archiveID [32]byte) (*Keys, error) {
 		return nil, err
 	}
 	if k.man, err = gcm(d.Manifest); err != nil {
+		return nil, err
+	}
+	hk, err := hkdf.Key(sha256.New, dek, archiveID[:], InfoHealth, 32)
+	if err != nil {
+		return nil, err
+	}
+	if k.health, err = gcm([32]byte(hk)); err != nil {
 		return nil, err
 	}
 	return k, nil
@@ -193,6 +204,8 @@ const (
 	FrameDomain Domain = iota
 	PreTrailerDomain
 	ManifestDomain
+	// HealthDomain seals health records (not wire format).
+	HealthDomain
 )
 
 func (k *Keys) aead(d Domain) cipher.AEAD {
@@ -201,6 +214,8 @@ func (k *Keys) aead(d Domain) cipher.AEAD {
 		return k.frame
 	case PreTrailerDomain:
 		return k.pt
+	case HealthDomain:
+		return k.health
 	}
 	return k.man
 }

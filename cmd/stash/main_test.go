@@ -346,3 +346,42 @@ func TestPolicyFlag(t *testing.T) {
 	ok(t, "create", plain)
 	ok(t, "ls", plain, "-policy", "standard")
 }
+
+// A GC-blocked compaction names the count an operator must confirm;
+// compact -emergency-prune gives the data up with a record that stash
+// health shows.
+func TestEmergencyPruneCLI(t *testing.T) {
+	dir := t.TempDir()
+	arch := filepath.Join(dir, "arch")
+	src := filepath.Join(dir, "src")
+	tree(t, src)
+	ok(t, "create", arch, "-blobs", "2")
+	ok(t, "put", arch, src)
+	name := filepath.Join(arch, "generation-0000000000000000", "frames", "blob-01.stash")
+	fi, err := os.Stat(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	damageBlob(t, arch, "generation-0000000000000000", fi.Size()/2)
+	r := cli(t, "", "compact", arch)
+	i := strings.Index(r.stderr, "-emergency-prune ")
+	if r.code != exitError || i < 0 {
+		t.Fatalf("exit %d\n%s", r.code, r.stderr)
+	}
+	n := strings.Fields(r.stderr[i+len("-emergency-prune "):])[0]
+	if r := cli(t, "", "compact", arch, "-emergency-prune", n, "-operator", "ops"); r.code != exitError || !strings.Contains(r.stderr, "reason") {
+		t.Fatalf("prune without a reason: %d %s", r.code, r.stderr)
+	}
+	out := ok(t, "compact", arch, "-emergency-prune", n, "-operator", "ops", "-reason", "disk sector loss")
+	if !strings.Contains(out.stdout, "EMERGENCY PRUNE: "+n+" extents lost") {
+		t.Fatal(out.stdout)
+	}
+	h := ok(t, "health", arch, "-v")
+	if !strings.Contains(h.stdout, "by ops: disk sector loss") || !strings.Contains(h.stdout, "UNRECOVERABLE") {
+		t.Fatal(h.stdout)
+	}
+	v := ok(t, "verify", arch)
+	if !strings.Contains(v.stdout, "pruned    1 emergency prunes") {
+		t.Fatal(v.stdout)
+	}
+}

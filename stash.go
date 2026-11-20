@@ -74,6 +74,9 @@ var (
 	// ErrAnchorUnavailable: the anchor cannot be reached; HARDENED does
 	// not downgrade, the operation fails.
 	ErrAnchorUnavailable = archive.ErrAnchorUnavailable
+	// ErrPruneRefused: an Emergency Pruning without the required
+	// authorization, or whose losses differ from the confirmed count.
+	ErrPruneRefused = archive.ErrPruneRefused
 	// ErrKeyRequired: an encrypted archive opened without its key.
 	ErrKeyRequired = archive.ErrKeyRequired
 	// ErrWrongKey: the key does not match the archive (key.check).
@@ -457,7 +460,9 @@ func (a *Archive) Close() error { return a.w.Close() }
 // the copy and wait only during the final merge and switch. Unless
 // KeepOld is set, generations nothing uses any more are removed
 // afterwards. A committed extent that cannot be found or rebuilt makes
-// Compact fail with ErrMissingData and leaves the archive unchanged.
+// Compact fail with a *GCBlockedError (matching ErrMissingData) and leaves
+// the archive unchanged; CompactOptions.EmergencyPrune then lets the
+// operator give those versions up explicitly (SPEC §13.9).
 func (a *Archive) Compact(ctx context.Context, o CompactOptions) (CompactResult, error) {
 	return a.w.Compact(ctx, o)
 }
@@ -476,6 +481,36 @@ type CompactOptions = archive.CompactOptions
 
 // CompactResult describes a compaction.
 type CompactResult = archive.CompactResult
+
+// EmergencyPrune authorizes a GC-blocked compaction to give up what can
+// be neither found nor rebuilt (SPEC §13.9): the operator, a reason, and
+// ExpectLostExtents equal to GCBlockedError.Extents of the failing
+// compaction. The versions concerned become UNRECOVERABLE and leave the
+// live state; a durable EMERGENCY_PRUNE record (health/, sealed in an
+// encrypted archive) is written before anything is switched or deleted.
+type EmergencyPrune = archive.EmergencyPrune
+
+// GCBlockedError is the error of a compaction that found committed
+// extents it can neither find nor rebuild.
+type GCBlockedError = archive.GCBlockedError
+
+// PruneReport, PruneRecord and PruneDetail describe Emergency Prunings.
+type (
+	PruneReport = archive.PruneReport
+	PruneRecord = archive.PruneRecord
+	PruneDetail = archive.PruneDetail
+)
+
+// PruneRecords lists the archive's EMERGENCY_PRUNE records and any
+// health metadata this implementation does not understand (another
+// implementation's: parity protection is then unknown until Verify).
+func (a *Archive) PruneRecords() ([]PruneRecord, []string, error) { return a.w.PruneRecords() }
+
+// PruneDetails streams the lost extents, UNRECOVERABLE versions and
+// affected parity groups of a record.
+func (a *Archive) PruneDetails(record string, fn func(PruneDetail) error) error {
+	return a.w.PruneDetails(record, fn)
+}
 
 // VerifyReport is the result of Verify; OK() says whether nothing is
 // damaged, missing or degraded.
@@ -591,6 +626,15 @@ func (r *Reader) List() ([]string, error) { return r.r.List() }
 // returns false (see Archive.Walk).
 func (r *Reader) Walk(prefix, start string, fn func(Info) bool) error {
 	return r.r.Walk(prefix, start, func(p string, v *manifest.Version) bool { return fn(info(p, v)) })
+}
+
+// PruneRecords lists the archive's EMERGENCY_PRUNE records (see
+// Archive.PruneRecords).
+func (r *Reader) PruneRecords() ([]PruneRecord, []string, error) { return r.r.PruneRecords() }
+
+// PruneDetails streams the details of a record.
+func (r *Reader) PruneDetails(record string, fn func(PruneDetail) error) error {
+	return r.r.PruneDetails(record, fn)
 }
 
 // Unavailable lists blob files that could not be opened (missing or with a

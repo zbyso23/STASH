@@ -97,7 +97,7 @@ Performance: appending an ADD with 17 extents about 45 µs (in-memory FS), loadi
 
 SPEC changes: E1-18 restated by frame identity; E1-20 a manifest line containing NUL starts the torn tail (found by the crash tests: out-of-order page persistence otherwise bricked the archive after an ordinary crash).
 
-Not yet: encrypted envelopes (`*_ENC`, crypto milestone), HARDENED anchored length on the writer side, spilling staged extents to disk.
+Later milestones: encrypted envelopes (`*_ENC`) landed in M15 and the HARDENED anchored manifest length on the writer side in M13 (`hardened.go`: unanchored bytes truncated or adopted at open, every commit advances the anchor). Still open: spilling staged extents to disk.
 
 ## Milestone 6 — allocators, generation layout, writer lock, first end-to-end archive (done, STANDARD, unencrypted, no parity)
 
@@ -161,7 +161,7 @@ Benchmarks (`go test . -bench .`, 4 cores, this container's disk): RS 4+2 encodi
 
 SPEC change E1-22: the torn-tail rule did not protect PARITY frames, because no `loc` names them; a committed PARITY frame damaged at the end of a blob was truncated and its group silently lost protection. Now the blob is sealed when the frame at E carries a referenced `group_id`, or when a referenced group lacks a member anywhere.
 
-Not yet: regrouping and repair by compaction (§7.3.1, §13.7), Emergency Pruning (§13.9), encrypted opaque shards (crypto milestone), `PARITY_GROUP` records (optional; discovery is by frame metadata).
+Later milestones: regrouping and repair by compaction (§7.3.1, §13.7) in M12, encrypted shards in M15, Emergency Pruning (§13.9) in M20. Still optional: `PARITY_GROUP` records (discovery is by frame metadata).
 
 ## Milestone 9 — PACKED small objects (done)
 
@@ -240,9 +240,9 @@ Benchmarks (4 cores, this container's disk): compaction of 64 MiB with half dele
 
 SPEC change E1-24: the post-Mark delta may be merged by its net effect per path, and a post-Mark group keeps its `group_id` only below the destination's allocation start. §7 asked to raise the destination `groups.alloc` above every copied ID before allocating new ones, which a concurrent Sweep cannot do.
 
-Not yet: Emergency Pruning (§13.9) and health records of degraded groups, `PARITY_GROUP` records in the destination (optional).
+Emergency Pruning (§13.9) and its health records came in M20. Still optional: `PARITY_GROUP` records in the destination.
 
-## Milestone 13 — HARDENED policy and the Generation Anchor (done, unencrypted archives)
+## Milestone 13 — HARDENED policy and the Generation Anchor (done; encrypted HARDENED archives in M15)
 
 | Where | Content | SPEC |
 |---|---|---|
@@ -485,8 +485,27 @@ Measured on the container this work runs in (4 cores, 15 GB RAM, 24 GB free disk
 - **10^7 frames** (10^6 objects of 10 × 4 KiB extents, 41 GB logical) on a btrfs file system with `compress-force=zstd:1` in a loop file (the frames are zeros with a unique stamp per 4 KiB, `STASH_ZERO=1`: distinct hashes, compressible; the archive took 5–6 GB, 12 GB during compaction). The compression happens in the kernel, outside the measured process; times include it and are not disk times. At 128 MiB: build 234 s; writer open 89 s, peak heap 137 MB, 1.0 byte per frame retained outside the caches; reader open 18 s, 111 MB, 1.1 bytes per frame; verify 19 min (sequential, before the parallel verify below), 119 MB; recovery 4.2 min, 125 MB; compaction 36 min, peak heap 170 MB, RSS 214 MB; reader open after compaction 10 s. Peaks are live heap plus garbage not yet collected (the Go collector lets the heap grow to about twice the live data), which is why compaction's peak passes the 128 MiB limit while its reservations do not.
 - **Parallelism** (4 cores). Profiles showed compaction and recovery using about 1.3 cores. Now: reader and writer `Verify` read versions from a pool of GOMAXPROCS workers fed by the path walk; table files are written and levels merged by a background goroutine while the other half of the delta fills (writers wait only when the previous flush is still running; the delta being written stays readable until its file replaces it, atomically for readers); compaction scans the destination blobs in parallel. Measured on 10^6 small objects: verify 26.7 s → 16.7 s at 128 MiB (26.5 → 15.5 s at 1 GiB); compaction 50 → 49 s at 128 MiB, 41 → 34 s at 1 GiB; recovery 17 → 14.4 s. Less than estimated: compaction now uses 1.5 cores at 128 MiB; what serializes it is the single frame-directory walk that feeds the copy workers and the random lookups of wanted extents in the work table (cache misses at small limits). Replacing those lookups by a sorted merge join of the frame directory against the wanted extents is the next step, not done here.
 
+## Milestone 20 — Emergency Pruning (done)
+
+Emergency Pruning is a compaction that the operator authorizes to give up what can be neither found nor rebuilt (§13.9). No wire byte changes: the record is implementation health metadata outside the format, like `policy.hardened` and `key.check`.
+
+| Piece | What it does | SPEC |
+|---|---|---|
+| `GCBlockedError` | a GC-blocked compaction (§13.8) fails with the number of extents it could not find or rebuild and an example; it matches `ErrMissingData` | §13.8 |
+| `CompactOptions.EmergencyPrune` | operator, reason and `ExpectLostExtents`, which must equal the count of the failing compaction; a different outcome (a resource that came back, more damage) is `ErrPruneRefused` and nothing changes. This is the guard against pruning for a resource that is only temporarily unreachable; I/O errors still fail the compaction as before | §13.9 |
+| lost set | the wanted extents nothing could provide move to the working table (`Z` extent, `z` version); those versions are left out of the destination records, the snapshot count and the delta (`X`/`Y`) | §13.9 step 2 |
+| parity impact | every group the compactor handles is classified: a data member parity cannot rebuild makes it UNRECOVERABLE, and its surviving live members are regrouped into new groups with fresh parity (§13.7.1); members lost and rebuilt make it DEGRADED → REBUILT. The destination is verified with every group's parity recomputed, so it never claims protection it lacks | §13.9 steps 3–5 |
+| `health/prune-<to>.prepared.jsonl` | written and fsynced before the switch: header with counts, the event (operator, reason, time), one line per lost extent, UNRECOVERABLE version and affected group, and a trailer with the line count and SHA-256 of everything before it. In an encrypted archive every line after the header is sealed with AES-256-GCM under HKDF(DEK, archive_id, `STASH-HEALTH-AEAD-R10`), AAD = archive_id, target generation and line number, because the lines name paths | §13.9 step 1 |
+| commit | after the root switch the record is renamed to `prune-<to>.jsonl`; only then may GC delete the old generation. Every open and every compaction settles prepared records by the root: `to == root.current` commits, `to > root.current` (an aborted compaction) removes | §13.9 step 6 |
+| reading | `PruneRecords` (writer and reader) checks each trailer and reports unknown names in `health/` as foreign: another implementation's health metadata, so parity protection is unknown until a verify; `Health.PruneRecords`, `Health.ForeignHealth` | §13.9 last paragraph |
+| CLI | the blocked error names the exact command; `stash compact -emergency-prune N -operator NAME -reason TEXT`; `stash health [-v]`; `stash verify` mentions prune records and foreign health metadata | |
+
+Choices: an UNRECOVERABLE version leaves the live state (a manifest record must cover `[0, L)`), so `Get` returns `ErrNotFound`; the record says why. What is still readable of a lost version can be salvaged before the prune (`stash salvage`).
+
+Tests: refusal without operator/reason, with a wrong count and with nothing lost (no generation and no record left behind); the pruned version is gone, the others intact, the record lists extent, version and event, verify and a later normal compaction pass; a tampered record is reported as damaged; XOR 2+1 with two of three blobs lost: UNRECOVERABLE groups, survivors regrouped, every destination group healthy, every object either intact or listed; encrypted: no path or reason in the clear, details readable with the key; foreign health metadata reported; HARDENED: the anchor advances and a reader opens the pruned generation; 96 crash points through a prune: before the switch nothing is lost and no record is committed, after it the record is committed and the version gone, never a prepared record left after open; CLI end to end.
+
 ## Next milestones
 
 19. Bounded-memory metadata: done through phase 5 (10^7 frames measured on compressing storage). Still to measure on real disks and production hardware (`tools/scale.sh`); compaction's sorted merge join (see Parallelism).
-20. Emergency Pruning (§13.9).
+20. Emergency Pruning (§13.9): done.
 21. Optionally a writable FUSE mount (new versions on close), if wanted.
