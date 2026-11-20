@@ -2,6 +2,7 @@ package index
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"slices"
 
@@ -160,6 +161,17 @@ func (x *Index) FindAt(r *blob.Reader, hash [wire.HashSize]byte, off uint64, acc
 	}
 	ref.Release()
 	return nil, nil
+}
+
+// Has reports whether the index holds the record (hash, off).
+func (x *Index) Has(hash [wire.HashSize]byte, off uint64) (bool, error) {
+	x.mu.RLock()
+	defer x.mu.RUnlock()
+	if x.closed {
+		return false, errors.New("index: closed")
+	}
+	_, ok, err := x.recordAt(hash, off)
+	return ok, err
 }
 
 // recordAt finds the record (hash, off) by binary search in every source,

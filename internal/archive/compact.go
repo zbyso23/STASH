@@ -87,7 +87,6 @@ type compactor struct {
 	tab *kvtab.Table
 
 	mu         sync.Mutex
-	nlive      int // 'L' keys
 	maxOrd     []uint64
 	hasOrd     []bool
 	maxGroup   uint64
@@ -403,17 +402,11 @@ func frameKeyBytes(tag byte, b uint8, off int64) []byte {
 func (c *compactor) want(p string, v *manifest.Version) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// no lookup first: a key is wanted once or more, the table holds it once
 	for _, l := range v.Loc {
 		k := liveKeyBytes(liveKey{l.Blob, blob.FrameKey{Hash: l.Hash, Path: p, FileVer: v.FileVer, Offset: l.Offset}})
-		_, had, err := c.tab.Get(k)
-		if err != nil {
+		if err := c.tab.Put(k, nil); err != nil {
 			return err
-		}
-		if !had {
-			if err := c.tab.Put(k, nil); err != nil {
-				return err
-			}
-			c.nlive++
 		}
 	}
 	return nil
@@ -569,10 +562,11 @@ func (c *compactor) copyVersions(ctx context.Context) error {
 	}
 	// wanted entries not found intact: they can only sit in members that
 	// are lost; rebuild the incomplete groups (§7.3)
-	c.mu.Lock()
-	missing := c.nlive > 0
-	c.mu.Unlock()
-	if missing {
+	missing, err := c.liveLeft(1)
+	if err != nil {
+		return err
+	}
+	if missing > 0 {
 		if err := run(func(send func(func() error) bool) error {
 			return fd.eachGroup(func(g uint32, ms []*hopMember) (bool, error) {
 				if len(ms) >= int(ms[0].t.GroupK)+int(ms[0].t.GroupM) {
@@ -591,9 +585,10 @@ func (c *compactor) copyVersions(ctx context.Context) error {
 	if err := c.flush(true); err != nil {
 		return err
 	}
-	c.mu.Lock()
-	n := c.nlive
-	c.mu.Unlock()
+	n, err := c.liveLeft(-1)
+	if err != nil {
+		return err
+	}
 	if n > 0 {
 		it := c.tab.Iter([]byte{'L'})
 		defer it.Close()
@@ -611,11 +606,131 @@ func (c *compactor) copyVersions(ctx context.Context) error {
 	return nil
 }
 
+// verifyFrames verifies the whole destination with every frame read once:
+// each blob is scanned completely (every frame fully validated: grid,
+// CRCs, hash, Pre-Trailer), the extents found are recorded ('v' keys:
+// path 0 file_ver offset → blob, hash, offset, length), and then every
+// live version of the destination state must have each of its extents in
+// a scanned frame of the right blob and hash, and in that blob's index.
+// It checks what reading every version would, without parsing a PACKED
+// frame once per object.
+func (c *compactor) verifyFrames(ctx context.Context) error {
+	d := c.d
+	vkey := func(p string, ver, off uint64) []byte {
+		k := append([]byte{'v'}, p...)
+		k = append(k, 0)
+		k = binary.BigEndian.AppendUint64(k, ver)
+		return binary.BigEndian.AppendUint64(k, off)
+	}
+	// a table of its own, dropped whole afterwards
+	vt := kvtab.New(c.src.kv)
+	defer vt.Close()
+	// the blobs are scanned in parallel (validation is the CPU cost)
+	errs := make([]error, len(d.view.blobs))
+	var wg sync.WaitGroup
+	for b, bv := range d.view.blobs {
+		if bv == nil {
+			return fmt.Errorf("%w: destination blob %02X unavailable", ErrMissingData, b)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res, err := bv.r.Scan(func(off int64, f *frame.Frame) error {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				bt := f.Trailer.BlockType
+				if bt != wire.BlockData && bt != wire.BlockPacked {
+					return nil
+				}
+				for _, e := range f.Entries {
+					lo := e.Offset
+					if bt == wire.BlockPacked {
+						lo = 0
+					}
+					v := append([]byte{byte(b)}, f.Trailer.HashPayload[:]...)
+					v = binary.BigEndian.AppendUint64(v, uint64(off))
+					v = binary.BigEndian.AppendUint64(v, e.Length)
+					if err := vt.Put(vkey(e.Path, e.FileVer, lo), v); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			if err == nil && (res.Err != nil || res.End != res.Size) {
+				err = fmt.Errorf("%w: destination blob %02X: %v", wire.ErrCorrupt, b, res.Err)
+			}
+			errs[b] = err
+		}()
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	var werr error
+	walked := 0
+	if err := d.journal.State().Walk("", "", func(p string, v *manifest.Version) bool {
+		walked++
+		if werr = ctx.Err(); werr != nil {
+			return false
+		}
+		for _, l := range v.Loc {
+			val, ok, err := vt.Get(vkey(p, v.FileVer, l.Offset))
+			if err == nil && (!ok || len(val) != 49 || val[0] != l.Blob || [wire.HashSize]byte(val[1:33]) != l.Hash ||
+				binary.BigEndian.Uint64(val[41:]) != l.Length) {
+				err = fmt.Errorf("%w: destination lacks %s v%d extent at %d", ErrMissingData, p, v.FileVer, l.Offset)
+			}
+			if err == nil {
+				var has bool
+				if has, err = d.view.blobs[l.Blob].idx.Has(l.Hash, binary.BigEndian.Uint64(val[33:])); err == nil && !has {
+					err = fmt.Errorf("%w: destination index %02X lacks %s v%d extent at %d", wire.ErrCorrupt, l.Blob, p, v.FileVer, l.Offset)
+				}
+			}
+			if err != nil {
+				werr = err
+				return false
+			}
+		}
+		return true
+	}); err != nil {
+		return err
+	}
+	if werr != nil {
+		return werr
+	}
+	// every snapshot path is in the destination (and nothing else)
+	want := 0
+	if err := c.eachPath('S', func(string, uint64) error { want++; return nil }); err != nil {
+		return err
+	}
+	if walked != want {
+		return fmt.Errorf("%w: destination has %d paths, the snapshot %d", ErrMissingData, walked, want)
+	}
+	return nil
+}
+
+// liveLeft counts the wanted extents not copied yet ('L' keys), up to
+// limit (-1: all).
+func (c *compactor) liveLeft(limit int) (int, error) {
+	it := c.tab.Iter([]byte{'L'})
+	defer it.Close()
+	n := 0
+	for (limit < 0 || n < limit) && it.Next() && it.Key()[0] == 'L' {
+		n++
+	}
+	return n, it.Err()
+}
+
 // clear deletes the keys under tag.
 func (c *compactor) clear(tag byte) error {
 	var keys [][]byte
+	from := []byte{tag}
 	for {
-		it := c.tab.Iter([]byte{tag})
+		// continue after the last batch: restarting at the tag would step
+		// over every tombstone written so far again
+		it := c.tab.Iter(from)
 		for it.Next() && it.Key()[0] == tag && len(keys) < 4096 {
 			keys = append(keys, bytes.Clone(it.Key()))
 		}
@@ -632,6 +747,7 @@ func (c *compactor) clear(tag byte) error {
 				return err
 			}
 		}
+		from = append(keys[len(keys)-1], 0)
 		keys = keys[:0]
 	}
 }
@@ -649,7 +765,6 @@ func (c *compactor) takeLocked(b uint8, t *wire.MasterTrailer, entries []wire.En
 			if err := c.tab.Delete(k); err != nil {
 				return nil, false, err
 			}
-			c.nlive--
 			live = append(live, e)
 		}
 	}
@@ -1193,7 +1308,12 @@ func (c *compactor) verify(ctx context.Context, tag byte, full bool) error {
 	d := c.d
 	st := d.journal.State()
 	before := d.view.Repairs()
-	if err := c.eachPath(tag, func(p string, _ uint64) error {
+	if tag == 'S' {
+		// all of it: by frame (each read once), not by path
+		if err := c.verifyFrames(ctx); err != nil {
+			return err
+		}
+	} else if err := c.eachPath(tag, func(p string, _ uint64) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}

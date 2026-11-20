@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"runtime"
 	"sync"
 
 	"stash/internal/blob"
@@ -110,27 +111,48 @@ func (v *view) verify(ctx context.Context, walk func(func(string, *manifest.Vers
 			return nil, err
 		}
 	}
-	// the live versions stream in path order; nothing per path is kept
-	// but the failures (the first maxFailedListed of them)
+	// the live versions stream in path order to a pool of readers; nothing
+	// per path is kept but the failures (the first maxFailedListed)
+	type job struct {
+		p   string
+		ver *manifest.Version
+	}
+	jobs := make(chan job, 2*runtime.GOMAXPROCS(0))
+	var mu sync.Mutex
+	var rwg sync.WaitGroup
+	for range runtime.GOMAXPROCS(0) {
+		rwg.Add(1)
+		go func() {
+			defer rwg.Done()
+			for j := range jobs {
+				o := v.object(j.p, j.ver)
+				n, err := io.Copy(io.Discard, o)
+				o.Close()
+				mu.Lock()
+				rep.Versions++
+				rep.Bytes += n
+				if err != nil {
+					if len(rep.Failed) < maxFailedListed {
+						rep.Failed[j.p] = err
+					}
+					rep.FailedCount++
+				}
+				mu.Unlock()
+			}
+		}()
+	}
 	var cerr error
-	if err := walk(func(p string, ver *manifest.Version) bool {
+	werr := walk(func(p string, ver *manifest.Version) bool {
 		if cerr = ctx.Err(); cerr != nil {
 			return false
 		}
-		o := v.object(p, ver)
-		n, err := io.Copy(io.Discard, o)
-		o.Close()
-		rep.Versions++
-		rep.Bytes += n
-		if err != nil {
-			if len(rep.Failed) < maxFailedListed {
-				rep.Failed[p] = err
-			}
-			rep.FailedCount++
-		}
+		jobs <- job{p, ver}
 		return true
-	}); err != nil {
-		return nil, err
+	})
+	close(jobs)
+	rwg.Wait()
+	if werr != nil {
+		return nil, werr
 	}
 	if cerr != nil {
 		return nil, cerr

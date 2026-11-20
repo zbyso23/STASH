@@ -2,6 +2,7 @@ package archive
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math/rand"
 	"os"
@@ -30,6 +31,8 @@ import (
 //	             compact (rewrites the archive into a new generation)
 //	STASH_READERS goroutines for the read phase (default 16)
 //	STASH_SAME    non-empty: objects share most frame content (duplicate frame hashes)
+//	STASH_ZERO    non-empty: frames are zeros with a unique stamp (distinct
+//	              hashes, compressible: for a compressing file system)
 //	STASH_NOHINT  non-empty: read without locator hints (comparison)
 //	STASH_GETS    Gets per reader goroutine (default 2000)
 //
@@ -93,7 +96,14 @@ func TestZZMemory(t *testing.T) {
 			for j := i; j < min(i+500, n); j++ {
 				go func(j int) {
 					d := make([]byte, size)
-					if os.Getenv("STASH_SAME") == "" {
+					switch {
+					case os.Getenv("STASH_ZERO") != "":
+						// distinct but compressible frames: zeros with a
+						// stamp per 4 KiB (for a compressing file system)
+						for k := 0; k+16 <= len(d); k += 4096 {
+							binary.BigEndian.PutUint64(d[k+8:], uint64(j)<<16|uint64(k/4096))
+						}
+					case os.Getenv("STASH_SAME") == "":
 						rand.New(rand.NewSource(int64(j))).Read(d) // distinct frames
 					}
 					d[0], d[1], d[2] = byte(j), byte(j>>8), byte(j>>16)
@@ -130,6 +140,10 @@ func TestZZMemory(t *testing.T) {
 		}
 		if !rep.OK() || rep.Versions != n {
 			t.Fatalf("verify: ok %v, %d versions", rep.OK(), rep.Versions)
+		}
+		for _, bv := range r.view.blobs {
+			h, m := bv.r.ParseCacheStats()
+			t.Logf("parse cache: %d hits, %d misses", h, m)
 		}
 		t.Logf("RESULT kind=%s phase=verify-time units=%d wall_s=%.2f", kind, units, time.Since(start).Seconds())
 		report("verify", 0, 0)

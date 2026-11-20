@@ -28,6 +28,7 @@ package stash
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -301,7 +302,21 @@ type Options struct {
 	// index page cache, in-memory index deltas, spills and validation
 	// sorts (default 1 GiB). Data beyond it goes to the scratch/ directory
 	// of the archive, which is removed when the writer opens and closes.
+	// A limit below MinMemoryLimit is ErrInvalid.
 	MemoryLimit int64
+}
+
+// MinMemoryLimit is the smallest MemoryLimit Open, OpenReadOnlyWith and
+// Recover accept (0 selects the 1 GiB default). The engine works below it
+// (its tests run at 8 MiB), but everything gets slower without a gain
+// worth having.
+const MinMemoryLimit = 128 << 20
+
+func checkMemory(n int64) error {
+	if n != 0 && n < MinMemoryLimit {
+		return fmt.Errorf("%w: memory limit %d MiB is below the minimum of %d MiB", ErrInvalid, n>>20, MinMemoryLimit>>20)
+	}
+	return nil
 }
 
 // Policy is the security policy an opener expects (SPEC §15A.2). It must
@@ -331,6 +346,9 @@ type Archive struct {
 // Open opens the archive in dir for writing, taking the writer lock and
 // running crash recovery (torn tails, open transactions, indexes).
 func Open(dir string, o Options) (*Archive, error) {
+	if err := checkMemory(o.MemoryLimit); err != nil {
+		return nil, err
+	}
 	w, err := archive.OpenWriter(vfs.OS{Root: dir}, archive.Options{MaxExtent: o.MaxExtent, UncompressedExtents: o.UncompressedExtents, PackThreshold: o.PackThreshold, VerifyAll: o.VerifyAll,
 		Anchor: o.Anchor, AdoptUnanchored: o.AdoptUnanchored, Key: o.Key, AcknowledgeAllocatorRollback: o.AcknowledgeAllocatorRollback, Policy: o.Policy,
 		MemoryLimit: o.MemoryLimit})
@@ -505,7 +523,7 @@ type ReadOptions struct {
 	// Policy is the expected security policy (see Options.Policy).
 	Policy Policy
 	// MemoryLimit bounds the reader's archive-scale working state (see
-	// Options.MemoryLimit).
+	// Options.MemoryLimit; at least MinMemoryLimit).
 	MemoryLimit int64
 	// TempDir holds the reader's private scratch space, used only when an
 	// index must be rebuilt or caught up beyond memory; "" means
@@ -520,6 +538,9 @@ func OpenReadOnly(dir string) (*Reader, error) { return OpenReadOnlyWith(dir, Re
 
 // OpenReadOnlyWith is OpenReadOnly with options.
 func OpenReadOnlyWith(dir string, o ReadOptions) (*Reader, error) {
+	if err := checkMemory(o.MemoryLimit); err != nil {
+		return nil, err
+	}
 	r, err := archive.OpenReaderWith(vfs.OS{Root: dir}, archive.ReaderOptions{Pin: !o.NoPin, PinTTL: o.PinTTL, Anchor: o.Anchor, Key: o.Key, Policy: o.Policy,
 		MemoryLimit: o.MemoryLimit, TempDir: o.TempDir})
 	if err != nil {
@@ -602,7 +623,8 @@ type RecoverOptions struct {
 	// created below it and removed by Close. Empty: os.TempDir(). When it
 	// cannot be used, Recover fails with ErrRecoveryWorkDir.
 	WorkDir string
-	// MemoryLimit bounds the scan's memory (0: 1 GiB); what does not fit
+	// MemoryLimit bounds the scan's memory (0: 1 GiB; at least
+	// MinMemoryLimit); what does not fit
 	// spills to WorkDir.
 	MemoryLimit int64
 }
@@ -635,6 +657,9 @@ type SalvageResult = recovery.SalvageResult
 // the live state), with gaps, provenance and manifest labels. Extract
 // reads one version; Salvage writes a selection into a new archive.
 func Recover(dir string, o RecoverOptions) (*Recovery, error) {
+	if err := checkMemory(o.MemoryLimit); err != nil {
+		return nil, err
+	}
 	return recovery.Scan(vfs.OS{Root: dir}, recovery.Options{Generation: o.Generation, NoManifest: o.NoManifest, Budget: o.ResyncBudget, Key: o.Key,
 		WorkDir: o.WorkDir, MemoryLimit: o.MemoryLimit})
 }

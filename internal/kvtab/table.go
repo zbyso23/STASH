@@ -152,12 +152,19 @@ type Table struct {
 	mu       sync.RWMutex
 	mem      map[string][]byte // value with a leading flag byte; flag 0: deleted
 	memBytes int64
-	memMax   int64
-	res      *membudget.Reservation
-	runs     []*sst // oldest first
-	seq      int
-	closed   bool
-	err      error // sticky failure of a flush
+	// imm is the previous delta while a background flush writes it; it
+	// stays readable (newer than every file) until the file replaces it.
+	// busy: the flush and the level merges after it are running; done
+	// is signalled when they end.
+	imm    map[string][]byte
+	busy   bool
+	done   *sync.Cond
+	memMax int64
+	res    *membudget.Reservation
+	runs   []*sst // oldest first
+	seq    int
+	closed bool
+	err    error // sticky failure of a flush
 
 	// view is the delta in key order, built by the first iterator after
 	// a change and shared, immutable, by iterators until the next change
@@ -172,6 +179,7 @@ func New(cfg Config) *Table {
 	var s [6]byte
 	rand.Read(s[:])
 	t := &Table{cfg: cfg, mac: newMacer(key), sess: hex.EncodeToString(s[:]), mem: map[string][]byte{}}
+	t.done = sync.NewCond(&t.mu)
 	if cfg.Scratch != nil {
 		want := cfg.MemLimit
 		if want <= 0 {
@@ -222,11 +230,21 @@ func (t *Table) set(key, v []byte) error {
 	t.mem[string(key)] = v
 	t.view = nil
 	t.memBytes += int64(len(key) + len(v) + entryMem)
-	if t.cfg.Scratch != nil && t.memBytes > t.memMax {
-		if err := t.flushLocked(); err != nil {
-			t.err = err
-			return err
+	// half the delta fills while the other half is written in the
+	// background: writers wait only when a flush is still running when
+	// the next one is due
+	if t.cfg.Scratch != nil && t.memBytes > t.memMax/2 {
+		for t.busy {
+			t.done.Wait()
 		}
+		if t.err != nil {
+			return t.err
+		}
+		if t.closed {
+			return errors.New("kvtab: closed")
+		}
+		t.imm, t.mem, t.memBytes, t.view, t.busy = t.mem, map[string][]byte{}, 0, nil, true
+		go t.background()
 	}
 	return nil
 }
@@ -238,11 +256,13 @@ func (t *Table) Get(key []byte) ([]byte, bool, error) {
 	if t.closed {
 		return nil, false, errors.New("kvtab: closed")
 	}
-	if v, ok := t.mem[string(key)]; ok {
-		if v[0] == 0 {
-			return nil, false, nil
+	for _, m := range []map[string][]byte{t.mem, t.imm} {
+		if v, ok := m[string(key)]; ok {
+			if v[0] == 0 {
+				return nil, false, nil
+			}
+			return bytes.Clone(v[1:]), true, nil
 		}
-		return bytes.Clone(v[1:]), true, nil
 	}
 	for i := len(t.runs) - 1; i >= 0; i-- {
 		cur := t.runs[i].seek(t.cache(), key)
@@ -268,7 +288,7 @@ func (t *Table) Get(key []byte) ([]byte, bool, error) {
 func (t *Table) Bulk(fill func(add func(k, v []byte) error) error) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if len(t.runs) > 0 || len(t.mem) > 0 {
+	if len(t.runs) > 0 || len(t.mem) > 0 || t.busy {
 		return errors.New("kvtab: Bulk into a non-empty table")
 	}
 	if t.cfg.Scratch == nil {
@@ -339,82 +359,108 @@ func (t *Table) writeFile(level int, fill func(add func(k, v []byte) error) erro
 	return s, nil
 }
 
-// flushLocked writes the delta as a level-0 file and merges levels.
-func (t *Table) flushLocked() error {
-	if len(t.mem) == 0 {
-		return nil
+// background writes the immutable delta as a level-0 file, then merges
+// levels, all without holding t.mu except to publish each result. Only
+// one runs at a time (busy), so nothing else changes t.runs meanwhile.
+func (t *Table) background() {
+	err := t.flushImm()
+	for err == nil {
+		var more bool
+		if more, err = t.mergeOnce(); !more {
+			break
+		}
 	}
-	keys := make([]string, 0, len(t.mem))
-	for k := range t.mem {
+	t.mu.Lock()
+	if err != nil && t.err == nil {
+		t.err = err
+	}
+	t.busy = false
+	t.done.Broadcast()
+	t.mu.Unlock()
+}
+
+func (t *Table) flushImm() error {
+	imm := t.imm // immutable while busy
+	keys := make([]string, 0, len(imm))
+	for k := range imm {
 		keys = append(keys, k)
 	}
 	slices.Sort(keys)
 	s, err := t.writeFile(0, func(add func(k, v []byte) error) error {
 		for _, k := range keys {
-			if err := add([]byte(k), t.mem[k]); err != nil {
+			if err := add([]byte(k), imm[k]); err != nil {
 				return err
 			}
 		}
 		return nil
 	})
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if err != nil {
 		return err
 	}
+	// the file replaces the delta atomically for readers
 	t.runs = append(t.runs, s)
-	clear(t.mem)
-	t.view = nil
-	t.memBytes = 0
-	return t.mergeLevels()
+	t.imm, t.view = nil, nil
+	return nil
 }
 
-// mergeLevels merges tierFan files of one session level into the next.
-// The bulk-loaded base is never merged in a session, so deletions stay
-// recorded as tombstones until the table is rebuilt.
-func (t *Table) mergeLevels() error {
-	for {
-		count := map[int]int{}
-		lvl := -1
-		for _, r := range t.runs {
-			if r.level == baseLevel {
-				continue
-			}
-			count[r.level]++
-			if count[r.level] >= tierFan && (lvl < 0 || r.level < lvl) {
-				lvl = r.level
-			}
+// mergeOnce merges tierFan files of one session level into the next, if
+// a level has that many. The bulk-loaded base is never merged in a
+// session, so deletions stay recorded as tombstones until the table is
+// rebuilt.
+func (t *Table) mergeOnce() (bool, error) {
+	t.mu.RLock()
+	count := map[int]int{}
+	lvl := -1
+	for _, r := range t.runs {
+		if r.level == baseLevel {
+			continue
 		}
-		if lvl < 0 {
-			return nil
+		count[r.level]++
+		if count[r.level] >= tierFan && (lvl < 0 || r.level < lvl) {
+			lvl = r.level
 		}
-		var in []*sst
-		var keep []*sst
-		for _, r := range t.runs {
-			if r.level == lvl {
-				in = append(in, r)
-			} else {
-				keep = append(keep, r)
-			}
-		}
-		s, err := t.writeFile(lvl+1, func(add func(k, v []byte) error) error {
-			m := newMerge(t.cache(), nil, in, nil, false)
-			for m.next() {
-				if err := add(m.k, m.v); err != nil {
-					return err
-				}
-			}
-			return m.err
-		})
-		if err != nil {
-			return err
-		}
-		for _, r := range in {
-			t.release(r)
-		}
-		// newer than every merged file, older than nothing left above them:
-		// merged files were the newest of their level, so append keeps order
-		t.runs = append(keep, s)
-		slices.SortStableFunc(t.runs, func(a, b *sst) int { return orderOf(a) - orderOf(b) })
 	}
+	var in []*sst
+	for _, r := range t.runs {
+		if r.level == lvl {
+			in = append(in, r)
+		}
+	}
+	t.mu.RUnlock()
+	if lvl < 0 {
+		return false, nil
+	}
+	s, err := t.writeFile(lvl+1, func(add func(k, v []byte) error) error {
+		m := newMerge(t.cache(), nil, in, nil, false)
+		for m.next() {
+			if err := add(m.k, m.v); err != nil {
+				return err
+			}
+		}
+		return m.err
+	})
+	if err != nil {
+		return false, err
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	keep := t.runs[:0:0]
+	for _, r := range t.runs {
+		if !slices.Contains(in, r) {
+			keep = append(keep, r)
+		}
+	}
+	for _, r := range in {
+		t.release(r)
+	}
+	// newer than every merged file, older than nothing left above them:
+	// merged files were the newest of their level, so append keeps order
+	t.runs = append(keep, s)
+	slices.SortStableFunc(t.runs, func(a, b *sst) int { return orderOf(a) - orderOf(b) })
+	t.view = nil
+	return true, nil
 }
 
 // orderOf sorts files oldest first: the base, then higher (older) levels.
@@ -448,10 +494,13 @@ func (t *Table) Close() error {
 		return nil
 	}
 	t.closed = true
+	for t.busy {
+		t.done.Wait()
+	}
 	for _, r := range t.runs {
 		t.release(r)
 	}
-	t.runs, t.mem, t.view = nil, nil, nil
+	t.runs, t.mem, t.imm, t.view = nil, nil, nil, nil
 	t.res.Release()
 	return nil
 }
@@ -546,14 +595,23 @@ func (t *Table) memView() *memView {
 	t.viewMu.Lock()
 	defer t.viewMu.Unlock()
 	if t.view == nil {
-		keys := make([]string, 0, len(t.mem))
+		keys := make([]string, 0, len(t.mem)+len(t.imm))
 		for k := range t.mem {
 			keys = append(keys, k)
+		}
+		for k := range t.imm {
+			if _, newer := t.mem[k]; !newer {
+				keys = append(keys, k)
+			}
 		}
 		slices.Sort(keys)
 		v := &memView{keys: keys, vals: make([][]byte, len(keys))}
 		for i, k := range keys {
-			v.vals[i] = t.mem[k]
+			if val, ok := t.mem[k]; ok {
+				v.vals[i] = val
+			} else {
+				v.vals[i] = t.imm[k]
+			}
 		}
 		t.view = v
 	}

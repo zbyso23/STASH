@@ -86,6 +86,7 @@ var (
 	ackRollbak bool
 	adopt      bool
 	policyName string
+	memMiB     int64
 )
 
 func commonFlags(fl *flag.FlagSet) {
@@ -93,6 +94,7 @@ func commonFlags(fl *flag.FlagSet) {
 	fl.StringVar(&anchorDir, "anchor", "", "directory of the file Generation Anchor (HARDENED)")
 	fl.BoolVar(&ackRollbak, "acknowledge-allocator-rollback", false, "continue after a reviewed ErrAllocatorRollback (operator decision)")
 	fl.BoolVar(&adopt, "adopt-unanchored", false, "keep manifest records written after the last anchor advance (operator decision)")
+	fl.Int64Var(&memMiB, "memory-mib", 0, "memory limit for archive-scale working state in MiB (default 1024, at least 128); what does not fit spills to disk")
 	fl.StringVar(&policyName, "policy", "", "expected security policy: standard or hardened (or $STASH_POLICY); with -anchor hardened is implied")
 }
 
@@ -145,7 +147,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		usage(stderr)
 		return exitUsage
 	}
-	keyFile, anchorDir, ackRollbak, adopt, policyName = "", "", false, false, ""
+	keyFile, anchorDir, ackRollbak, adopt, policyName, memMiB = "", "", false, false, "", 0
 	fl := flag.NewFlagSet("stash "+c.name, flag.ContinueOnError)
 	fl.SetOutput(stderr)
 	fl.Usage = func() {
@@ -297,7 +299,7 @@ func openWriter(dir string, extra func(*stash.Options)) (*stash.Archive, error) 
 	if err != nil {
 		return nil, err
 	}
-	o := stash.Options{Key: key, Anchor: a, AcknowledgeAllocatorRollback: ackRollbak, AdoptUnanchored: adopt, Policy: pol}
+	o := stash.Options{Key: key, Anchor: a, AcknowledgeAllocatorRollback: ackRollbak, AdoptUnanchored: adopt, Policy: pol, MemoryLimit: memMiB << 20}
 	if extra != nil {
 		extra(&o)
 	}
@@ -317,7 +319,7 @@ func openReader(dir string) (*stash.Reader, error) {
 	if err != nil {
 		return nil, err
 	}
-	return stash.OpenReadOnlyWith(dir, stash.ReadOptions{Key: key, Anchor: a, Policy: pol})
+	return stash.OpenReadOnlyWith(dir, stash.ReadOptions{Key: key, Anchor: a, Policy: pol, MemoryLimit: memMiB << 20})
 }
 
 // ---- create / info
@@ -830,7 +832,6 @@ var (
 	rGeneration string
 	rAll        bool
 	rWorkDir    string
-	rMemory     int64
 )
 
 func recoverFlags(fl *flag.FlagSet) {
@@ -838,7 +839,6 @@ func recoverFlags(fl *flag.FlagSet) {
 	fl.StringVar(&rGeneration, "generation", "", "generation id to scan (default: root.current, else the newest)")
 	fl.BoolVar(&rAll, "all", false, "recover: list every version found, not only the default selection")
 	fl.StringVar(&rWorkDir, "work-dir", "", "directory for the scan's working tables, outside the archive (default: the system temp directory)")
-	fl.Int64Var(&rMemory, "memory-mib", 0, "memory limit of the scan in MiB (default 1024)")
 }
 
 func scan(dir string) (*stash.Recovery, error) {
@@ -846,7 +846,7 @@ func scan(dir string) (*stash.Recovery, error) {
 	if err != nil {
 		return nil, err
 	}
-	o := stash.RecoverOptions{Key: key, NoManifest: rNoManifest, WorkDir: rWorkDir, MemoryLimit: rMemory << 20}
+	o := stash.RecoverOptions{Key: key, NoManifest: rNoManifest, WorkDir: rWorkDir, MemoryLimit: memMiB << 20}
 	if rGeneration != "" {
 		g, err := strconv.ParseUint(rGeneration, 0, 64)
 		if err != nil {
@@ -1069,7 +1069,7 @@ func cmdMount(e *env, _ *flag.FlagSet, args []string) error {
 		return err
 	}
 	logf := func(s string) { fmt.Fprintln(e.stderr, s) }
-	srv, err := fusefs.Mount(args[0], args[1], fusefs.Options{Read: stash.ReadOptions{Key: key, Anchor: a, Policy: pol},
+	srv, err := fusefs.Mount(args[0], args[1], fusefs.Options{Read: stash.ReadOptions{Key: key, Anchor: a, Policy: pol, MemoryLimit: memMiB << 20},
 		AllowOther: mAllowOther, Debug: mDebug, Log: logf})
 	if err != nil {
 		return err

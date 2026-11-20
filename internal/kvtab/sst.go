@@ -25,7 +25,7 @@ import (
 const (
 	MaxKey      = 8 << 10
 	MaxValue    = 256 << 10
-	blockTarget = 32 << 10
+	blockTarget = 4 << 10
 	macSize     = 16
 	blockHead   = 4
 )

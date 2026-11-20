@@ -912,7 +912,30 @@ func (rc *Recovery) assemble() error {
 			return err
 		}
 	}
-	return rc.All()(func(*Version) bool { rc.NVersions++; return true })
+	return rc.countVersions()
+}
+
+// countVersions counts the distinct versions of the extent records (one
+// pass over the keys, no labels).
+func (rc *Recovery) countVersions() error {
+	it := rc.tab.Iter([]byte{'E'})
+	defer it.Close()
+	var cur []byte
+	for it.Next() {
+		k := it.Key()
+		if k[0] != 'E' {
+			break
+		}
+		i := bytes.IndexByte(k, 0)
+		if i < 0 || len(k) < i+1+8+16 {
+			return kvtab.ErrTampered
+		}
+		if vk := k[:i+1+8+16]; cur == nil || !bytes.Equal(vk, cur) {
+			cur = append(cur[:0], vk...)
+			rc.NVersions++
+		}
+	}
+	return it.Err()
 }
 
 // Selection streams versions to fn until it returns false.

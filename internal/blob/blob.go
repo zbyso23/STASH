@@ -8,11 +8,15 @@
 package blob
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path"
+	"slices"
+	"sync"
+	"sync/atomic"
 
 	"stash/internal/bufpool"
 	"stash/internal/compress"
@@ -91,6 +95,33 @@ type Reader struct {
 	h    *wire.ArchiveHeader
 	k    *seal.Keys
 	pool *bufpool.Pool
+
+	// the last parsed frames with many entries (PACKED): reading small
+	// objects of one frame one after another parses its entries once
+	parsedMu sync.Mutex
+	parsed   []parsedFrame // a ring of at most parsedFrames
+	parsedAt int
+	parsedSz int // bytes of raw held
+	hits     atomic.Uint64
+	misses   atomic.Uint64
+}
+
+// ParseCacheStats counts ReadFrame calls answered from the parse cache and
+// frames with many entries parsed anew.
+func (r *Reader) ParseCacheStats() (hits, misses uint64) { return r.hits.Load(), r.misses.Load() }
+
+// parsedFrames and parsedBytes bound the parse cache of a Reader: the
+// frames and their raw bytes it holds (plus their entries).
+const (
+	parsedFrames = 16
+	parsedBytes  = 256 << 10
+)
+
+type parsedFrame struct {
+	off     int64
+	raw     []byte       // the validated bytes
+	fr      *frame.Frame // without its slices of raw
+	pay, pt [2]int       // Payload and PreTrailer bounds in raw
 }
 
 // Open opens a blob for reading and validates its header. Frames of an
@@ -252,12 +283,78 @@ func (r *Reader) ReadFrame(off int64) (*Ref, error) {
 		r.pool.Put(buf)
 		return nil, err
 	}
+	if fr := r.parsedHit(off, buf); fr != nil {
+		r.hits.Add(1)
+		return &Ref{Frame: fr, Offset: off, buf: buf, pool: r.pool, h: r.h, k: r.k}, nil
+	}
 	fr, err := frame.ParseKeyed(buf, r.h, r.k)
 	if err != nil {
 		r.pool.Put(buf)
 		return nil, err
 	}
+	if len(fr.Entries) > 1 {
+		r.misses.Add(1)
+		r.parsedPut(off, buf, fr)
+	}
 	return &Ref{Frame: fr, Offset: off, buf: buf, pool: r.pool, h: r.h, k: r.k}, nil
+}
+
+// parsedHit returns the parse of buf when the same bytes were read and
+// validated at off before: the frame is byte-identical, so its validation
+// holds; only the slices into the buffer are rebuilt.
+func (r *Reader) parsedHit(off int64, buf []byte) *frame.Frame {
+	r.parsedMu.Lock()
+	defer r.parsedMu.Unlock()
+	for i := range r.parsed {
+		c := &r.parsed[i]
+		if c.fr == nil || c.off != off || !bytes.Equal(c.raw, buf) {
+			continue
+		}
+		fr := *c.fr
+		fr.Payload = buf[c.pay[0]:c.pay[1]]
+		fr.PreTrailer = buf[c.pt[0]:c.pt[1]]
+		return &fr
+	}
+	return nil
+}
+
+func (r *Reader) parsedPut(off int64, buf []byte, fr *frame.Frame) {
+	pay, ok1 := within(buf, fr.Payload)
+	pt, ok2 := within(buf, fr.PreTrailer)
+	if !ok1 || !ok2 {
+		return
+	}
+	if len(buf) > parsedBytes/4 {
+		return
+	}
+	c := *fr
+	c.Payload, c.PreTrailer = nil, nil
+	e := parsedFrame{off: off, raw: bytes.Clone(buf), fr: &c, pay: pay, pt: pt}
+	r.parsedMu.Lock()
+	defer r.parsedMu.Unlock()
+	for len(r.parsed) > 0 && (len(r.parsed) >= parsedFrames || r.parsedSz+len(e.raw) > parsedBytes) {
+		// drop the oldest (the ring's next slot)
+		r.parsedAt %= len(r.parsed)
+		r.parsedSz -= len(r.parsed[r.parsedAt].raw)
+		r.parsed = slices.Delete(r.parsed, r.parsedAt, r.parsedAt+1)
+	}
+	r.parsedAt %= len(r.parsed) + 1
+	r.parsed = slices.Insert(r.parsed, r.parsedAt, e)
+	r.parsedAt++
+	r.parsedSz += len(e.raw)
+}
+
+// within returns the bounds of s inside buf, if s is a slice of it that
+// keeps the capacity to the end of buf (how frame.Parse slices).
+func within(buf, s []byte) ([2]int, bool) {
+	if len(s) == 0 {
+		return [2]int{}, true
+	}
+	start := cap(buf) - cap(s)
+	if start < 0 || start+len(s) > len(buf) || &buf[start] != &s[0] {
+		return [2]int{}, false
+	}
+	return [2]int{start, start + len(s)}, true
 }
 
 func frameSizeAt(f vfs.File, h *wire.ArchiveHeader, off, size int64) (int64, error) {

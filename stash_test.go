@@ -774,3 +774,18 @@ func listOf(t testing.TB, l interface{ List() ([]string, error) }) []string {
 	}
 	return p
 }
+
+func TestMinMemoryLimit(t *testing.T) {
+	dir := t.TempDir()
+	for _, n := range []int64{1, 64 << 20, stash.MinMemoryLimit - 1} {
+		if _, err := stash.Open(dir, stash.Options{MemoryLimit: n}); !errors.Is(err, stash.ErrInvalid) {
+			t.Fatalf("Open with %d: %v", n, err)
+		}
+		if _, err := stash.OpenReadOnlyWith(dir, stash.ReadOptions{MemoryLimit: n}); !errors.Is(err, stash.ErrInvalid) {
+			t.Fatalf("OpenReadOnlyWith with %d: %v", n, err)
+		}
+		if _, err := stash.Recover(dir, stash.RecoverOptions{MemoryLimit: n}); !errors.Is(err, stash.ErrInvalid) {
+			t.Fatalf("Recover with %d: %v", n, err)
+		}
+	}
+}
