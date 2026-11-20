@@ -334,6 +334,9 @@ func (w *Writer) prepareManifest(gen string, adopt bool) error {
 
 // advanceCommit hashes the manifest bytes appended since the last advance
 // and advances the anchor to them (§10.4.1 commit advance).
+//
+// (poisoned, below, reads the poison for operations with side effects
+// before the commit, such as acknowledging a loss.)
 func (w *Writer) advanceCommit(ctx context.Context) error {
 	hs := &w.hard
 	hs.mu.Lock()
@@ -531,4 +534,11 @@ func AuthorizeAnchorTransition(ctx context.Context, fsys vfs.FS, a anchor.Anchor
 	log(fmt.Sprintf("stash: anchor of archive %x advanced by %q from generation %d to local generation %d",
 		root.ArchiveID, operator, prev.GenerationID, root.GenerationID))
 	return nil
+}
+
+// poisoned returns the error that stopped the writer, if any.
+func (hs *hardenedState) poisoned() error {
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	return hs.failed
 }

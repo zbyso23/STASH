@@ -534,6 +534,14 @@ All six findings were verified first; the auditor's reproductions are kept as `i
 - **P1, a callback error lost in Walk.** In the mark and delta phases the callback's error and `Walk`'s own error are kept apart; the callback's wins. Not covered by fault injection (no hook inside the state walk yet).
 - **P2, acknowledgements outside the memory budget.** The acknowledged digests are a `kvtab` table (256 KiB in-memory delta, reserved from the budget, spilling to scratch files), created on the first acknowledgement. Tested with 15,000 acknowledgements over a 30,000-marker index, spill observed, and the set rebuilt from the cleared log on reopen.
 
+### Recheck after the audit fixes (second round, 2026-11-16)
+
+The auditor's recheck reproductions are kept as `internal/archive/audit_recheck_test.go`; all four failures were reproduced, then fixed:
+
+- **An acknowledged loss came back after a crash.** The cleared log is opened with `O_CREATE` after a compaction (or after it was removed), and `Sync` of the file does not make its name durable. The first acknowledgement of every open now also syncs `HealthDir`; only then does `Delete` report success. A failed write, sync or directory sync takes the record back (truncate, best effort), keeps the marker and fails the `Delete`; a retry works. Tested in `TestAckDurability`.
+- **A refused Delete changed state.** A stopped writer (`hard.failed`, now read and set under `hard.mu`) refuses the `Delete` before the acknowledgement; the marker and the log stay unchanged.
+- **Old index format STUNREC1.** Decided by the user: it is refused, never read as "no markers". It only existed in the M20b/M20c test builds; the error names it (an `ErrCorrupt`). The auditor's test is adapted to expect that refusal.
+
 ## Next milestones
 
 19. Bounded-memory metadata: done through phase 5 (10^7 frames measured on compressing storage). Still to measure on real disks and production hardware (`tools/scale.sh`); compaction's sorted merge join (see Parallelism).

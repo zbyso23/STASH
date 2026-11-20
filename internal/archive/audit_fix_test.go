@@ -392,3 +392,69 @@ func TestCompactRootReplaceFaultsHardened(t *testing.T) {
 		})
 	}
 }
+
+// healthSyncFS fails the sync of HealthDir once.
+type healthSyncFS struct {
+	vfs.FS
+	fail bool
+}
+
+func (h *healthSyncFS) SyncDir(p string) error {
+	if h.fail && p == HealthDir {
+		h.fail = false
+		return fs.ErrPermission
+	}
+	return h.FS.SyncDir(p)
+}
+
+// Recheck: an acknowledgement is durable with its log's name; a failed
+// directory sync fails the Delete, keeps the marker, and a retry works.
+// A stopped writer's Delete changes neither the marker nor the log.
+func TestAckDurability(t *testing.T) {
+	ctx := context.Background()
+	backing, _ := pruneOne(t, nil, "a", "b")
+	fsys := &healthSyncFS{FS: backing}
+	w := mustOpen(t, fsys)
+	fsys.fail = true
+	if err := w.Delete("a"); !errors.Is(err, fs.ErrPermission) {
+		t.Fatalf("delete with a failing directory sync: %v", err)
+	}
+	if _, err := w.Get("a"); !isLost(err) {
+		t.Fatalf("a failed delete acknowledged the loss: %v", err)
+	}
+	w.Close()
+	w = mustOpen(t, fsys)
+	if _, err := w.Get("a"); !isLost(err) {
+		t.Fatalf("after reopen: %v", err)
+	}
+	if err := w.Delete("a"); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	w = mustOpen(t, backing.Crash(vfs.CrashDropUnsynced, nil))
+	if _, err := w.Get("a"); !errors.Is(err, ErrNotFound) || isLost(err) {
+		t.Fatalf("acknowledged a after a crash: %v", err)
+	}
+	w.Close()
+
+	// poisoned writer
+	rf := &rootFaultFS{FS: backing}
+	w = mustOpen(t, rf)
+	defer w.Close()
+	root, _ := readRoot(rf)
+	logName := clearedName(root.GenerationID)
+	before, _ := vfs.ReadFile(rf, logName, 1<<20)
+	rf.renamed, rf.failSync = false, true
+	if _, err := w.Compact(ctx, CompactOptions{}); !errors.Is(err, fs.ErrPermission) {
+		t.Fatalf("compact: %v", err)
+	}
+	if err := w.Delete("b"); err == nil {
+		t.Fatal("a stopped writer acknowledged a loss")
+	}
+	if _, err := w.Get("b"); !isLost(err) {
+		t.Fatalf("b after a refused delete: %v", err)
+	}
+	if after, _ := vfs.ReadFile(rf, logName, 1<<20); !bytes.Equal(before, after) {
+		t.Fatal("a refused delete wrote the cleared log")
+	}
+}

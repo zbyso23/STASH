@@ -105,13 +105,18 @@ type lostSet struct {
 	nCleared int64
 	clog     vfs.File // writer only
 	clogEnd  int64
+	// fsys and dirSynced: the log's name is made durable (a sync of
+	// HealthDir) before the first acknowledgement of this open; a log
+	// created by O_CREATE is not durable by its own Sync
+	fsys      vfs.FS
+	dirSynced bool
 }
 
 // openLostSet opens the markers of generation gen; a writer also opens
 // the cleared log for appending (its torn tail truncated). kv configures
 // the table of acknowledged digests.
 func openLostSet(fsys vfs.FS, k *seal.Keys, gen uint64, writer bool, kv kvtab.Config) (*lostSet, error) {
-	s := &lostSet{k: k, gen: gen, kv: kv}
+	s := &lostSet{k: k, gen: gen, kv: kv, fsys: fsys}
 	f, err := fsys.OpenFile(lostIndexName(gen), os.O_RDONLY, 0)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
@@ -198,6 +203,10 @@ func checkLostIndex(f vfs.File, gen uint64) (int64, error) {
 	}
 	if _, err := f.ReadAt(hdr[:], 0); err != nil {
 		return 0, err
+	}
+	if string(hdr[:8]) == "STUNREC1" {
+		// the pre-release format of M20b/M20c, never released
+		return 0, fmt.Errorf("%w: marker index in the pre-release format STUNREC1 (M20b/M20c test builds), not supported; reprune from a copy made before the prune, or rebuild the index with that build", wire.ErrCorrupt)
 	}
 	if [8]byte(hdr[:8]) != lostMagic {
 		return 0, fmt.Errorf("%w: marker index magic", wire.ErrCorrupt)
@@ -357,11 +366,24 @@ func (s *lostSet) clear(p string) error {
 		return fmt.Errorf("%w: markers not writable", wire.ErrInvalid)
 	}
 	rec := binary.LittleEndian.AppendUint32(append([]byte(nil), d[:]...), wire.CRC32C(d[:]))
-	if _, err := s.clog.WriteAt(rec, s.clogEnd); err != nil {
+	// a failed acknowledgement takes its record back (best effort), so a
+	// reopen does not find a Delete that reported an error
+	undo := func(err error) error {
+		s.clog.Truncate(s.clogEnd)
+		s.clog.Sync()
 		return err
 	}
+	if _, err := s.clog.WriteAt(rec, s.clogEnd); err != nil {
+		return undo(err)
+	}
 	if err := s.clog.Sync(); err != nil {
-		return err
+		return undo(err)
+	}
+	if !s.dirSynced {
+		if err := s.fsys.SyncDir(HealthDir); err != nil {
+			return undo(err) // not acknowledged; a retry writes it again
+		}
+		s.dirSynced = true
 	}
 	s.clogEnd += clearedRec
 	return s.ack(d)

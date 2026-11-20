@@ -442,8 +442,11 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 		if w.hard.anchor != nil || rerr != nil || cur.GenerationID == id {
 			switched = true // keep the destination directory
 			d.closeGeneration()
-			w.hard.failed = fmt.Errorf("compaction to generation %d: root replacement failed after the rename may have landed (reopen required): %w", id, err)
-			return res, w.hard.failed
+			perr := fmt.Errorf("compaction to generation %d: root replacement failed after the rename may have landed (reopen required): %w", id, err)
+			w.hard.mu.Lock()
+			w.hard.failed = perr
+			w.hard.mu.Unlock()
+			return res, perr
 		}
 		return res, err
 	}

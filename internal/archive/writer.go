@@ -675,6 +675,10 @@ func (w *Writer) Delete(p string) error {
 		return err
 	}
 	if u != nil {
+		// a stopped writer changes nothing, the acknowledgement included
+		if err := w.hard.poisoned(); err != nil {
+			return err
+		}
 		if err := w.view.lost.clear(p); err != nil {
 			return err
 		}
