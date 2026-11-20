@@ -38,6 +38,9 @@ type Config struct {
 	// are removed by Close; CleanScratch removes runs left by a crash.
 	FS  vfs.FS
 	Dir string
+	// Scratch, when FS is nil, provides FS and Dir lazily on the first
+	// spill, so a sort that fits in memory never touches the disk.
+	Scratch func() (vfs.FS, string, error)
 	// Compare orders records. Records that compare equal keep the order
 	// in which they were added (the sort is stable).
 	Compare Compare
@@ -83,8 +86,8 @@ type Sorter struct {
 
 // New reserves the working set and returns an empty Sorter.
 func New(ctx context.Context, cfg Config) (*Sorter, error) {
-	if cfg.Compare == nil || cfg.FS == nil {
-		return nil, errors.New("extsort: Compare and FS are required")
+	if cfg.Compare == nil || (cfg.FS == nil && cfg.Scratch == nil) {
+		return nil, errors.New("extsort: Compare and FS or Scratch are required")
 	}
 	if cfg.Memory == 0 {
 		cfg.Memory = DefaultMemory
@@ -235,6 +238,13 @@ func (s *Sorter) spill() error {
 // writeRun creates a new scratch run filled by fill.
 func (s *Sorter) writeRun(fill func(*RunWriter) error) (string, error) {
 	if s.seq == 0 {
+		if s.cfg.FS == nil {
+			fsys, dir, err := s.cfg.Scratch()
+			if err != nil {
+				return "", fmt.Errorf("extsort: scratch space: %w", err)
+			}
+			s.cfg.FS, s.cfg.Dir = fsys, dir
+		}
 		if err := s.cfg.FS.MkdirAll(s.cfg.Dir, 0o755); err != nil {
 			return "", err
 		}

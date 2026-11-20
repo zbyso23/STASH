@@ -310,10 +310,10 @@ func (w *Writer) writeGroupFrames(specs []*frame.Spec, q uint32) ([]placedFrame,
 			errs[i] = err
 			return
 		}
-		bv := w.blobs[b]
-		bv.mu.Lock()
-		bv.idx.Add(rec)
-		bv.mu.Unlock()
+		if err := w.blobs[b].idx.Add(rec); err != nil {
+			errs[i] = err
+			return
+		}
 		if i < k {
 			placed[i] = placedFrame{b, rec}
 		}

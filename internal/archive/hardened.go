@@ -270,7 +270,7 @@ func verifyAnchored(ctx context.Context, fsys vfs.FS, pool *bufpool.Pool, root w
 	if err := checkManifestPrefix(fsys, GenDir(root.GenerationID), st); err != nil {
 		return err
 	}
-	r, err := openReaderAt(fsys, pool, root, int64(st.ManifestLength), true, dek)
+	r, err := openReaderAt(fsys, pool, root, int64(st.ManifestLength), true, dek, memOpts{})
 	if err != nil {
 		return err
 	}

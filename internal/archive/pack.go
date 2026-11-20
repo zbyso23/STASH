@@ -184,10 +184,9 @@ func (w *Writer) writeSpecs(specs []*frame.Spec) ([]placedFrame, map[int]bool, e
 				if err != nil {
 					return err
 				}
-				bv := w.blobs[b]
-				bv.mu.Lock()
-				bv.idx.Add(rec)
-				bv.mu.Unlock()
+				if err := w.blobs[b].idx.Add(rec); err != nil {
+					return err
+				}
 				mu.Lock()
 				placed[i] = placedFrame{b, rec}
 				touched[b] = true

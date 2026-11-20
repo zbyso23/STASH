@@ -347,9 +347,8 @@ func (w *Writer) appendData(p string, ver uint64, b int, ord uint64, e encExtent
 	if err != nil {
 		return manifest.Loc{}, 0, err
 	}
-	bv := w.blobs[b]
-	bv.mu.Lock()
-	bv.idx.Add(rec)
-	bv.mu.Unlock()
+	if err := w.blobs[b].idx.Add(rec); err != nil {
+		return manifest.Loc{}, 0, err
+	}
 	return manifest.Loc{Blob: uint8(b), Hash: rec.FrameHash, Offset: uint64(off), Length: uint64(n)}, b, nil
 }

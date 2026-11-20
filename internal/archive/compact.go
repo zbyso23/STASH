@@ -127,7 +127,7 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 	if err := createGeneration(w.fsys, &dh); err != nil {
 		return res, err
 	}
-	d := &Writer{fsys: w.fsys, opt: w.opt, busy: map[string]bool{}, genAlloc: w.genAlloc, verAlloc: w.verAlloc, keys: w.keys,
+	d := &Writer{fsys: w.fsys, opt: w.opt, env: w.env, busy: map[string]bool{}, genAlloc: w.genAlloc, verAlloc: w.verAlloc, keys: w.keys,
 		health: Health{Sealed: map[uint8]error{}, TornBlobBytes: map[uint8]int64{}}}
 	switched := false
 	defer func() {
@@ -444,10 +444,9 @@ func (c *compactor) copyTo(b int, fr []byte) (wire.IndexRecord, error) {
 	if err != nil {
 		return rec, err
 	}
-	bv := c.d.blobs[b]
-	bv.mu.Lock()
-	bv.idx.Add(rec)
-	bv.mu.Unlock()
+	if err := c.d.blobs[b].idx.Add(rec); err != nil {
+		return rec, err
+	}
 	c.mu.Lock()
 	if !c.hasOrd[b] || rec.FrameOrdinal > c.maxOrd[b] {
 		c.maxOrd[b], c.hasOrd[b] = rec.FrameOrdinal, true

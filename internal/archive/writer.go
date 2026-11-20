@@ -70,6 +70,10 @@ type Options struct {
 	// Policy is the expected security policy from trusted configuration
 	// (§15A.2); see Policy.
 	Policy Policy
+	// MemoryLimit bounds the archive-scale working state (index pages,
+	// in-memory index deltas, spills, validation sorts); 0 means 1 GiB.
+	// Spills go to ScratchDir below the archive root.
+	MemoryLimit int64
 }
 
 // Health reports conditions found when opening (§13.9).
@@ -110,6 +114,7 @@ type Writer struct {
 	retired   []*view
 	compactMu sync.Mutex
 	fsys      vfs.FS // shadows view.fsys (the same FS), usable before a view exists
+	env       *index.Env
 	unlock    func() error
 	journal   *manifest.Journal
 	opt       Options
@@ -157,6 +162,9 @@ func OpenWriter(fsys vfs.FS, opt Options) (w *Writer, err error) {
 		}
 	}()
 	if err := checkPolicy(context.Background(), fsys, opt.Anchor, opt.Policy); err != nil {
+		return nil, err
+	}
+	if w.env, err = writerEnv(fsys, opt.MemoryLimit); err != nil {
 		return nil, err
 	}
 	if opt.Anchor != nil {
@@ -215,7 +223,7 @@ func (w *Writer) openGeneration(gen string, h *wire.ArchiveHeader) (err error) {
 			return err
 		}
 	}
-	w.view = &view{fsys: fsys, gen: gen, h: h, pool: opt.Pool, k: w.keys}
+	w.view = &view{fsys: fsys, gen: gen, h: h, pool: opt.Pool, k: w.keys, env: w.env}
 	if h.Encrypted() && h.GenerationID > seal.MaxGenerationID {
 		return fmt.Errorf("%w: generation %d", seal.ErrNonceLimit, h.GenerationID)
 	}
@@ -718,6 +726,11 @@ func (w *Writer) Close() error {
 	}
 	if w.journal != nil {
 		keep(w.journal.Close())
+	}
+	if w.env != nil {
+		w.env.Cache.Close()
+		keep(removeScratch(w.fsys))
+		w.env = nil
 	}
 	if w.unlock != nil {
 		keep(w.unlock())

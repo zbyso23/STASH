@@ -50,7 +50,7 @@ func TestGoldenIndexFile(t *testing.T) {
 	if err := h.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	x := New(h, g.BlobOrdinal)
+	x := New(nil, h, g.BlobOrdinal)
 	for _, r := range g.Records {
 		hb, _ := hex.DecodeString(r.Hash)
 		x.Add(wire.IndexRecord{FrameHash: [32]byte(hb), PhysicalOffset: r.Offset, FrameQuanta: r.Quanta,
@@ -66,7 +66,7 @@ func TestGoldenIndexFile(t *testing.T) {
 	if !bytes.Equal(got, want) {
 		t.Fatalf("index file differs from independent encoding\n got %x\nwant %x", got, want)
 	}
-	y, err := Load(c, "index/blob-07.idx", h, g.BlobOrdinal, g.BlobSize, nil)
+	y, err := Load(nil, c, "index/blob-07.idx", h, g.BlobOrdinal, g.BlobSize, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestGoldenIndexFile(t *testing.T) {
 	if c := y.Lookup([32]byte(hb)); len(c) != 2 || c[0].PhysicalOffset >= c[1].PhysicalOffset {
 		t.Fatalf("duplicate-hash lookup %+v", c)
 	}
-	if _, err := Load(c, "index/blob-07.idx", h, g.BlobOrdinal, g.BlobSize-1, nil); !errors.Is(err, ErrDiscard) {
+	if _, err := Load(nil, c, "index/blob-07.idx", h, g.BlobOrdinal, g.BlobSize-1, nil); !errors.Is(err, ErrDiscard) {
 		t.Fatalf("record past blob end accepted: %v", err)
 	}
 }
@@ -143,7 +143,7 @@ func hashOf(s string) [32]byte {
 func TestOpenMissingRebuildsThenLagging(t *testing.T) {
 	c, h, w, _ := setup(t, "a", "b", "c")
 	r := reader(t, c, h)
-	x, st, err := Open(c, idxName, r, h, 0, nil)
+	x, st, err := Open(nil, c, idxName, r, h, 0, nil)
 	if err != nil || !st.Rebuilt || !errors.Is(st.Discarded, ErrDiscard) || x.Len() != 3 {
 		t.Fatalf("%v %+v len %d", err, st, x.Len())
 	}
@@ -153,7 +153,7 @@ func TestOpenMissingRebuildsThenLagging(t *testing.T) {
 	w.Append(spec(3, "d"))
 	w.Append(spec(4, "e"))
 	w.Sync()
-	x, st, err = Open(c, idxName, r, h, 0, nil)
+	x, st, err = Open(nil, c, idxName, r, h, 0, nil)
 	if err != nil || st.Rebuilt || st.CaughtUp != 2 || x.Len() != 5 {
 		t.Fatalf("%v %+v len %d", err, st, x.Len())
 	}
@@ -167,12 +167,12 @@ func TestOpenMissingRebuildsThenLagging(t *testing.T) {
 func TestStaleIdentityRebuilds(t *testing.T) {
 	c, h, _, _ := setup(t, "a", "b")
 	r := reader(t, c, h)
-	x, _, _ := Build(r, h, 0)
+	x, _, _ := Build(nil, r, h, 0)
 	other := *h
 	other.GenerationID = 2
 	x.h = &other
 	x.Write(c, idxName)
-	_, st, err := Open(c, idxName, r, h, 0, nil)
+	_, st, err := Open(nil, c, idxName, r, h, 0, nil)
 	if err != nil || !st.Rebuilt {
 		t.Fatalf("stale index used: %v %+v", err, st)
 	}
@@ -181,7 +181,7 @@ func TestStaleIdentityRebuilds(t *testing.T) {
 func TestFindDuplicatesAndFallback(t *testing.T) {
 	c, h, _, offs := setup(t, "same", "other", "same")
 	r := reader(t, c, h)
-	x, _, _ := Build(r, h, 0)
+	x, _, _ := Build(nil, r, h, 0)
 	want := func(path string) func(*blob.Ref) bool {
 		return func(ref *blob.Ref) bool { return ref.Entries[0].Path == path }
 	}
@@ -191,14 +191,14 @@ func TestFindDuplicatesAndFallback(t *testing.T) {
 	}
 	ref.Release()
 	// an index missing the record: the scan finds it and flags the index
-	empty := New(h, 0)
+	empty := New(nil, h, 0)
 	ref, how, err = empty.Find(r, hashOf("other"), nil)
 	if err != nil || how != ViaScan || ref.Offset != offs[1] {
 		t.Fatalf("fallback %v %v", how, err)
 	}
 	ref.Release()
 	// a wrong record (points at another frame) is rejected by validation
-	bad := New(h, 0)
+	bad := New(nil, h, 0)
 	bad.Add(wire.IndexRecord{FrameHash: hashOf("other"), PhysicalOffset: uint64(offs[0]), FrameQuanta: 1})
 	if ref, how, _ = bad.Find(r, hashOf("other"), nil); how != ViaScan || ref.Offset != offs[1] {
 		t.Fatalf("wrong candidate trusted: %v", how)
@@ -213,7 +213,7 @@ func TestFindDuplicatesAndFallback(t *testing.T) {
 func TestLoadRejects(t *testing.T) {
 	c, h, _, _ := setup(t, "a", "b", "c")
 	r := reader(t, c, h)
-	x, _, _ := Build(r, h, 0)
+	x, _, _ := Build(nil, r, h, 0)
 	x.Write(c, idxName)
 	good, _ := vfs.ReadFile(c, idxName, 1<<20)
 	size, _ := r.Size()
@@ -250,12 +250,12 @@ func TestLoadRejects(t *testing.T) {
 		if name == "too many recs" {
 			bs = 0x40 + 2*4096
 		}
-		if _, err := Load(c, idxName, h, 0, bs, nil); !errors.Is(err, ErrDiscard) {
+		if _, err := Load(nil, c, idxName, h, 0, bs, nil); !errors.Is(err, ErrDiscard) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
 	vfs.ReplaceFile(c, idxName, good)
-	if _, err := Load(c, idxName, h, 0, size, nil); err != nil {
+	if _, err := Load(nil, c, idxName, h, 0, size, nil); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -265,7 +265,7 @@ func TestLoadRejects(t *testing.T) {
 func TestCrashDuringWrite(t *testing.T) {
 	c, h, w, _ := setup(t, "a", "b")
 	r := reader(t, c, h)
-	x, _, _ := Build(r, h, 0)
+	x, _, _ := Build(nil, r, h, 0)
 	x.Write(c, idxName)
 	w.Append(spec(2, "c"))
 	w.Sync()
@@ -273,14 +273,14 @@ func TestCrashDuringWrite(t *testing.T) {
 	size, _ := r.Size()
 	for seed := int64(0); seed < 50; seed++ {
 		cc := c.Crash(vfs.CrashDropUnsynced, nil) // fresh copy to write into
-		y := New(h, 0)
-		for _, rr := range x.recs {
+		y := New(nil, h, 0)
+		for _, rr := range allRecords(t, x) {
 			y.Add(rr)
 		}
 		// write the new index but crash at a random point by tearing
 		y.Write(cc, idxName)
 		after := cc.Crash(vfs.CrashTear, rand.New(rand.NewSource(seed)))
-		z, err := Load(after, idxName, h, 0, size, nil)
+		z, err := Load(nil, after, idxName, h, 0, size, nil)
 		if err != nil {
 			t.Fatalf("seed %d: completed write not durable: %v", seed, err)
 		}
@@ -299,7 +299,7 @@ func FuzzLoad(f *testing.F) {
 		fsys := vfs.NewCrashFS()
 		fsys.MkdirAll("index", 0o755)
 		vfs.ReplaceFile(fsys, idxName, b)
-		x, err := Load(fsys, idxName, h, 0, 0x40+16*4096, nil)
+		x, err := Load(nil, fsys, idxName, h, 0, 0x40+16*4096, nil)
 		if err != nil {
 			if !errors.Is(err, ErrDiscard) {
 				t.Fatalf("non-discard error %v", err)
@@ -325,7 +325,7 @@ func setupF(f *testing.F) (*vfs.CrashFS, *wire.ArchiveHeader, *Index, int64) {
 	w.Sync()
 	r, _ := blob.Open(c, blobName, h, nil)
 	defer r.Close()
-	x, _, _ := Build(r, h, 0)
+	x, _, _ := Build(nil, r, h, 0)
 	x.Write(c, idxName)
 	size, _ := r.Size()
 	return c, h, x, size
@@ -333,7 +333,7 @@ func setupF(f *testing.F) (*vfs.CrashFS, *wire.ArchiveHeader, *Index, int64) {
 
 func BenchmarkLookup(b *testing.B) {
 	h := header()
-	x := New(h, 0)
+	x := New(nil, h, 0)
 	rng := rand.New(rand.NewSource(1))
 	var keys [][32]byte
 	for i := 0; i < 100000; i++ {
@@ -355,7 +355,7 @@ func BenchmarkLookup(b *testing.B) {
 // identical to a rebuild and needs no catch-up.
 func TestWriterPathMatchesRebuild(t *testing.T) {
 	c, h, w, _ := setup(t)
-	x := New(h, 0)
+	x := New(nil, h, 0)
 	for i := 0; i < 2500; i++ { // crosses the 1024-record merge batch
 		rec, err := w.AppendIndexed(spec(i, fmt.Sprint(i%700)))
 		if err != nil {
@@ -368,11 +368,11 @@ func TestWriterPathMatchesRebuild(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := reader(t, c, h)
-	y, st, err := Open(c, idxName, r, h, 0, nil)
+	y, st, err := Open(nil, c, idxName, r, h, 0, nil)
 	if err != nil || st.Rebuilt || st.CaughtUp != 0 || y.Len() != 2500 {
 		t.Fatalf("%v %+v %d", err, st, y.Len())
 	}
-	z, _, _ := Build(r, h, 0)
+	z, _, _ := Build(nil, r, h, 0)
 	z.Write(c, "index/rebuilt.idx")
 	a, _ := vfs.ReadFile(c, idxName, 1<<30)
 	b, _ := vfs.ReadFile(c, "index/rebuilt.idx", 1<<30)
@@ -382,4 +382,25 @@ func TestWriterPathMatchesRebuild(t *testing.T) {
 	if n := len(y.Lookup(hashOf("5"))); n < 3 {
 		t.Fatalf("payload-identical frames: %d candidates", n)
 	}
+}
+
+// allRecords returns every record of x in index order.
+func allRecords(t *testing.T, x *Index) []wire.IndexRecord {
+	t.Helper()
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	x.merge()
+	var its []recIter
+	if x.base != nil {
+		its = append(its, newSeq(x.base, x.h))
+	}
+	for _, r := range x.runs {
+		its = append(its, newSeq(r, x.h))
+	}
+	its = append(its, &sliceIter{recs: x.recs})
+	var out []wire.IndexRecord
+	if err := mergeAll(its, func(r *wire.IndexRecord) error { out = append(out, *r); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	return out
 }

@@ -36,8 +36,8 @@ var ErrMissingData = errors.New("committed data missing or damaged")
 // blobView is the read side of one blob: a reader and its index.
 type blobView struct {
 	r   *blob.Reader
-	mu  sync.Mutex // guards idx
-	idx *index.Index
+	mu  sync.Mutex   // guards defective and serializes index rewrites
+	idx *index.Index // safe for concurrent use
 	// defective is set when a lookup needed the fallback scan (§10.5.1).
 	defective bool
 }
@@ -49,6 +49,7 @@ type view struct {
 	h     *wire.ArchiveHeader
 	k     *seal.Keys // encrypted archive
 	pool  *bufpool.Pool
+	env   *index.Env  // memory budget, page cache, scratch space
 	blobs []*blobView // nil entry: blob unavailable
 	// unavailable records why a blob could not be opened (readers of a
 	// parity archive continue without it, §7.4).
@@ -100,7 +101,7 @@ func (v *view) openBlobs(writeIndexes, tolerate bool) (statuses []index.Status, 
 				return
 			}
 			iname, _ := index.Name(uint8(b))
-			x, st, err := index.Open(v.fsys, path.Join(v.gen, iname), r, v.h, uint8(b), v.pool)
+			x, st, err := index.Open(v.env, v.fsys, path.Join(v.gen, iname), r, v.h, uint8(b), v.pool)
 			if err != nil {
 				r.Close()
 				errs[b] = fmt.Errorf("index %02X: %w", b, err)
@@ -108,6 +109,7 @@ func (v *view) openBlobs(writeIndexes, tolerate bool) (statuses []index.Status, 
 			}
 			if writeIndexes && (st.Rebuilt || st.CaughtUp > 0) {
 				if err := x.Write(v.fsys, path.Join(v.gen, iname)); err != nil {
+					x.Close()
 					r.Close()
 					errs[b] = err
 					return
@@ -130,6 +132,7 @@ func (v *view) close() {
 	v.closeOnce.Do(func() {
 		for _, b := range v.blobs {
 			if b != nil {
+				b.idx.Close()
 				b.r.Close()
 			}
 		}
@@ -151,12 +154,13 @@ func (v *view) fetch(p string, ver *manifest.Version, l manifest.Loc) (*blob.Ref
 		return ok
 	}
 	if bv := v.blobs[l.Blob]; bv != nil {
-		bv.mu.Lock()
+		// the index is safe for concurrent lookups: no blob lock across I/O
 		ref, how, err := bv.idx.Find(bv.r, l.Hash, accept)
 		if how == index.ViaScan {
+			bv.mu.Lock()
 			bv.defective = true
+			bv.mu.Unlock()
 		}
-		bv.mu.Unlock()
 		if err != nil {
 			return nil, err
 		}
@@ -417,8 +421,9 @@ func checkPath(p string) error {
 // reader snapshot). It takes no lock and never writes.
 type Reader struct {
 	view
-	st  *manifest.State
-	pin *Pin
+	st       *manifest.State
+	pin      *Pin
+	memClose func() // releases the page cache and the scratch directory
 }
 
 // OpenReader opens the archive in fsys for reading, without a pin: a
@@ -429,7 +434,7 @@ func OpenReader(fsys vfs.FS, pool *bufpool.Pool) (*Reader, error) {
 	if err != nil {
 		return nil, err
 	}
-	return openReaderAt(fsys, pool, root, 0, false, nil)
+	return openReaderAt(fsys, pool, root, 0, false, nil, memOpts{})
 }
 
 // ReaderOptions configure OpenReaderWith.
@@ -446,22 +451,30 @@ type ReaderOptions struct {
 	Key []byte
 	// Policy is the expected security policy (§15A.2).
 	Policy Policy
+	// MemoryLimit bounds the archive-scale working state (index pages,
+	// spills, validation sorts); 0 means 1 GiB.
+	MemoryLimit int64
+	// TempDir holds the reader's private scratch space, created only when
+	// an index must spill (a rebuild or a large lag); "" is os.TempDir().
+	// A reader never writes into the archive.
+	TempDir string
 }
 
 // OpenReaderWith opens a read-only snapshot with options.
 func OpenReaderWith(fsys vfs.FS, o ReaderOptions) (*Reader, error) {
+	mo := memOpts{limit: o.MemoryLimit, tempDir: o.TempDir}
 	if err := checkPolicy(context.Background(), fsys, o.Anchor, o.Policy); err != nil {
 		return nil, err
 	}
 	if o.Anchor == nil {
 		if o.Pin {
-			return openReaderPinned(fsys, o.Pool, o.PinTTL, o.Key)
+			return openReaderPinned(fsys, o.Pool, o.PinTTL, o.Key, mo)
 		}
 		root, err := readRoot(fsys)
 		if err != nil {
 			return nil, err
 		}
-		return openReaderAt(fsys, o.Pool, root, 0, false, o.Key)
+		return openReaderAt(fsys, o.Pool, root, 0, false, o.Key, mo)
 	}
 	ctx := context.Background()
 	root, st, err := resolveHardened(ctx, fsys, o.Anchor, o.Pool, false, o.Key)
@@ -482,7 +495,7 @@ func OpenReaderWith(fsys vfs.FS, o ReaderOptions) (*Reader, error) {
 			return nil, err
 		}
 	}
-	r, err := openReaderAt(fsys, o.Pool, root, int64(st.ManifestLength), true, o.Key)
+	r, err := openReaderAt(fsys, o.Pool, root, int64(st.ManifestLength), true, o.Key, mo)
 	if err != nil {
 		pin.Release()
 		return nil, err
@@ -495,10 +508,10 @@ func OpenReaderWith(fsys vfs.FS, o ReaderOptions) (*Reader, error) {
 // first (§13.1.1), so GC keeps it until Close. ttl <= 0 selects
 // DefaultPinTTL; the pin is renewed in the background.
 func OpenReaderPinned(fsys vfs.FS, pool *bufpool.Pool, ttl time.Duration) (*Reader, error) {
-	return openReaderPinned(fsys, pool, ttl, nil)
+	return openReaderPinned(fsys, pool, ttl, nil, memOpts{})
 }
 
-func openReaderPinned(fsys vfs.FS, pool *bufpool.Pool, ttl time.Duration, dek []byte) (*Reader, error) {
+func openReaderPinned(fsys vfs.FS, pool *bufpool.Pool, ttl time.Duration, dek []byte, mo memOpts) (*Reader, error) {
 	for try := 0; ; try++ {
 		root, err := readRoot(fsys)
 		if err != nil {
@@ -521,7 +534,7 @@ func openReaderPinned(fsys vfs.FS, pool *bufpool.Pool, ttl time.Duration, dek []
 			}
 			return nil, fmt.Errorf("generation keeps changing while pinning")
 		}
-		r, err := openReaderAt(fsys, pool, root, 0, false, dek)
+		r, err := openReaderAt(fsys, pool, root, 0, false, dek, mo)
 		if err != nil {
 			pin.Release()
 			return nil, err
@@ -533,7 +546,7 @@ func openReaderPinned(fsys vfs.FS, pool *bufpool.Pool, ttl time.Duration, dek []
 
 // openReaderAt opens generation root.GenerationID; with limited, only
 // manifest.jsonl[0:limit] is applied (a HARDENED reader snapshot, §10.4.1).
-func openReaderAt(fsys vfs.FS, pool *bufpool.Pool, root wire.Root, limit int64, limited bool, dek []byte) (*Reader, error) {
+func openReaderAt(fsys vfs.FS, pool *bufpool.Pool, root wire.Root, limit int64, limited bool, dek []byte, mo memOpts) (*Reader, error) {
 	if pool == nil {
 		pool = bufpool.Default
 	}
@@ -555,9 +568,11 @@ func openReaderAt(fsys vfs.FS, pool *bufpool.Pool, root wire.Root, limit int64, 
 			return nil, err
 		}
 	}
-	r := &Reader{view: view{fsys: fsys, gen: gen, h: h, pool: pool, k: k}, st: st}
+	env, cleanup := readerEnv(mo.limit, mo.tempDir)
+	r := &Reader{view: view{fsys: fsys, gen: gen, h: h, pool: pool, k: k, env: env}, st: st, memClose: cleanup}
 	if _, err := r.openBlobs(false, h.ParityScheme != wire.ParityNone); err != nil {
 		r.close()
+		cleanup()
 		return nil, err
 	}
 	return r, nil
@@ -606,5 +621,8 @@ func (r *Reader) Generation() uint64 { return r.h.GenerationID }
 // Close releases the files and the pin.
 func (r *Reader) Close() error {
 	r.close()
+	if r.memClose != nil {
+		r.memClose()
+	}
 	return r.pin.Release()
 }

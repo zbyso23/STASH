@@ -297,6 +297,11 @@ type Options struct {
 	// Policy is the expected security policy. With an Anchor, HARDENED is
 	// expected whatever the storage says.
 	Policy Policy
+	// MemoryLimit bounds the memory for archive-scale working state: the
+	// index page cache, in-memory index deltas, spills and validation
+	// sorts (default 1 GiB). Data beyond it goes to the scratch/ directory
+	// of the archive, which is removed when the writer opens and closes.
+	MemoryLimit int64
 }
 
 // Policy is the security policy an opener expects (SPEC §15A.2). It must
@@ -327,7 +332,8 @@ type Archive struct {
 // running crash recovery (torn tails, open transactions, indexes).
 func Open(dir string, o Options) (*Archive, error) {
 	w, err := archive.OpenWriter(vfs.OS{Root: dir}, archive.Options{MaxExtent: o.MaxExtent, UncompressedExtents: o.UncompressedExtents, PackThreshold: o.PackThreshold, VerifyAll: o.VerifyAll,
-		Anchor: o.Anchor, AdoptUnanchored: o.AdoptUnanchored, Key: o.Key, AcknowledgeAllocatorRollback: o.AcknowledgeAllocatorRollback, Policy: o.Policy})
+		Anchor: o.Anchor, AdoptUnanchored: o.AdoptUnanchored, Key: o.Key, AcknowledgeAllocatorRollback: o.AcknowledgeAllocatorRollback, Policy: o.Policy,
+		MemoryLimit: o.MemoryLimit})
 	if err != nil {
 		return nil, err
 	}
@@ -489,6 +495,13 @@ type ReadOptions struct {
 	Key []byte
 	// Policy is the expected security policy (see Options.Policy).
 	Policy Policy
+	// MemoryLimit bounds the reader's archive-scale working state (see
+	// Options.MemoryLimit).
+	MemoryLimit int64
+	// TempDir holds the reader's private scratch space, used only when an
+	// index must be rebuilt or caught up beyond memory; "" means
+	// os.TempDir(). A reader never writes into the archive.
+	TempDir string
 }
 
 // OpenReadOnly opens a snapshot of the archive in dir for reading. It pins
@@ -498,7 +511,8 @@ func OpenReadOnly(dir string) (*Reader, error) { return OpenReadOnlyWith(dir, Re
 
 // OpenReadOnlyWith is OpenReadOnly with options.
 func OpenReadOnlyWith(dir string, o ReadOptions) (*Reader, error) {
-	r, err := archive.OpenReaderWith(vfs.OS{Root: dir}, archive.ReaderOptions{Pin: !o.NoPin, PinTTL: o.PinTTL, Anchor: o.Anchor, Key: o.Key, Policy: o.Policy})
+	r, err := archive.OpenReaderWith(vfs.OS{Root: dir}, archive.ReaderOptions{Pin: !o.NoPin, PinTTL: o.PinTTL, Anchor: o.Anchor, Key: o.Key, Policy: o.Policy,
+		MemoryLimit: o.MemoryLimit, TempDir: o.TempDir})
 	if err != nil {
 		return nil, err
 	}

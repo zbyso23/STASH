@@ -22,16 +22,17 @@ type Status struct {
 // lags (§10.5.1). A missing or invalid index is rebuilt by a scan in memory;
 // the caller decides whether to persist it with Write (a writer should,
 // a read-only opener must not).
-func Open(fsys vfs.FS, name string, r *blob.Reader, h *wire.ArchiveHeader, ordinal uint8, pool *bufpool.Pool) (*Index, Status, error) {
+func Open(env *Env, fsys vfs.FS, name string, r *blob.Reader, h *wire.ArchiveHeader, ordinal uint8, pool *bufpool.Pool) (*Index, Status, error) {
 	var st Status
 	size, err := r.Size()
 	if err != nil {
 		return nil, st, err
 	}
-	x, err := Load(fsys, name, h, ordinal, size, pool)
+	x, err := Load(env, fsys, name, h, ordinal, size, pool)
 	if err == nil {
 		st.CaughtUp, err = x.CatchUp(r)
 		if err != nil {
+			x.Close()
 			return nil, st, err
 		}
 		return x, st, nil
@@ -40,7 +41,7 @@ func Open(fsys vfs.FS, name string, r *blob.Reader, h *wire.ArchiveHeader, ordin
 		return nil, st, err
 	}
 	st.Discarded = err
-	x, _, err = Build(r, h, ordinal)
+	x, _, err = Build(env, r, h, ordinal)
 	if err != nil {
 		return nil, st, err
 	}
@@ -68,21 +69,12 @@ const (
 // none qualifies, a streaming scan of the blob follows before the frame is
 // reported missing. The returned Ref must be released.
 func (x *Index) Find(r *blob.Reader, hash [wire.HashSize]byte, accept func(*blob.Ref) bool) (*blob.Ref, Resolution, error) {
-	for _, c := range x.Lookup(hash) {
-		ref, err := r.ReadFrame(int64(c.PhysicalOffset))
-		if err != nil {
-			if wire.IsFormatError(err) {
-				continue
-			}
-			return nil, NotFound, err
-		}
-		t := &ref.Trailer
-		if t.HashPayload == hash && t.FrameQuanta == c.FrameQuanta && t.BlockType == c.BlockType &&
-			t.FrameOrdinal == c.FrameOrdinal && (accept == nil || accept(ref)) {
-			return ref, ViaIndex, nil
-		}
-		ref.Release()
+	ref, err := x.findIndexed(r, hash, accept)
+	if ref != nil || err != nil {
+		return ref, ViaIndex, err
 	}
+	// no candidate validated (or the stored file changed under us): the
+	// bounded streaming scan of §10.5.1, without holding the index
 	var found []int64
 	if _, err := r.Scan(func(off int64, f *frame.Frame) error {
 		if f.Trailer.HashPayload == hash {
@@ -106,4 +98,32 @@ func (x *Index) Find(r *blob.Reader, hash [wire.HashSize]byte, accept func(*blob
 		ref.Release()
 	}
 	return nil, NotFound, nil
+}
+
+// findIndexed tries the index candidates in offset order, streaming them
+// (a hash shared by many frames is never collected in memory). A failure
+// to read the index itself is not an error here: it is treated like a
+// miss, so the caller falls back to the scan.
+func (x *Index) findIndexed(r *blob.Reader, hash [wire.HashSize]byte, accept func(*blob.Ref) bool) (*blob.Ref, error) {
+	x.mu.RLock()
+	defer x.mu.RUnlock()
+	if x.closed {
+		return nil, nil
+	}
+	for c := x.candidates(hash); c.next(); {
+		ref, err := r.ReadFrame(int64(c.rec.PhysicalOffset))
+		if err != nil {
+			if wire.IsFormatError(err) {
+				continue
+			}
+			return nil, err
+		}
+		t := &ref.Trailer
+		if t.HashPayload == hash && t.FrameQuanta == c.rec.FrameQuanta && t.BlockType == c.rec.BlockType &&
+			t.FrameOrdinal == c.rec.FrameOrdinal && (accept == nil || accept(ref)) {
+			return ref, nil
+		}
+		ref.Release()
+	}
+	return nil, nil
 }
