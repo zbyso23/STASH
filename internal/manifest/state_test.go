@@ -76,7 +76,7 @@ func TestFoldAddDel(t *testing.T) {
 	s := newSeqr(t)
 	s.ok(&Record{Op: OpAdd, Path: "a", FileVer: 5, Loc: loc1(1, 10)})
 	s.ok(&Record{Op: OpAdd, Path: "a", FileVer: 6, Loc: loc1(2, 0)})
-	if v, _ := s.st.Lookup("a"); v.FileVer != 6 || v.Length != 0 {
+	if v, _ := s.st.look("a"); v.FileVer != 6 || v.Length != 0 {
 		t.Fatal(v)
 	}
 	s.corrupt(&Record{Op: OpAdd, Path: "a", FileVer: 6, Loc: loc1(3, 1)}, "same file_ver")
@@ -85,7 +85,7 @@ func TestFoldAddDel(t *testing.T) {
 	s.ok(&Record{Op: OpDel, Path: "a", FileVer: 6})
 	s.corrupt(&Record{Op: OpAdd, Path: "a", FileVer: 6, Loc: loc1(3, 1)}, "re-add below applied_max")
 	s.ok(&Record{Op: OpAdd, Path: "a", FileVer: 7, Loc: loc1(3, 1)})
-	if p := s.st.Paths(); len(p) != 1 {
+	if p := s.st.paths(); len(p) != 1 {
 		t.Fatal(p)
 	}
 	// seq must increase
@@ -111,7 +111,7 @@ func TestLocRules(t *testing.T) {
 	}
 	// order inside loc carries no meaning (§9.2)
 	s.ok(&Record{Op: OpAdd, Path: "x", FileVer: 1, Loc: []Loc{{Offset: 4096, Length: 3}, {Offset: 0, Length: 4096}}})
-	if v, _ := s.st.Lookup("x"); v.Length != 4099 || v.Loc[0].Offset != 0 {
+	if v, _ := s.st.look("x"); v.Length != 4099 || v.Loc[0].Offset != 0 {
 		t.Fatal(v)
 	}
 }
@@ -124,15 +124,15 @@ func TestTransactions(t *testing.T) {
 	s.ok(&Record{Op: OpAddExtent, TxID: A, ExtentSequence: 1, Loc: []Loc{{Offset: 4096, Length: 5}}})
 	s.ok(&Record{Op: OpAddExtent, TxID: B, ExtentSequence: 0, Loc: loc1(9, 1)})
 	s.ok(&Record{Op: OpAddExtent, TxID: A, ExtentSequence: 0, Loc: []Loc{{Offset: 0, Length: 4096}}})
-	if _, ok := s.st.Lookup("big"); ok {
+	if _, ok := s.st.look("big"); ok {
 		t.Fatal("visible before commit")
 	}
 	s.ok(&Record{Op: OpAddCommit, TxID: A, ExtentRecordCount: 2, ExtentCount: 2})
-	if v, ok := s.st.Lookup("big"); !ok || v.Length != 4101 {
+	if v, ok := s.st.look("big"); !ok || v.Length != 4101 {
 		t.Fatal(v)
 	}
 	s.ok(&Record{Op: OpAddAbort, TxID: B})
-	if _, ok := s.st.Lookup("other"); ok || s.st.Aborted != 1 {
+	if _, ok := s.st.look("other"); ok || s.st.Aborted != 1 {
 		t.Fatal("aborted version visible")
 	}
 	s.corrupt(&Record{Op: OpAddExtent, TxID: A, ExtentSequence: 2, Loc: loc1(1, 1)}, "extent after commit")
@@ -152,7 +152,7 @@ func TestTransactions(t *testing.T) {
 	if len(s.st.Ignored) != 2 {
 		t.Fatal(s.st.Ignored)
 	}
-	if _, ok := s.st.Lookup("c"); ok {
+	if _, ok := s.st.look("c"); ok {
 		t.Fatal("ignored transaction visible")
 	}
 	// coverage violation in a matching commit is corruption

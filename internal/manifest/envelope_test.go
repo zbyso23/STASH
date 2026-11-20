@@ -211,7 +211,7 @@ func TestEncryptedJournal(t *testing.T) {
 		}
 	}
 	j, st := open()
-	if v, ok := st.Lookup("big"); !ok || len(v.Loc) != len(big) {
+	if v, ok := st.look("big"); !ok || len(v.Loc) != len(big) {
 		t.Fatal("big")
 	}
 	if err := j.Del("a", 1); err != nil {
@@ -225,7 +225,7 @@ func TestEncryptedJournal(t *testing.T) {
 	f.WriteAt([]byte(`{"seq":"99","op":"ADD_E`), sz)
 	f.Close()
 	j, st = open()
-	if _, ok := st.Lookup("a"); ok {
+	if _, ok := st.look("a"); ok {
 		t.Fatal("deleted path live")
 	}
 	if err := j.Add("c", 3, loc1(3, 7)); err != nil {
@@ -234,7 +234,7 @@ func TestEncryptedJournal(t *testing.T) {
 	j.Sync()
 	j.Close()
 	_, st = open()
-	if _, ok := st.Lookup("c"); !ok {
+	if _, ok := st.look("c"); !ok {
 		t.Fatal("record after torn tail")
 	}
 	// a plaintext record inserted into an encrypted manifest

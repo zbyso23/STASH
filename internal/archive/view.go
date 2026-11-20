@@ -424,6 +424,7 @@ type Reader struct {
 	st       *manifest.State
 	pin      *Pin
 	memClose func() // releases the page cache and the scratch directory
+	stEnv    *manifest.Env
 }
 
 // OpenReader opens the archive in fsys for reading, without a pin: a
@@ -559,19 +560,23 @@ func openReaderAt(fsys vfs.FS, pool *bufpool.Pool, root wire.Root, limit int64, 
 	if err != nil {
 		return nil, err
 	}
+	env, envClose := readerEnv(mo.limit, mo.tempDir)
+	senv, senvClose := stateEnv(env)
+	cleanup := func() { senvClose(); envClose() }
 	var st *manifest.State
 	if limited && limit == 0 {
 		st = manifest.NewState(h, manifest.DefaultLimits)
 	} else {
-		st, _, err = manifest.Load(fsys, gen, h, manifest.LoadOptions{Limit: limit, Crypto: manifestCrypto(h, k)})
+		st, _, err = manifest.Load(fsys, gen, h, manifest.LoadOptions{Limit: limit, Crypto: manifestCrypto(h, k), Env: senv})
 		if err != nil {
+			cleanup()
 			return nil, err
 		}
 	}
-	env, cleanup := readerEnv(mo.limit, mo.tempDir)
-	r := &Reader{view: view{fsys: fsys, gen: gen, h: h, pool: pool, k: k, env: env}, st: st, memClose: cleanup}
+	r := &Reader{view: view{fsys: fsys, gen: gen, h: h, pool: pool, k: k, env: env}, st: st, memClose: cleanup, stEnv: senv}
 	if _, err := r.openBlobs(false, h.ParityScheme != wire.ParityNone); err != nil {
 		r.close()
+		st.Close()
 		cleanup()
 		return nil, err
 	}
@@ -585,12 +590,23 @@ func (r *Reader) Unavailable() map[uint8]error { return r.unavailable }
 // Header returns the archive header.
 func (r *Reader) Header() *wire.ArchiveHeader { return r.h }
 
-// List returns the live paths in bytewise order.
-func (r *Reader) List() []string { return r.st.Paths() }
+// List returns the live paths in bytewise order (all of them in memory;
+// see Walk).
+func (r *Reader) List() ([]string, error) { return r.st.Paths() }
+
+// Walk calls fn for the live paths with prefix, in bytewise order from the
+// first path >= start, until fn returns false. Memory does not depend on
+// the number of paths.
+func (r *Reader) Walk(prefix, start string, fn func(string, *manifest.Version) bool) error {
+	return r.st.Walk(prefix, start, fn)
+}
 
 // Stat returns the current version of a path.
 func (r *Reader) Stat(p string) (*manifest.Version, error) {
-	v, ok := r.st.Lookup(p)
+	v, ok, err := r.st.Lookup(p)
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, p)
 	}
@@ -621,6 +637,9 @@ func (r *Reader) Generation() uint64 { return r.h.GenerationID }
 // Close releases the files and the pin.
 func (r *Reader) Close() error {
 	r.close()
+	if r.st != nil {
+		r.st.Close()
+	}
 	if r.memClose != nil {
 		r.memClose()
 	}

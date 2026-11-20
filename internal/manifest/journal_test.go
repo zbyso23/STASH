@@ -72,14 +72,14 @@ func TestJournalRoundTrip(t *testing.T) {
 	if info.Torn != 0 || info.ValidEnd != int64(len(text)) {
 		t.Fatal(info)
 	}
-	v, ok := st.Lookup("big")
+	v, ok := st.look("big")
 	if !ok || v.Length != 20000*4096+77 || len(v.Loc) != 20001 {
 		t.Fatalf("big: %v", ok)
 	}
-	if _, ok := st.Lookup("small"); ok {
+	if _, ok := st.look("small"); ok {
 		t.Fatal("deleted path live")
 	}
-	if v, _ := st.Lookup("stream"); v.Length != 8192 {
+	if v, _ := st.look("stream"); v.Length != 8192 {
 		t.Fatal(v)
 	}
 }
@@ -158,7 +158,7 @@ func TestCrashTornManifest(t *testing.T) {
 		ver := uint64(1)
 		add := func() {
 			p := fmt.Sprintf("f%d", rng.Intn(5))
-			if v, ok := j.State().Lookup(p); ok && rng.Intn(3) == 0 {
+			if v, ok := j.State().look(p); ok && rng.Intn(3) == 0 {
 				j.Del(p, v.FileVer)
 			} else {
 				j.Add(p, ver, locN(int(ver), rng.Intn(40), uint64(rng.Intn(4000)+1)))
@@ -237,7 +237,7 @@ func TestLinkedManifests(t *testing.T) {
 	if fmt.Sprint(order) != "[1 2 3 4 5 6]" || info.Linked != 1 {
 		t.Fatalf("merge order %v", order)
 	}
-	if p := st.Paths(); fmt.Sprint(p) != "[m1 m2 s2]" {
+	if p := st.paths(); fmt.Sprint(p) != "[m1 m2 s2]" {
 		t.Fatal(p)
 	}
 
@@ -342,8 +342,8 @@ func TestSnapshotLimit(t *testing.T) {
 	j.Add("b", 2, loc1(2, 1))
 	j.Sync()
 	st, _, err := Load(c, "g", hdr(), LoadOptions{Limit: cut})
-	if err != nil || len(st.Paths()) != 1 {
-		t.Fatal(err, st.Paths())
+	if err != nil || len(st.paths()) != 1 {
+		t.Fatal(err, st.paths())
 	}
 	if _, _, err := Load(c, "g", hdr(), LoadOptions{Limit: j.End() + 1}); !errors.Is(err, wire.ErrCorrupt) {
 		t.Fatal("snapshot longer than file accepted")

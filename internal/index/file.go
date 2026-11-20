@@ -141,6 +141,13 @@ func (c *PageCache) Close() {
 // Stats returns page hits and disk reads.
 func (c *PageCache) Stats() (hits, reads uint64) { return c.hits.Load(), c.reads.Load() }
 
+// Used returns the bytes of the cached pages.
+func (c *PageCache) Used() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return int64(len(c.pages)) * pageSize
+}
+
 // page returns the bytes of page p of f. The slice is immutable and stays
 // valid after eviction.
 func (c *PageCache) page(f *idxFile, p uint64) ([]byte, error) {

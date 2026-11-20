@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"runtime"
+	"runtime/pprof"
 	"strconv"
 	"sync"
 	"testing"
@@ -19,6 +21,9 @@ import (
 //	STASH_DIR    archive directory
 //	STASH_KIND   extents (10 x 4 KiB frames per object) or small (PACKED)
 //	STASH_N      objects (default 5000 extents / 100000 small)
+//	STASH_MEMLIMIT  memory limit of writer and reader in MiB (0: default);
+//	             the caches fill up to their share of it
+//	STASH_HEAPPROF  write a heap profile at the measurement
 //	STASH_PHASE  build | writer | reader | read (concurrent Gets)
 //	STASH_READERS goroutines for the read phase (default 16)
 //	STASH_SAME    non-empty: objects share most frame content (duplicate frame hashes)
@@ -48,11 +53,19 @@ func TestZZMemory(t *testing.T) {
 	memprobe.ResetPeakRSS()
 	base := memprobe.Retained()
 	s := memprobe.Start(0)
-	report := func(what string, retained uint64) {
+	report := func(what string, retained uint64, cache int64) {
 		peak := s.End()
 		_, hwm := memprobe.RSS()
-		t.Logf("RESULT kind=%s phase=%s units=%d retained_per_unit=%.1f peak_heap_mb=%.1f peak_rss_mb=%.1f",
-			kind, what, units, float64(retained)/float64(units), float64(peak-min(peak, base))/(1<<20), float64(hwm)/(1<<20))
+		rest := retained - min(retained, uint64(cache))
+		t.Logf("RESULT kind=%s phase=%s units=%d retained_per_unit=%.1f cache_mb=%.1f retained_nocache_per_unit=%.1f peak_heap_mb=%.1f peak_rss_mb=%.1f",
+			kind, what, units, float64(retained)/float64(units), float64(cache)/(1<<20), float64(rest)/float64(units), float64(peak-min(peak, base))/(1<<20), float64(hwm)/(1<<20))
+		if p := os.Getenv("STASH_HEAPPROF"); p != "" { // what the retained heap is
+			runtime.GC()
+			if f, err := os.Create(p); err == nil {
+				pprof.WriteHeapProfile(f)
+				f.Close()
+			}
+		}
 	}
 	switch phase {
 	case "build":
@@ -93,27 +106,28 @@ func TestZZMemory(t *testing.T) {
 		if err := w.Close(); err != nil {
 			t.Fatal(err)
 		}
-		report("build", 0)
+		report("build", 0, 0)
 	case "writer":
-		w, err := OpenWriter(fsys, Options{MaxExtent: 4096})
+		w, err := OpenWriter(fsys, Options{MaxExtent: 4096, MemoryLimit: memLimit()})
 		if err != nil {
 			t.Fatal(err)
 		}
-		report("writer", memprobe.Retained()-base)
+		report("writer", memprobe.Retained()-base, cacheBytes(w.env, w.stEnv))
 		w.Close()
 	case "reader":
-		r, err := OpenReader(fsys, nil)
+		r, err := OpenReaderWith(fsys, ReaderOptions{MemoryLimit: memLimit()})
 		if err != nil {
 			t.Fatal(err)
 		}
-		report("reader", memprobe.Retained()-base)
+		report("reader", memprobe.Retained()-base, cacheBytes(r.env, r.stEnv))
 		r.Close()
 	case "read":
-		r, err := OpenReader(fsys, nil)
+		r, err := OpenReaderWith(fsys, ReaderOptions{MemoryLimit: memLimit()})
 		if err != nil {
 			t.Fatal(err)
 		}
 		retained := memprobe.Retained() - base
+		cache := cacheBytes(r.env, r.stEnv)
 		g, _ := strconv.Atoi(os.Getenv("STASH_READERS"))
 		if g <= 0 {
 			g = 16
@@ -142,9 +156,14 @@ func TestZZMemory(t *testing.T) {
 		for err := range errs {
 			t.Fatal(err)
 		}
-		report(fmt.Sprintf("read-%d", g), retained)
+		report(fmt.Sprintf("read-%d", g), retained, cache)
 		r.Close()
 	default:
 		t.Fatalf("unknown STASH_PHASE %q", phase)
 	}
+}
+
+func memLimit() int64 {
+	n, _ := strconv.ParseInt(os.Getenv("STASH_MEMLIMIT"), 10, 64)
+	return n << 20
 }

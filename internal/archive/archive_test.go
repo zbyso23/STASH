@@ -74,20 +74,20 @@ func TestPutGetDeleteReopen(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		check(w.Get, w.List())
+		check(w.Get, listOf(t, w))
 		// a reader works while the writer holds the lock
 		r, err := OpenReader(fsys, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		check(r.Get, r.List())
+		check(r.Get, listOf(t, r))
 		r.Close()
 		if _, err := OpenWriter(fsys, Options{}); !errors.Is(err, vfs.ErrLocked) {
 			t.Fatalf("second writer: %v", err)
 		}
 		w.Close()
 		w = mustOpen(t, fsys)
-		check(w.Get, w.List())
+		check(w.Get, listOf(t, w))
 		v2, _ := w.Put("dir/file-3", data(100, 10))
 		if v2 <= v1 {
 			t.Fatalf("file_ver %d after %d", v2, v1)
@@ -198,7 +198,7 @@ func TestCrashDuringCreate(t *testing.T) {
 		switch {
 		case err == nil:
 			complete++
-			if len(w.List()) != 0 {
+			if len(listOf(t, w)) != 0 {
 				t.Fatal("non-empty")
 			}
 			if _, err := w.Put("x", []byte("ok")); err != nil {
@@ -514,4 +514,13 @@ func dropCheckpoints(t testing.TB, fsys vfs.FS) {
 	if err := fsys.Remove(path.Join(GenDir(0), checkpointName)); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func listOf(t testing.TB, l interface{ List() ([]string, error) }) []string {
+	t.Helper()
+	p, err := l.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
 }

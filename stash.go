@@ -409,8 +409,17 @@ func (a *Archive) Stat(path string) (Info, error) {
 	return info(p, v), nil
 }
 
-// List returns every live path in bytewise order.
-func (a *Archive) List() []string { return a.w.List() }
+// List returns every live path in bytewise order. It holds them all in
+// memory; use Walk for archive-scale listings.
+func (a *Archive) List() ([]string, error) { return a.w.List() }
+
+// Walk calls fn for every live path that starts with prefix, in bytewise
+// order from the first path >= start ("" for the beginning), until fn
+// returns false. Memory does not depend on the number of paths; the walk
+// sees the state as it was when it began.
+func (a *Archive) Walk(prefix, start string, fn func(Info) bool) error {
+	return a.w.Walk(prefix, start, func(p string, v *manifest.Version) bool { return fn(info(p, v)) })
+}
 
 // Health reports what crash recovery found when the archive was opened.
 func (a *Archive) Health() Health { return a.w.Health() }
@@ -553,8 +562,15 @@ func (r *Reader) Stat(path string) (Info, error) {
 	return info(p, v), nil
 }
 
-// List returns every live path of the snapshot.
-func (r *Reader) List() []string { return r.r.List() }
+// List returns every live path of the snapshot (all in memory; see Walk).
+func (r *Reader) List() ([]string, error) { return r.r.List() }
+
+// Walk calls fn for every live path of the snapshot that starts with
+// prefix, in bytewise order from the first path >= start, until fn
+// returns false (see Archive.Walk).
+func (r *Reader) Walk(prefix, start string, fn func(Info) bool) error {
+	return r.r.Walk(prefix, start, func(p string, v *manifest.Version) bool { return fn(info(p, v)) })
+}
 
 // Unavailable lists blob files that could not be opened (missing or with a
 // damaged header); with parity their data is rebuilt on read.

@@ -111,6 +111,8 @@ type LoadOptions struct {
 	Limits Limits
 	// TrackRefs records loc references for State.BlobCommitted (writers).
 	TrackRefs bool
+	// Env bounds the memory of the state and of the load (nil: in memory).
+	Env *Env
 	// Crypto is required for an encrypted archive: every record is an
 	// envelope authenticated with the manifest key and the prev chain
 	// (§15.8).
@@ -328,10 +330,22 @@ func Load(fsys vfs.FS, genDir string, h *wire.ArchiveHeader, opt LoadOptions) (*
 // applied (for tests and tools).
 func LoadWith(fsys vfs.FS, genDir string, h *wire.ArchiveHeader, opt LoadOptions, each func(*Record, int)) (*State, LoadInfo, error) {
 	var info LoadInfo
-	st := NewState(h, opt.Limits)
+	st := newState(h, opt.Limits, opt.Env)
 	if opt.TrackRefs {
 		st.TrackRefs()
 	}
+	ls, err := newLoadSink(opt.Env, opt.TrackRefs)
+	if err != nil {
+		st.Close()
+		return nil, info, err
+	}
+	defer ls.close()
+	ok := false
+	defer func() {
+		if !ok {
+			st.Close()
+		}
+	}()
 	enc := h.Encrypted()
 	if enc && (opt.Crypto == nil || opt.Crypto.Keys == nil) {
 		return nil, info, &wire.Error{Struct: "Manifest", Class: wire.ErrInvalid, Detail: "encrypted manifest needs the archive keys"}
@@ -381,7 +395,7 @@ func LoadWith(fsys vfs.FS, genDir string, h *wire.ArchiveHeader, opt LoadOptions
 	for hp.Len() > 0 {
 		c := (*hp)[0]
 		r := c.rec
-		if err := st.Apply(r, c.file); err != nil {
+		if err := st.apply(r, c.file, ls); err != nil {
 			return nil, info, fmt.Errorf("%s: %w", c.name, err)
 		}
 		if each != nil {
@@ -418,6 +432,10 @@ func LoadWith(fsys vfs.FS, genDir string, h *wire.ArchiveHeader, opt LoadOptions
 		}
 	}
 	info.Prev = main.accepted
+	if err := st.build(ls); err != nil {
+		return nil, info, err
+	}
+	ok = true
 	return st, info, nil
 }
 

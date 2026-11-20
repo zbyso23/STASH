@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -127,9 +128,20 @@ func (s *Server) Shadowed() []string {
 	return append([]string(nil), snap.shadowed...)
 }
 
+// ShadowedCount returns how many objects are hidden (Shadowed lists at
+// most the first 1000).
+func (s *Server) ShadowedCount() int {
+	snap := s.root.current()
+	if snap == nil {
+		return 0
+	}
+	defer snap.release()
+	return snap.nshadow
+}
+
 func (rt *root) logShadowed(s *snapshot) {
-	if rt.opt.Log != nil && len(s.shadowed) > 0 {
-		rt.opt.Log(fmt.Sprintf("%d objects are hidden by directories of the same name (e.g. %q); read them with stash get", len(s.shadowed), s.shadowed[0]))
+	if rt.opt.Log != nil && s.nshadow > 0 {
+		rt.opt.Log(fmt.Sprintf("%d objects are hidden by directories of the same name (e.g. %q); read them with stash get", s.nshadow, s.shadowed[0]))
 	}
 }
 
@@ -189,12 +201,19 @@ func (d *dirNode) Getattr(ctx context.Context, _ fs.FileHandle, out *fuse.AttrOu
 		return syscall.ENOENT
 	}
 	defer s.release()
-	e := s.dirs[d.path]
-	if e == nil {
-		return syscall.ENOENT
+	if ok, err := s.isDir(d.path); err != nil || !ok {
+		return dirErr(err)
 	}
-	dirAttr(&out.Attr, s, d.root.ino(true, d.path), len(e.names))
+	dirAttr(&out.Attr, s, d.root.ino(true, d.path), 0)
 	return 0
+}
+
+// dirErr maps a failed directory query: a state read error is EIO.
+func dirErr(err error) syscall.Errno {
+	if err != nil {
+		return syscall.EIO
+	}
+	return syscall.ENOENT
 }
 
 func dirAttr(a *fuse.Attr, s *snapshot, ino uint64, n int) {
@@ -228,22 +247,25 @@ func (d *dirNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (
 		return nil, syscall.ENOENT
 	}
 	defer s.release()
-	e := s.dirs[d.path]
-	if e == nil {
-		return nil, syscall.ENOENT
-	}
-	isDir, ok := e.isDir[name]
-	if !ok {
+	if strings.Contains(name, "/") {
 		return nil, syscall.ENOENT
 	}
 	p := join(d.path, name)
+	isDir, err := s.isDir(p)
+	if err != nil {
+		return nil, syscall.EIO
+	}
 	if isDir {
 		ino := d.root.ino(true, p)
-		dirAttr(&out.Attr, s, ino, len(s.dirs[p].names))
+		dirAttr(&out.Attr, s, ino, 0)
 		return d.NewInode(ctx, &dirNode{root: d.root, path: p}, fs.StableAttr{Mode: fuse.S_IFDIR, Ino: ino}), 0
 	}
+	in, ok, err := s.file(p)
+	if err != nil || !ok {
+		return nil, dirErr(err)
+	}
 	ino := d.root.ino(false, p)
-	fileAttr(&out.Attr, s, ino, s.files[p])
+	fileAttr(&out.Attr, s, ino, in)
 	return d.NewInode(ctx, &fileNode{root: d.root, path: p}, fs.StableAttr{Mode: fuse.S_IFREG, Ino: ino}), 0
 }
 
@@ -253,17 +275,20 @@ func (d *dirNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 		return nil, syscall.ENOENT
 	}
 	defer s.release()
-	e := s.dirs[d.path]
-	if e == nil {
-		return nil, syscall.ENOENT
+	if ok, err := s.isDir(d.path); err != nil || !ok {
+		return nil, dirErr(err)
 	}
-	out := make([]fuse.DirEntry, 0, len(e.names))
-	for _, n := range e.names {
+	kids, err := s.children(d.path)
+	if err != nil {
+		return nil, syscall.EIO
+	}
+	out := make([]fuse.DirEntry, 0, len(kids))
+	for _, c := range kids {
 		mode := uint32(fuse.S_IFREG)
-		if e.isDir[n] {
+		if c.isDir {
 			mode = fuse.S_IFDIR
 		}
-		out = append(out, fuse.DirEntry{Name: n, Mode: mode, Ino: d.root.ino(e.isDir[n], join(d.path, n))})
+		out = append(out, fuse.DirEntry{Name: c.name, Mode: mode, Ino: d.root.ino(c.isDir, join(d.path, c.name))})
 	}
 	return fs.NewListDirStream(out), 0
 }
@@ -277,7 +302,7 @@ func (d *dirNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno
 	out.Bsize = 4096
 	out.Frsize = 4096
 	out.Blocks = uint64(s.bytes+4095) / 4096
-	out.Files = uint64(len(s.files))
+	out.Files = uint64(s.files)
 	out.NameLen = 255
 	return 0
 }
@@ -300,9 +325,9 @@ func (f *fileNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.Attr
 		return syscall.ENOENT
 	}
 	defer s.release()
-	in, ok := s.files[f.path]
-	if !ok {
-		return syscall.ENOENT
+	in, ok, err := s.file(f.path)
+	if err != nil || !ok {
+		return dirErr(err)
 	}
 	fileAttr(&out.Attr, s, f.root.ino(false, f.path), in)
 	return 0
@@ -323,10 +348,10 @@ func (f *fileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 	if s == nil {
 		return nil, 0, syscall.ENOENT
 	}
-	in, ok := s.files[f.path]
-	if !ok {
+	in, ok, err := s.file(f.path)
+	if err != nil || !ok {
 		s.release()
-		return nil, 0, syscall.ENOENT
+		return nil, 0, dirErr(err)
 	}
 	o, err := s.r.OpenObject(f.path)
 	if err != nil {
@@ -374,9 +399,9 @@ func (f *fileNode) Getxattr(ctx context.Context, attr string, dest []byte) (uint
 		return 0, syscall.ENOENT
 	}
 	defer s.release()
-	in, ok := s.files[f.path]
-	if !ok {
-		return 0, syscall.ENOENT
+	in, ok, err := s.file(f.path)
+	if err != nil || !ok {
+		return 0, dirErr(err)
 	}
 	var v string
 	switch attr {

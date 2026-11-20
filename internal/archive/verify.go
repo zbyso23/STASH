@@ -72,7 +72,7 @@ func (r *VerifyReport) OK() bool {
 // resynchronization, every live version read completely (validating every
 // frame, repairing through parity where needed), and every parity group
 // checked for completeness and parity consistency.
-func (v *view) verify(ctx context.Context, live func() map[string]*manifest.Version) (*VerifyReport, error) {
+func (v *view) verify(ctx context.Context, live func() (map[string]*manifest.Version, error)) (*VerifyReport, error) {
 	rep := &VerifyReport{Failed: map[string]error{}, Blobs: make([]BlobVerify, v.h.BlobCount)}
 	before := v.Repairs()
 	var wg sync.WaitGroup
@@ -105,7 +105,10 @@ func (v *view) verify(ctx context.Context, live func() map[string]*manifest.Vers
 			return nil, err
 		}
 	}
-	paths := live()
+	paths, err := live()
+	if err != nil {
+		return nil, err
+	}
 	names := make([]string, 0, len(paths))
 	for p := range paths {
 		names = append(names, p)
@@ -223,18 +226,21 @@ func (v *view) verifyGroups(ctx context.Context, gv *GroupVerify) error {
 	return nil
 }
 
-func liveOf(st *manifest.State) map[string]*manifest.Version {
+// liveOf collects the live versions. It holds every version in memory
+// (compaction and verify until phase 4 of M19 streams them); a state read
+// error is returned rather than hidden.
+func liveOf(st *manifest.State) (map[string]*manifest.Version, error) {
 	out := map[string]*manifest.Version{}
-	for _, p := range st.Paths() {
-		v, _ := st.Lookup(p)
+	err := st.Walk("", "", func(p string, v *manifest.Version) bool {
 		out[p] = v
-	}
-	return out
+		return true
+	})
+	return out, err
 }
 
 // Verify verifies the snapshot completely (see VerifyReport).
 func (r *Reader) Verify(ctx context.Context) (*VerifyReport, error) {
-	return r.verify(ctx, func() map[string]*manifest.Version { return liveOf(r.st) })
+	return r.verify(ctx, func() (map[string]*manifest.Version, error) { return liveOf(r.st) })
 }
 
 // Verify verifies the current generation completely. Writes wait until it
@@ -242,7 +248,7 @@ func (r *Reader) Verify(ctx context.Context) (*VerifyReport, error) {
 func (w *Writer) Verify(ctx context.Context) (*VerifyReport, error) {
 	w.genMu.Lock() // quiesce writes: in-flight appends would look like damage
 	defer w.genMu.Unlock()
-	return w.verify(ctx, func() map[string]*manifest.Version {
+	return w.verify(ctx, func() (map[string]*manifest.Version, error) {
 		w.stateMu.RLock()
 		defer w.stateMu.RUnlock()
 		return liveOf(w.journal.State())

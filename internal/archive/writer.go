@@ -115,6 +115,8 @@ type Writer struct {
 	compactMu sync.Mutex
 	fsys      vfs.FS // shadows view.fsys (the same FS), usable before a view exists
 	env       *index.Env
+	stEnv     *manifest.Env
+	stClose   func()
 	unlock    func() error
 	journal   *manifest.Journal
 	opt       Options
@@ -167,6 +169,7 @@ func OpenWriter(fsys vfs.FS, opt Options) (w *Writer, err error) {
 	if w.env, err = writerEnv(fsys, opt.MemoryLimit); err != nil {
 		return nil, err
 	}
+	w.stEnv, w.stClose = stateEnv(w.env)
 	if opt.Anchor != nil {
 		// §11.8: may complete an interrupted switch or creation
 		_, st, err := resolveHardened(context.Background(), fsys, opt.Anchor, opt.Pool, true, opt.Key)
@@ -263,6 +266,7 @@ func (w *Writer) openGeneration(gen string, h *wire.ArchiveHeader) (err error) {
 		Limits:    opt.Limits,
 		Crypto:    manifestCrypto(h, w.keys),
 		SeqSource: w.seqAlloc.Next,
+		Env:       w.stEnv,
 		BeforeAppend: func(st *manifest.State) error {
 			if err := w.verAlloc.Check(st.MaxFileVer(), st.MaxFileVer() > 0); err != nil {
 				return err
@@ -434,7 +438,11 @@ func (w *Writer) groupCensus(st *manifest.State) (referenced map[uint32]bool, in
 				if f.Trailer.BlockType == wire.BlockPacked {
 					off = 0
 				}
-				if _, ok := refs[blob.FrameKey{Hash: f.Trailer.HashPayload, Path: e.Path, FileVer: e.FileVer, Offset: off}]; ok {
+				ok, err := refs.Has(blob.FrameKey{Hash: f.Trailer.HashPayload, Path: e.Path, FileVer: e.FileVer, Offset: off})
+				if err != nil {
+					return err
+				}
+				if ok {
 					referenced[g] = true
 				}
 			}
@@ -570,8 +578,11 @@ func (w *Writer) Get(p string) ([]byte, error) {
 	w.genMu.RLock()
 	defer w.genMu.RUnlock()
 	w.stateMu.RLock()
-	v, ok := w.journal.State().Lookup(p)
+	v, ok, err := w.journal.State().Lookup(p)
 	w.stateMu.RUnlock()
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, p)
 	}
@@ -585,8 +596,11 @@ func (w *Writer) Open(p string) (*Object, error) {
 	w.genMu.RLock()
 	defer w.genMu.RUnlock()
 	w.stateMu.RLock()
-	v, ok := w.journal.State().Lookup(p)
+	v, ok, err := w.journal.State().Lookup(p)
 	w.stateMu.RUnlock()
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, p)
 	}
@@ -599,7 +613,10 @@ func (w *Writer) Stat(p string) (*manifest.Version, error) {
 	defer w.genMu.RUnlock()
 	w.stateMu.RLock()
 	defer w.stateMu.RUnlock()
-	v, ok := w.journal.State().Lookup(p)
+	v, ok, err := w.journal.State().Lookup(p)
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, p)
 	}
@@ -674,13 +691,22 @@ func (w *Writer) putPacked(p string, data []byte) (uint64, error) {
 	return ver, nil
 }
 
-// List returns the live paths.
-func (w *Writer) List() []string {
+// List returns the live paths (all of them in memory; see Walk).
+func (w *Writer) List() ([]string, error) {
 	w.genMu.RLock()
 	defer w.genMu.RUnlock()
 	w.stateMu.RLock()
 	defer w.stateMu.RUnlock()
 	return w.journal.State().Paths()
+}
+
+// Walk calls fn for the live paths with prefix, in bytewise order from the
+// first path >= start, until fn returns false. It sees a snapshot taken
+// when it starts; writes may continue meanwhile.
+func (w *Writer) Walk(prefix, start string, fn func(string, *manifest.Version) bool) error {
+	w.genMu.RLock()
+	defer w.genMu.RUnlock()
+	return w.journal.State().Walk(prefix, start, fn)
 }
 
 // Close persists the indexes, closes files and releases the writer lock.
@@ -726,6 +752,10 @@ func (w *Writer) Close() error {
 	}
 	if w.journal != nil {
 		keep(w.journal.Close())
+	}
+	if w.stClose != nil {
+		w.stClose()
+		w.stClose = nil
 	}
 	if w.env != nil {
 		w.env.Cache.Close()

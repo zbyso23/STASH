@@ -7,6 +7,8 @@ import (
 	"sync"
 
 	"stash/internal/index"
+	"stash/internal/kvtab"
+	"stash/internal/manifest"
 	"stash/internal/membudget"
 	"stash/internal/vfs"
 )
@@ -83,9 +85,33 @@ type memOpts struct {
 	tempDir string
 }
 
+// stateEnv gives the manifest state the same budget and scratch space as
+// the index, with a block cache of its own; the cache is closed by the
+// returned func.
+func stateEnv(e *index.Env) (*manifest.Env, func()) {
+	c := kvtab.NewCache(e.Budget, e.Budget.Limit()/cacheShare)
+	return &manifest.Env{Budget: e.Budget, Cache: c, Scratch: e.Scratch, MemLimit: testKVMem, SortMemory: testKVMem}, c.Close
+}
+
+// testKVMem overrides the in-memory state delta (tests force spills).
+var testKVMem int64
+
 func removeScratch(fsys vfs.FS) error {
 	if err := vfs.RemoveAll(fsys, ScratchDir); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
 	return nil
+}
+
+// cacheBytes is what the block caches of a session hold (bounded by their
+// share of the limit; the memory harness reports it apart).
+func cacheBytes(e *index.Env, s *manifest.Env) int64 {
+	var n int64
+	if e != nil {
+		n += e.Cache.Used()
+	}
+	if s != nil {
+		n += s.Cache.Used()
+	}
+	return n
 }

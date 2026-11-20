@@ -238,7 +238,7 @@ func recoverWith(t testing.TB, fsys vfs.FS, key []byte) map[string][]byte {
 	}
 	defer r.Close()
 	out := map[string][]byte{}
-	for _, p := range r.List() {
+	for _, p := range listOf(t, r) {
 		b, err := r.Get(p)
 		if err != nil {
 			t.Fatal(err)

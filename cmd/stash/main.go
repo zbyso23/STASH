@@ -649,10 +649,8 @@ func cmdExport(e *env, _ *flag.FlagSet, args []string) error {
 	defer root.Close()
 	var n int
 	var failed []string
-	for _, p := range r.List() {
-		if !strings.HasPrefix(p, exportPrefix) {
-			continue
-		}
+	werr := r.Walk(exportPrefix, "", func(in stash.Info) bool {
+		p := in.Path
 		o, err := r.OpenObject(p)
 		if err == nil {
 			err = root.write(p, o)
@@ -661,9 +659,13 @@ func cmdExport(e *env, _ *flag.FlagSet, args []string) error {
 		if err != nil {
 			fmt.Fprintf(e.stderr, "%s: %v\n", p, err)
 			failed = append(failed, p)
-			continue
+			return true
 		}
 		n++
+		return true
+	})
+	if werr != nil {
+		return werr
 	}
 	fmt.Fprintf(e.stderr, "exported %d objects\n", n)
 	if len(failed) > 0 {
@@ -691,19 +693,15 @@ func cmdLs(e *env, _ *flag.FlagSet, args []string) error {
 		prefix = args[1]
 	}
 	tw := tabwriter.NewWriter(e.stdout, 2, 8, 2, ' ', tabwriter.AlignRight)
-	for _, p := range r.List() {
-		if !strings.HasPrefix(p, prefix) {
-			continue
+	if err := r.Walk(prefix, "", func(in stash.Info) bool {
+		if lsLong {
+			fmt.Fprintf(tw, "%d\tv%d\t\t%s\n", in.Size, in.FileVer, in.Path)
+		} else {
+			fmt.Fprintln(e.stdout, in.Path)
 		}
-		if !lsLong {
-			fmt.Fprintln(e.stdout, p)
-			continue
-		}
-		in, err := r.Stat(p)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(tw, "%d\tv%d\t\t%s\n", in.Size, in.FileVer, p)
+		return true
+	}); err != nil {
+		return err
 	}
 	return tw.Flush()
 }

@@ -61,7 +61,7 @@ func TestPublicRoundTrip(t *testing.T) {
 		if got, _ := r.Get("b/c.txt"); string(got) != "hello" {
 			t.Fatal(string(got))
 		}
-		if l := r.List(); len(l) != 3 {
+		if l := listOf(t, r); len(l) != 3 {
 			t.Fatal(l)
 		}
 		r.Close()
@@ -179,7 +179,7 @@ func TestConcurrentGroupCommit(t *testing.T) {
 	a.Close()
 	r, _ := stash.OpenReadOnly(dir)
 	defer r.Close()
-	if n := len(r.List()); n != 320 {
+	if n := len(listOf(t, r)); n != 320 {
 		t.Fatal(n)
 	}
 	for g := 0; g < 16; g++ {
@@ -765,3 +765,12 @@ func benchText(b *testing.B, uncompressed bool) {
 
 func BenchmarkPut64MTextFixedCompressedExtents(b *testing.B)   { benchText(b, false) }
 func BenchmarkPut64MTextFixedUncompressedExtents(b *testing.B) { benchText(b, true) }
+
+func listOf(t testing.TB, l interface{ List() ([]string, error) }) []string {
+	t.Helper()
+	p, err := l.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}

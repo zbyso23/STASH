@@ -121,8 +121,11 @@ func OpenJournal(fsys vfs.FS, genDir string, h *wire.ArchiveHeader, opt LoadOpti
 // read it concurrently with appends.
 func (j *Journal) State() *State { return j.st }
 
-// Close closes the file without syncing.
-func (j *Journal) Close() error { return j.f.Close() }
+// Close closes the file without syncing and releases the state.
+func (j *Journal) Close() error {
+	j.st.Close()
+	return j.f.Close()
+}
 
 // appendLocked assigns the next seq, applies r to the state (rejecting it
 // if invalid) and writes its canonical line. Not durable until Sync.
@@ -287,7 +290,11 @@ func (j *Journal) beginLocked(p string, fileVer uint64) (*Tx, error) {
 		if _, err := rand.Read(id[:]); err != nil {
 			return nil, err
 		}
-		if !j.st.IsTxKnown(id) {
+		known, err := j.st.IsTxKnown(id)
+		if err != nil {
+			return nil, err
+		}
+		if !known {
 			break
 		}
 	}

@@ -484,10 +484,14 @@ func (rc *Recovery) readManifest(genDir string, opt Options) (map[verKey]uint64,
 		return committed, nil
 	}
 	rc.Manifest.Loaded = true
+	defer st.Close()
 	current := map[verKey]bool{}
-	for _, p := range st.Paths() {
-		v, _ := st.Lookup(p)
+	if err := st.Walk("", "", func(p string, v *manifest.Version) bool {
 		current[verKey{path: p, ver: v.FileVer}] = true
+		return true
+	}); err != nil {
+		rc.Manifest.Loaded, rc.Manifest.Err = false, err
+		return committed, nil
 	}
 	return committed, current
 }

@@ -1,6 +1,7 @@
 package fusefs
 
 import (
+	"errors"
 	"sort"
 	"strings"
 	"sync"
@@ -14,71 +15,62 @@ import (
 // Object paths become files; their '/'-separated components become
 // directories. When a path is both an object and a directory prefix of
 // other objects ("a" and "a/b"), the directory wins and the object is
-// listed in Shadowed (it stays readable with stash get).
+// counted as shadowed (it stays readable with stash get).
+//
+// Nothing per path is held in memory: directories are listed on demand
+// from the sorted state (SPEC §16.1), and a lookup is a state lookup. Only
+// the totals for statfs and the shadowed count are computed once, by one
+// streaming walk at mount.
 type snapshot struct {
 	r        *stash.Reader
 	at       time.Time
-	dirs     map[string]*dirEntry // by directory path; "" is the root
-	files    map[string]stash.Info
-	shadowed []string
+	shadowed []string // the first shadowedSample shadowed paths
+	nshadow  int
 	bytes    int64
+	files    int64
 
 	refs    atomic.Int64 // 1 while current, +1 per open file
 	closeMu sync.Once
 }
 
-type dirEntry struct {
-	names []string        // sorted
-	isDir map[string]bool // by name
-}
+const shadowedSample = 1000
 
 func newSnapshot(r *stash.Reader) (*snapshot, error) {
-	s := &snapshot{r: r, at: time.Now(), dirs: map[string]*dirEntry{"": {isDir: map[string]bool{}}}, files: map[string]stash.Info{}}
+	s := &snapshot{r: r, at: time.Now()}
 	s.refs.Store(1)
-	paths := r.List()
-	isPrefix := map[string]bool{}
-	for _, p := range paths {
-		for i := strings.IndexByte(p, '/'); i >= 0; {
-			isPrefix[p[:i]] = true
-			j := strings.IndexByte(p[i+1:], '/')
-			if j < 0 {
+	// a file f is shadowed by any path in [f+"/", f+"0"); the open
+	// intervals nest, so a stack as deep as the path depth tracks them
+	type open struct {
+		path string
+		size int64
+	}
+	var stack []open
+	err := r.Walk("", "", func(in stash.Info) bool {
+		p := in.Path
+		for len(stack) > 0 && p >= stack[len(stack)-1].path+"0" {
+			stack = stack[:len(stack)-1]
+		}
+		for i, f := range stack {
+			if strings.HasPrefix(p, f.path+"/") {
+				if s.nshadow < shadowedSample {
+					s.shadowed = append(s.shadowed, f.path)
+				}
+				s.nshadow++
+				s.bytes -= f.size
+				s.files--
+				stack = append(stack[:i], stack[i+1:]...)
 				break
 			}
-			i += 1 + j
 		}
-	}
-	add := func(dir, name string, d bool) {
-		e := s.dirs[dir]
-		if _, ok := e.isDir[name]; !ok {
-			e.names = append(e.names, name)
-		}
-		e.isDir[name] = e.isDir[name] || d
-	}
-	for _, p := range paths {
-		if isPrefix[p] {
-			s.shadowed = append(s.shadowed, p)
-			continue
-		}
-		in, err := r.Stat(p)
-		if err != nil {
-			return nil, err
-		}
-		s.files[p] = in
+		stack = append(stack, open{p, in.Size})
 		s.bytes += in.Size
-		parent := ""
-		for _, c := range strings.Split(p, "/")[:strings.Count(p, "/")] {
-			dir := join(parent, c)
-			if s.dirs[dir] == nil {
-				s.dirs[dir] = &dirEntry{isDir: map[string]bool{}}
-				add(parent, c, true)
-			}
-			parent = dir
-		}
-		add(parent, p[strings.LastIndexByte(p, '/')+1:], false)
+		s.files++
+		return true
+	})
+	if err != nil {
+		return nil, err
 	}
-	for _, e := range s.dirs {
-		sort.Strings(e.names)
-	}
+	sort.Strings(s.shadowed)
 	return s, nil
 }
 
@@ -87,6 +79,83 @@ func join(dir, name string) string {
 		return name
 	}
 	return dir + "/" + name
+}
+
+func prefixOf(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	return dir + "/"
+}
+
+// isDir reports whether p is a directory: the root, or a prefix of a path.
+func (s *snapshot) isDir(p string) (bool, error) {
+	if p == "" {
+		return true, nil
+	}
+	found := false
+	err := s.r.Walk(p+"/", "", func(stash.Info) bool { found = true; return false })
+	return found, err
+}
+
+// file returns the object at p unless a directory of the same name
+// hides it.
+func (s *snapshot) file(p string) (stash.Info, bool, error) {
+	if d, err := s.isDir(p); err != nil || d {
+		return stash.Info{}, false, err
+	}
+	in, err := s.r.Stat(p)
+	if errors.Is(err, stash.ErrNotFound) {
+		return stash.Info{}, false, nil
+	}
+	return in, err == nil, err
+}
+
+type child struct {
+	name  string
+	isDir bool
+}
+
+// children lists a directory in name order. Each subdirectory costs one
+// seek past its subtree, so the walk is proportional to the entries of
+// this directory, not to everything below it.
+func (s *snapshot) children(dir string) ([]child, error) {
+	pfx := prefixOf(dir)
+	var out []child
+	at := map[string]int{}
+	start := ""
+	for {
+		var next string
+		err := s.r.Walk(pfx, start, func(in stash.Info) bool {
+			rest := in.Path[len(pfx):]
+			i := strings.IndexByte(rest, '/')
+			if i < 0 {
+				if _, ok := at[rest]; !ok {
+					at[rest] = len(out)
+					out = append(out, child{name: rest})
+				}
+				return true
+			}
+			name := rest[:i]
+			if j, ok := at[name]; ok {
+				out[j].isDir = true // a shadowed object of the same name
+			} else {
+				at[name] = len(out)
+				out = append(out, child{name: name, isDir: true})
+			}
+			next = pfx + name + "0" // the first path after name/...
+			return false
+		})
+		if err != nil {
+			return nil, err
+		}
+		if next == "" {
+			break
+		}
+		start = next
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
+	return out, nil
 }
 
 // acquire takes a reference for an open file; it fails when the snapshot

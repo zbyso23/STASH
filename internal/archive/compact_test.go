@@ -16,7 +16,7 @@ import (
 
 func checkWriter(t testing.TB, w *Writer, want map[string][]byte) {
 	t.Helper()
-	if got := w.List(); len(got) != len(want) {
+	if got := listOf(t, w); len(got) != len(want) {
 		t.Fatalf("%d paths, want %d", len(got), len(want))
 	}
 	checkAll(t, w.Get, want)

@@ -31,7 +31,11 @@ type FrameKey struct {
 type Committed struct {
 	// Refs holds every frame of this blob that a loc references, whether
 	// the record is committed, live, dead, or inside an open transaction.
-	Refs map[FrameKey]struct{}
+	// It may live on disk (the manifest state); nil means none.
+	Refs RefSet
+	// Distinct counts the distinct referenced frames seen by the scan; nil
+	// uses an in-memory set. The manifest state supplies a bounded one.
+	Distinct func() (DistinctCounter, error)
 	// GroupReferenced reports whether a loc anywhere references a frame
 	// carrying groupID (non-zero). nil means no group is referenced.
 	GroupReferenced func(groupID uint32) bool
@@ -41,6 +45,43 @@ type Committed struct {
 	TailMayHoldCommitted bool
 	// Verified is an optional checkpoint from a clean close (E1-23).
 	Verified Checkpoint
+}
+
+// RefSet is a set of referenced frames.
+type RefSet interface {
+	Len() int
+	Has(FrameKey) (bool, error)
+}
+
+// RefMap is an in-memory RefSet.
+type RefMap map[FrameKey]struct{}
+
+// Len returns the number of references.
+func (m RefMap) Len() int { return len(m) }
+
+// Has reports whether k is referenced.
+func (m RefMap) Has(k FrameKey) (bool, error) { _, ok := m[k]; return ok, nil }
+
+// DistinctCounter counts distinct keys added.
+type DistinctCounter interface {
+	Add(FrameKey) error
+	Count() (int, error)
+	Reset() error
+	Close()
+}
+
+type mapCounter map[FrameKey]struct{}
+
+func (m mapCounter) Add(k FrameKey) error { m[k] = struct{}{}; return nil }
+func (m mapCounter) Count() (int, error)  { return len(m), nil }
+func (m mapCounter) Reset() error         { clear(m); return nil }
+func (m mapCounter) Close()               {}
+
+func (c *Committed) refCount() int {
+	if c.Refs == nil {
+		return 0
+	}
+	return c.Refs.Len()
 }
 
 // Checkpoint records that every frame below End was validated completely
@@ -78,8 +119,8 @@ func keysOfTail(t *wire.MasterTrailer, entries []wire.Entry) []FrameKey {
 // damaged region, valid or not), or a valid frame beyond E carries a
 // referenced group_id.
 func (c *Committed) protects(E int64, satisfied int, tail []TailFrame, atE *HopFrame) error {
-	if satisfied < len(c.Refs) {
-		return fmt.Errorf("%w: %d referenced frame(s) are not in the valid run before %d", ErrSealed, len(c.Refs)-satisfied, E)
+	if satisfied < c.refCount() {
+		return fmt.Errorf("%w: %d referenced frame(s) are not in the valid run before %d", ErrSealed, c.refCount()-satisfied, E)
 	}
 	if c.TailMayHoldCommitted {
 		return fmt.Errorf("%w: a committed parity group lacks a member that may lie in [%d, EOF)", ErrSealed, E)
@@ -200,33 +241,51 @@ func OpenWriterKeyed(fsys vfs.FS, name string, h *wire.ArchiveHeader, pool *bufp
 		}
 		size = wire.FrameAreaStart
 	}
-	satisfied := map[FrameKey]struct{}{}
-	collect := func(_ int64, fr *frame.Frame) error {
-		res.see(&fr.Trailer, storedNonce(h, &fr.Trailer, fr.PreTrailer))
-		if len(committed.Refs) == 0 {
-			return nil
+	var satisfied DistinctCounter = mapCounter{}
+	if committed.Distinct != nil && committed.refCount() > 0 {
+		if satisfied, err = committed.Distinct(); err != nil {
+			return fail(err)
 		}
-		for _, k := range keysOf(fr) {
-			if _, ok := committed.Refs[k]; ok {
-				satisfied[k] = struct{}{}
+	}
+	defer satisfied.Close()
+	mark := func(ks []FrameKey) error {
+		for _, k := range ks {
+			ok, err := committed.Refs.Has(k)
+			if err != nil {
+				return err
+			}
+			if ok {
+				if err := satisfied.Add(k); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
 	}
+	collect := func(_ int64, fr *frame.Frame) error {
+		res.see(&fr.Trailer, storedNonce(h, &fr.Trailer, fr.PreTrailer))
+		if committed.refCount() == 0 {
+			return nil
+		}
+		return mark(keysOf(fr))
+	}
 	start := int64(wire.FrameAreaStart)
+	var markErr error
 	if n, ok, err := useCheckpoint(f, h, k, pool, committed.Verified, size, func(hf HopFrame) {
 		res.see(&hf.Trailer, hf.Nonce)
-		for _, k := range keysOfTail(&hf.Trailer, hf.Entries) {
-			if _, ok := committed.Refs[k]; ok {
-				satisfied[k] = struct{}{}
-			}
+		if committed.refCount() > 0 && markErr == nil {
+			markErr = mark(keysOfTail(&hf.Trailer, hf.Entries))
 		}
 	}); err != nil {
 		return fail(err)
+	} else if markErr != nil {
+		return fail(markErr)
 	} else if ok {
 		start, res.Checkpointed = committed.Verified.End, n
 	} else {
-		clear(satisfied)
+		if err := satisfied.Reset(); err != nil {
+			return fail(err)
+		}
 		res = OpenResult{gen: h.GenerationID, ordinal: ordinal}
 	}
 	if res.Scan, err = scan(f, h, k, pool, start, size, collect); err != nil {
@@ -234,13 +293,17 @@ func OpenWriterKeyed(fsys vfs.FS, name string, h *wire.ArchiveHeader, pool *bufp
 	}
 	res.Scan.Frames += res.Checkpointed
 	E := res.Scan.End
-	if len(satisfied) < len(committed.Refs) {
+	nsat, err := satisfied.Count()
+	if err != nil {
+		return fail(err)
+	}
+	if nsat < committed.refCount() {
 		// Committed data lies at or beyond E even if nothing validates
 		// there (damage of §3.1.1 item 4); the blob is sealed either way.
 		if E < size {
 			res.Tail, _ = probeTail(f, h, k, pool, E, size)
 		}
-		return fail(committed.protects(E, len(satisfied), res.Tail, nil))
+		return fail(committed.protects(E, nsat, res.Tail, nil))
 	}
 	if E < size {
 		if res.Tail, err = probeTail(f, h, k, pool, E, size); err != nil {
@@ -257,7 +320,7 @@ func OpenWriterKeyed(fsys vfs.FS, name string, h *wire.ArchiveHeader, pool *bufp
 			atE = &hf
 			res.see(&hf.Trailer, hf.Nonce)
 		}
-		if err := committed.protects(E, len(satisfied), res.Tail, atE); err != nil {
+		if err := committed.protects(E, nsat, res.Tail, atE); err != nil {
 			return fail(err)
 		}
 		if err := f.Truncate(E); err != nil {
@@ -461,13 +524,16 @@ func IsSealed(err error) bool { return errors.Is(err, ErrSealed) }
 // (hop-and-read without payload hashing) and validates the frame ending at
 // cp.End completely. ok is false when the checkpoint does not match the
 // blob exactly (a gap, another last frame, a different length); the
-// caller then scans everything. see receives every frame walked.
+// caller then scans everything. see receives every frame as it is walked,
+// before the checkpoint is confirmed (nothing per frame is kept): when ok
+// is false the caller discards what see collected.
 func useCheckpoint(f vfs.File, h *wire.ArchiveHeader, k *seal.Keys, pool *bufpool.Pool, cp Checkpoint, size int64, see func(HopFrame)) (int, bool, error) {
 	if cp.End <= wire.FrameAreaStart || cp.End > size || cp.LastOff < wire.FrameAreaStart || cp.LastOff >= cp.End {
 		return 0, false, nil
 	}
 	var buf []byte
-	var seen []HopFrame
+	var last HopFrame
+	n := 0
 	off := int64(wire.FrameAreaStart)
 	for off < cp.End {
 		hf, ok, err := tailAt(f, h, k, off, cp.End, &buf)
@@ -477,10 +543,11 @@ func useCheckpoint(f vfs.File, h *wire.ArchiveHeader, k *seal.Keys, pool *bufpoo
 		if !ok {
 			return 0, false, nil
 		}
-		seen = append(seen, hf)
+		see(hf)
+		last = hf
+		n++
 		off += int64(wire.FrameSize(hf.Quanta))
 	}
-	last := seen[len(seen)-1]
 	if off != cp.End || last.Offset != cp.LastOff || last.Trailer.HashPayload != cp.LastHash {
 		return 0, false, nil
 	}
@@ -493,8 +560,5 @@ func useCheckpoint(f vfs.File, h *wire.ArchiveHeader, k *seal.Keys, pool *bufpoo
 		}
 		return 0, false, nil
 	}
-	for _, hf := range seen {
-		see(hf)
-	}
-	return len(seen), true, nil
+	return n, true, nil
 }

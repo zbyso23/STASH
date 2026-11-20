@@ -161,7 +161,7 @@ func TestCrashDuringCreate(t *testing.T) {
 type committedSet map[int64]FrameKey
 
 func (s committedSet) c() Committed {
-	refs := map[FrameKey]struct{}{}
+	refs := RefMap{}
 	for _, k := range s {
 		refs[k] = struct{}{}
 	}

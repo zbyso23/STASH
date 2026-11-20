@@ -104,8 +104,12 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 	w.genMu.RLock()
 	src := w.view
 	w.stateMu.RLock()
-	snap := liveOf(w.journal.State())
+	snap, err := liveOf(w.journal.State())
 	w.stateMu.RUnlock()
+	if err != nil {
+		w.genMu.RUnlock()
+		return res, err
+	}
 	var floor uint64
 	if w.groupAlloc != nil {
 		floor = w.groupAlloc.ReservedThrough()
@@ -127,7 +131,7 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 	if err := createGeneration(w.fsys, &dh); err != nil {
 		return res, err
 	}
-	d := &Writer{fsys: w.fsys, opt: w.opt, env: w.env, busy: map[string]bool{}, genAlloc: w.genAlloc, verAlloc: w.verAlloc, keys: w.keys,
+	d := &Writer{fsys: w.fsys, opt: w.opt, env: w.env, stEnv: w.stEnv, busy: map[string]bool{}, genAlloc: w.genAlloc, verAlloc: w.verAlloc, keys: w.keys,
 		health: Health{Sealed: map[uint8]error{}, TornBlobBytes: map[uint8]int64{}}}
 	switched := false
 	defer func() {
@@ -178,8 +182,11 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 	w.genMu.Lock()
 	defer w.genMu.Unlock()
 	w.stateMu.RLock()
-	final := liveOf(w.journal.State())
+	final, err := liveOf(w.journal.State())
 	w.stateMu.RUnlock()
+	if err != nil {
+		return res, err
+	}
 	delta := map[string]*manifest.Version{}
 	var deltaPaths, gone []string
 	for p, v := range final {
@@ -941,12 +948,15 @@ func (c *compactor) verify(ctx context.Context, paths []string, full bool) error
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		v, ok := st.Lookup(p)
+		v, ok, err := st.Lookup(p)
+		if err != nil {
+			return err
+		}
 		if !ok {
 			return fmt.Errorf("%w: destination lacks %s", ErrMissingData, p)
 		}
 		o := d.view.object(p, v)
-		_, err := io.Copy(io.Discard, o)
+		_, err = io.Copy(io.Discard, o)
 		o.Close()
 		if err != nil {
 			return fmt.Errorf("destination verification of %s: %w", p, err)

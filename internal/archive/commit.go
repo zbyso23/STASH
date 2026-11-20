@@ -160,7 +160,11 @@ func (w *Writer) commitBatch(batch []*commitReq) {
 			continue // frames not durable: never reference them
 		}
 		if r.del {
-			v, ok := w.journal.State().Lookup(r.path)
+			v, ok, err := w.journal.State().Lookup(r.path)
+			if err != nil {
+				r.err = err
+				continue
+			}
 			if !ok {
 				r.err = fmt.Errorf("%w: %s", ErrNotFound, r.path)
 				continue
