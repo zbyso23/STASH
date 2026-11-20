@@ -883,6 +883,9 @@ func cmdHealth(e *env, _ *flag.FlagSet, args []string) error {
 		fmt.Fprintf(w, "PRUNE     generation %d -> %d, %s\n", rc.From, rc.To, who)
 		fmt.Fprintf(w, "          %d extents lost, %d versions UNRECOVERABLE; groups %d unrecoverable (%d members regrouped), %d rebuilt",
 			rc.LostExtents, rc.LostVersions, rc.UnrecoverableGroups, rc.RegroupedMembers, rc.RebuiltGroups)
+		if rc.SupersededVersions > 0 {
+			fmt.Fprintf(w, "; %d versions SUPERSEDED (deleted or rewritten during the prune)", rc.SupersededVersions)
+		}
 		if len(rc.UnavailableBlobs) > 0 {
 			fmt.Fprintf(w, "; blobs unavailable %v", rc.UnavailableBlobs)
 		}

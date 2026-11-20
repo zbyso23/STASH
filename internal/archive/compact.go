@@ -148,6 +148,9 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 	}
 	w.compactMu.Lock()
 	defer w.compactMu.Unlock()
+	if err := w.hard.failed; err != nil {
+		return res, err
+	}
 	if opt.EmergencyPrune != nil {
 		if err := opt.EmergencyPrune.check(); err != nil {
 			return res, err
@@ -178,12 +181,17 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 	defer c.tab.Close()
 	c.prune = opt.EmergencyPrune
 	w.stateMu.RLock()
+	// the callback's error is kept apart: Walk returns only its own
+	var cbErr error
 	err = w.journal.State().Walk("", "", func(p string, v *manifest.Version) bool {
-		if err = c.tab.Put(append([]byte{'S'}, p...), binary.BigEndian.AppendUint64(nil, v.FileVer)); err == nil {
-			err = c.want(p, v)
+		if cbErr = c.tab.Put(append([]byte{'S'}, p...), binary.BigEndian.AppendUint64(nil, v.FileVer)); cbErr == nil {
+			cbErr = c.want(p, v)
 		}
-		return err == nil
+		return cbErr == nil
 	})
+	if err == nil {
+		err = cbErr
+	}
 	w.stateMu.RUnlock()
 	if err != nil {
 		w.genMu.RUnlock()
@@ -210,7 +218,7 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 	if err := createGeneration(w.fsys, &dh); err != nil {
 		return res, err
 	}
-	d := &Writer{fsys: w.fsys, opt: w.opt, env: w.env, stEnv: w.stEnv, busy: map[string]bool{}, genAlloc: w.genAlloc, verAlloc: w.verAlloc, keys: w.keys,
+	d := &Writer{fsys: w.fsys, opt: w.opt, env: w.env, stEnv: w.stEnv, busy: map[string]bool{}, genAlloc: w.genAlloc, verAlloc: w.verAlloc, keys: w.keys, building: true,
 		health: Health{Sealed: map[uint8]error{}, TornBlobBytes: map[uint8]int64{}}}
 	switched := false
 	prepared := ""
@@ -302,7 +310,7 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 	}
 	w.stateMu.RLock()
 	if err == nil {
-		err = w.journal.State().Walk("", "", func(p string, v *manifest.Version) bool {
+		werr := w.journal.State().Walk("", "", func(p string, v *manifest.Version) bool {
 			res.Versions++
 			for err == nil && sok && sp < p {
 				if err = gone(sp, sver); err == nil {
@@ -326,6 +334,10 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 			}
 			return err == nil
 		})
+		// the callback's error (in err) wins; Walk reports only its own
+		if err == nil {
+			err = werr
+		}
 	}
 	for err == nil && sok {
 		if err = gone(sp, sver); err == nil {
@@ -374,6 +386,20 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 	}
 	res.SourceBytes, res.DestBytes = blobBytes(src), blobBytes(d.view)
 	if c.prune != nil {
+		// a lost version deleted or rewritten while the compaction ran
+		// is superseded: the final state decides which markers stand
+		w.stateMu.RLock()
+		err := c.settleLost(func(p string) (uint64, bool, error) {
+			v, ok, err := w.journal.State().Lookup(p)
+			if !ok || err != nil {
+				return 0, false, err
+			}
+			return v.FileVer, true, nil
+		})
+		w.stateMu.RUnlock()
+		if err != nil {
+			return res, err
+		}
 		// §13.9: the losses must be what the operator confirmed, and the
 		// record is durable before anything is switched or deleted
 		r, err := c.pruneReport()
@@ -408,6 +434,17 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 	}
 	root := wire.Root{GenerationID: id, ArchiveID: dh.ArchiveID}
 	if err := vfs.ReplaceFile(w.fsys, RootName, root.AppendBinary(nil)); err != nil {
+		// the rename may have landed with its durability unknown, and a
+		// HARDENED anchor already names the destination: the destination
+		// and its records stay, the writer stops, and the next open decides
+		// by the root (or the anchor) which generation is current
+		cur, rerr := readRoot(w.fsys)
+		if w.hard.anchor != nil || rerr != nil || cur.GenerationID == id {
+			switched = true // keep the destination directory
+			d.closeGeneration()
+			w.hard.failed = fmt.Errorf("compaction to generation %d: root replacement failed after the rename may have landed (reopen required): %w", id, err)
+			return res, w.hard.failed
+		}
 		return res, err
 	}
 	switched = true

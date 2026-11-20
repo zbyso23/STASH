@@ -117,6 +117,8 @@ type Health struct {
 // parallel, commits go through one manifest stream.
 type Writer struct {
 	*view
+	// building: the writer of a compaction destination (not yet current)
+	building bool
 	// genMu: every operation holds it shared; compaction holds it
 	// exclusively while it freezes, merges and switches generations
 	// (§13.5).
@@ -243,7 +245,10 @@ func (w *Writer) openGeneration(gen string, h *wire.ArchiveHeader) (err error) {
 		}
 	}
 	w.view = &view{fsys: fsys, gen: gen, h: h, pool: opt.Pool, k: w.keys, env: w.env, kv: w.stEnv.Table()}
-	if w.view.lost, err = openLostSet(fsys, w.keys, h.GenerationID, true); err != nil {
+	if w.building {
+		// a compaction destination: foldLost writes its markers
+		w.view.lost = &lostSet{k: w.keys, gen: h.GenerationID, kv: w.view.kv}
+	} else if w.view.lost, err = openLostSet(fsys, w.keys, h.GenerationID, true, w.view.kv); err != nil {
 		return err
 	}
 	if h.Encrypted() && h.GenerationID > seal.MaxGenerationID {

@@ -29,16 +29,22 @@ import (
 // path clears it for good. Markers live in two files per generation in
 // HealthDir:
 //
-//	unrecoverable-<gen>.idx  "STUNREC1", count (uint64 LE), count records
-//	                          sorted by digest: digest[32] file_ver[8]
-//	                          generation[8] (LE), then SHA-256 of all
-//	                          before; looked up by binary search, nothing
-//	                          per marker held in memory
+//	unrecoverable-<gen>.idx  "STUNREC2", generation, count (uint64 LE),
+//	                          count records sorted by digest: digest[32]
+//	                          file_ver[8] pruned_into[8] (LE), then
+//	                          SHA-256 of all before; looked up by binary
+//	                          search, nothing per marker held in memory
 //	cleared-<gen>.log        appended by Delete: digest[32] crc32c[4]
 //
 // The digest is HMAC-SHA-256(path) under a key derived from the DEK in an
 // encrypted archive (seal.InfoHealthMAC), SHA-256("STASH-UNRECOVERABLE" ||
 // path) otherwise. Compaction folds both into the destination's index.
+//
+// Once a prune committed, every later generation has an index, empty when
+// every loss was acknowledged: a missing index while a committed prune
+// record exists fails the open (ErrCorrupt) instead of reading the losses
+// as absences. Acknowledged digests are kept in a budgeted table that
+// spills to scratch files, not in memory per entry.
 
 // ErrUnrecoverable reports a path whose version an Emergency Pruning
 // gave up (§13.9). It also matches ErrMissingData.
@@ -61,13 +67,18 @@ func (e *UnrecoverableError) Is(target error) bool {
 	return target == ErrUnrecoverable || target == ErrMissingData
 }
 
-var lostMagic = [8]byte{'S', 'T', 'U', 'N', 'R', 'E', 'C', '1'}
+var lostMagic = [8]byte{'S', 'T', 'U', 'N', 'R', 'E', 'C', '2'}
 
 const (
 	lostRec     = 48
 	clearedRec  = 36
-	lostHdrSize = 16
+	lostHdrSize = 24
+	clearedMem  = 256 << 10 // in-memory delta of the acknowledged set
 )
+
+// ErrMarkersMissing: a committed prune record exists but the generation's
+// marker index does not; the losses cannot be told from absences.
+var ErrMarkersMissing = fmt.Errorf("%w: UNRECOVERABLE marker index missing although an emergency prune committed", wire.ErrCorrupt)
 
 func lostIndexName(gen uint64) string {
 	return fmt.Sprintf("%s/unrecoverable-%016x.idx", HealthDir, gen)
@@ -88,24 +99,34 @@ type lostSet struct {
 	idx vfs.File // nil: no markers
 	n   int64
 
-	mu      sync.Mutex
-	cleared map[[32]byte]bool
-	clog    vfs.File // writer only
-	clogEnd int64
+	mu       sync.Mutex
+	kv       kvtab.Config
+	cleared  *kvtab.Table // acknowledged digests; nil: none
+	nCleared int64
+	clog     vfs.File // writer only
+	clogEnd  int64
 }
 
 // openLostSet opens the markers of generation gen; a writer also opens
-// the cleared log for appending (its torn tail truncated).
-func openLostSet(fsys vfs.FS, k *seal.Keys, gen uint64, writer bool) (*lostSet, error) {
-	s := &lostSet{k: k, gen: gen, cleared: map[[32]byte]bool{}}
+// the cleared log for appending (its torn tail truncated). kv configures
+// the table of acknowledged digests.
+func openLostSet(fsys vfs.FS, k *seal.Keys, gen uint64, writer bool, kv kvtab.Config) (*lostSet, error) {
+	s := &lostSet{k: k, gen: gen, kv: kv}
 	f, err := fsys.OpenFile(lostIndexName(gen), os.O_RDONLY, 0)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
+		// fail closed: after a committed prune every generation has one
+		if to, ok, err := committedPruneUpTo(fsys, gen); err != nil {
+			return nil, err
+		} else if ok {
+			return nil, fmt.Errorf("%w: %s (the prune into generation %d recorded losses; restore the file from a copy of the archive)",
+				ErrMarkersMissing, lostIndexName(gen), to)
+		}
 	case err != nil:
 		return nil, err
 	default:
 		s.idx = f
-		if s.n, err = checkLostIndex(f); err != nil {
+		if s.n, err = checkLostIndex(f, gen); err != nil {
 			f.Close()
 			return nil, fmt.Errorf("%s: %w", lostIndexName(gen), err)
 		}
@@ -146,7 +167,27 @@ func openLostSet(fsys vfs.FS, k *seal.Keys, gen uint64, writer bool) (*lostSet, 
 	return s, nil
 }
 
-func checkLostIndex(f vfs.File) (int64, error) {
+// committedPruneUpTo reports a committed prune record into a generation
+// up to gen (a prepared record into gen itself counts: a reader does not
+// settle records, and the root names gen).
+func committedPruneUpTo(fsys vfs.FS, gen uint64) (uint64, bool, error) {
+	ents, err := fsys.ReadDir(HealthDir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	for _, e := range ents {
+		to, prepared, ok := parsePruneName(e.Name())
+		if ok && (to < gen && !prepared || to == gen) {
+			return to, true, nil
+		}
+	}
+	return 0, false, nil
+}
+
+func checkLostIndex(f vfs.File, gen uint64) (int64, error) {
 	size, err := f.Size()
 	if err != nil {
 		return 0, err
@@ -158,8 +199,14 @@ func checkLostIndex(f vfs.File) (int64, error) {
 	if _, err := f.ReadAt(hdr[:], 0); err != nil {
 		return 0, err
 	}
-	n := int64(binary.LittleEndian.Uint64(hdr[8:]))
-	if [8]byte(hdr[:8]) != lostMagic || n < 0 || n > (size-lostHdrSize-32)/lostRec || size != lostHdrSize+n*lostRec+32 {
+	if [8]byte(hdr[:8]) != lostMagic {
+		return 0, fmt.Errorf("%w: marker index magic", wire.ErrCorrupt)
+	}
+	if g := binary.LittleEndian.Uint64(hdr[8:]); g != gen {
+		return 0, fmt.Errorf("%w: marker index of generation %d, expected %d", wire.ErrCorrupt, g, gen)
+	}
+	n := int64(binary.LittleEndian.Uint64(hdr[16:]))
+	if n < 0 || n > (size-lostHdrSize-32)/lostRec || size != lostHdrSize+n*lostRec+32 {
 		return 0, fmt.Errorf("%w: marker index header", wire.ErrCorrupt)
 	}
 	h := sha256.New()
@@ -202,16 +249,51 @@ func (s *lostSet) loadCleared(f vfs.File, size int64) error {
 			}
 			break // a torn last record
 		}
-		s.cleared[[32]byte(rec[:32])] = true
+		if err := s.ack([32]byte(rec[:32])); err != nil {
+			return err
+		}
 		off += clearedRec
 	}
 	s.clogEnd = off
 	return nil
 }
 
+// ack adds d to the acknowledged set (s.mu held, or s not yet shared).
+func (s *lostSet) ack(d [32]byte) error {
+	if s.cleared == nil {
+		cfg := s.kv
+		if cfg.MemLimit <= 0 || cfg.MemLimit > clearedMem {
+			cfg.MemLimit = clearedMem
+		}
+		s.cleared = kvtab.New(cfg)
+	}
+	if _, ok, err := s.cleared.Get(d[:]); err != nil || ok {
+		return err
+	}
+	if err := s.cleared.Put(d[:], nil); err != nil {
+		return err
+	}
+	s.nCleared++
+	return nil
+}
+
+func (s *lostSet) acked(d [32]byte) (bool, error) {
+	s.mu.Lock()
+	t := s.cleared
+	s.mu.Unlock()
+	if t == nil {
+		return false, nil
+	}
+	_, ok, err := t.Get(d[:])
+	return ok, err
+}
+
 func (s *lostSet) close() {
 	if s == nil {
 		return
+	}
+	if s.cleared != nil {
+		s.cleared.Close()
 	}
 	if s.idx != nil {
 		s.idx.Close()
@@ -255,11 +337,8 @@ func (s *lostSet) lookup(p string) (*UnrecoverableError, error) {
 	if err != nil || !ok {
 		return nil, err
 	}
-	s.mu.Lock()
-	gone := s.cleared[d]
-	s.mu.Unlock()
-	if gone {
-		return nil, nil
+	if gone, err := s.acked(d); err != nil || gone {
+		return nil, err
 	}
 	return &UnrecoverableError{Path: p, FileVer: ver, PrunedInto: gen}, nil
 }
@@ -269,8 +348,10 @@ func (s *lostSet) clear(p string) error {
 	d := pathDigest(s.k, p)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.cleared[d] {
-		return nil
+	if s.cleared != nil {
+		if _, ok, err := s.cleared.Get(d[:]); err != nil || ok {
+			return err
+		}
 	}
 	if s.clog == nil {
 		return fmt.Errorf("%w: markers not writable", wire.ErrInvalid)
@@ -283,8 +364,7 @@ func (s *lostSet) clear(p string) error {
 		return err
 	}
 	s.clogEnd += clearedRec
-	s.cleared[d] = true
-	return nil
+	return s.ack(d)
 }
 
 // each streams the standing markers (digest order).
@@ -299,10 +379,9 @@ func (s *lostSet) each(fn func(d [32]byte, ver, gen uint64) error) error {
 			return err
 		}
 		d := [32]byte(rec[:32])
-		s.mu.Lock()
-		gone := s.cleared[d]
-		s.mu.Unlock()
-		if gone {
+		if gone, err := s.acked(d); err != nil {
+			return err
+		} else if gone {
 			continue
 		}
 		if err := fn(d, binary.LittleEndian.Uint64(rec[32:]), binary.LittleEndian.Uint64(rec[40:])); err != nil {
@@ -319,7 +398,7 @@ func (s *lostSet) count() int64 {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.n - int64(len(s.cleared))
+	return s.n - s.nCleared
 }
 
 // writeLostIndex writes the marker index of generation gen from sorted
@@ -331,7 +410,8 @@ func writeLostIndex(fsys vfs.FS, gen uint64, n int64, next func(yield func(d [32
 	return vfs.ReplaceFileStream(fsys, lostIndexName(gen), func(out io.Writer) error {
 		h := sha256.New()
 		w := io.MultiWriter(out, h)
-		hdr := binary.LittleEndian.AppendUint64(append([]byte(nil), lostMagic[:]...), uint64(n))
+		hdr := binary.LittleEndian.AppendUint64(append([]byte(nil), lostMagic[:]...), gen)
+		hdr = binary.LittleEndian.AppendUint64(hdr, uint64(n))
 		if _, err := w.Write(hdr); err != nil {
 			return err
 		}
@@ -356,7 +436,10 @@ func writeLostIndex(fsys vfs.FS, gen uint64, n int64, next func(yield func(d [32
 }
 
 // foldLost writes the destination's marker index: the source's standing
-// markers (cleared ones dropped) and the versions this prune gave up.
+// markers (cleared ones dropped) and the versions this prune gave up that
+// are still the live version at the freeze (one deleted or rewritten
+// during the compaction is SUPERSEDED, not lost). Once a source has an
+// index the destination has one too, empty if need be.
 func (c *compactor) foldLost(to uint64) error {
 	put := func(d [32]byte, ver, g uint64) error {
 		v := binary.LittleEndian.AppendUint64(nil, ver)
@@ -372,6 +455,9 @@ func (c *compactor) foldLost(to uint64) error {
 			if i < 0 || len(rest)-i-1 != 8 {
 				return kvtab.ErrTampered
 			}
+			if _, sup, err := c.tab.Get(append([]byte{'w'}, rest...)); err != nil || sup {
+				return err
+			}
 			return put(pathDigest(c.src.k, string(rest[:i])), binary.BigEndian.Uint64(rest[i+1:]), to)
 		}); err != nil {
 			return err
@@ -381,7 +467,7 @@ func (c *compactor) foldLost(to uint64) error {
 	if err := c.eachTag('u', func([]byte, []byte) error { n++; return nil }); err != nil {
 		return err
 	}
-	if n == 0 {
+	if n == 0 && c.prune == nil && (c.src.lost == nil || c.src.lost.idx == nil) {
 		return nil
 	}
 	if err := writeLostIndex(c.d.fsys, to, n, func(yield func(d [32]byte, ver, g uint64) error) error {
@@ -394,7 +480,7 @@ func (c *compactor) foldLost(to uint64) error {
 	}); err != nil {
 		return err
 	}
-	l, err := openLostSet(c.d.fsys, c.src.k, to, true)
+	l, err := openLostSet(c.d.fsys, c.src.k, to, true, c.d.view.kv)
 	if err != nil {
 		return err
 	}

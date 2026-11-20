@@ -686,7 +686,7 @@ func openReaderAt(fsys vfs.FS, pool *bufpool.Pool, root wire.Root, limit int64, 
 		}
 	}
 	r := &Reader{view: view{fsys: fsys, gen: gen, h: h, pool: pool, k: k, env: env, kv: senv.Table(), hints: st}, st: st, memClose: cleanup, stEnv: senv}
-	if r.lost, err = openLostSet(fsys, k, root.GenerationID, false); err != nil {
+	if r.lost, err = openLostSet(fsys, k, root.GenerationID, false, r.kv); err != nil {
 		st.Close()
 		cleanup()
 		return nil, err

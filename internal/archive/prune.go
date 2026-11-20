@@ -70,10 +70,12 @@ type EmergencyPrune struct {
 type PruneReport struct {
 	// Record is the health record's name (below the archive root).
 	Record string
-	// LostExtents committed extents could not be found or rebuilt; the
-	// LostVersions holding them are UNRECOVERABLE and not in the
-	// destination.
-	LostExtents, LostVersions int
+	// LostExtents committed extents could not be found or rebuilt (the
+	// count the operator confirms); the LostVersions holding them are
+	// UNRECOVERABLE and not in the destination. SupersededVersions held
+	// lost extents too, but were deleted or rewritten while the compaction
+	// ran: nothing of the live state is lost and no marker stands.
+	LostExtents, LostVersions, SupersededVersions int
 	// UnrecoverableGroups lost data members parity could not rebuild;
 	// their surviving live members (RegroupedMembers) were rewritten into
 	// new, fully protected groups. RebuiltGroups lost members that were
@@ -105,7 +107,7 @@ type PruneDetail struct {
 	Offset   uint64 `json:"offset,omitempty"`
 	Blob     uint8  `json:"blob,omitempty"`
 	Hash     string `json:"hash,omitempty"`
-	Status   string `json:"status,omitempty"` // UNRECOVERABLE, DEGRADED
+	Status   string `json:"status,omitempty"` // UNRECOVERABLE, SUPERSEDED, DEGRADED
 	GroupID  uint32 `json:"group_id,omitempty"`
 	K        int    `json:"k,omitempty"`
 	M        int    `json:"m,omitempty"`
@@ -125,6 +127,7 @@ type pruneHeader struct {
 	Encrypted           bool    `json:"encrypted"`
 	LostExtents         int     `json:"lost_extents"`
 	LostVersions        int     `json:"lost_versions"`
+	SupersededVersions  int     `json:"superseded_versions,omitempty"`
 	UnrecoverableGroups int     `json:"unrecoverable_groups"`
 	RebuiltGroups       int     `json:"rebuilt_groups"`
 	RegroupedMembers    int     `json:"regrouped_members"`
@@ -183,9 +186,19 @@ func healthAAD(archiveID [32]byte, to uint64, line int) []byte {
 	return binary.BigEndian.AppendUint64(b, uint64(line))
 }
 
+// MaxPruneText bounds EmergencyPrune.Operator and Reason (bytes), so the
+// record's event line stays well below the 1 MiB line limit of a reader.
+const MaxPruneText = 4096
+
+// maxHealthLine is the longest record line a reader accepts.
+const maxHealthLine = 1 << 20
+
 func (p *EmergencyPrune) check() error {
 	if strings.TrimSpace(p.Operator) == "" || strings.TrimSpace(p.Reason) == "" {
 		return fmt.Errorf("%w: an operator and a reason are required (§13.9)", ErrPruneRefused)
+	}
+	if len(p.Operator) > MaxPruneText || len(p.Reason) > MaxPruneText {
+		return fmt.Errorf("%w: operator and reason are limited to %d bytes each", ErrPruneRefused, MaxPruneText)
 	}
 	if p.ExpectLostExtents <= 0 {
 		return fmt.Errorf("%w: ExpectLostExtents must be the count of extents the failing compaction reported", ErrPruneRefused)
@@ -279,6 +292,28 @@ func (c *compactor) eachTag(tag byte, fn func(k, v []byte) error) error {
 	return it.Err()
 }
 
+// settleLost runs at the freeze, against the source's final state: a lost
+// version that is no longer the live version of its path (deleted, or
+// rewritten, while the compaction ran) is SUPERSEDED ('w'); it gets no
+// UNRECOVERABLE marker, because the writer's state already moved past it.
+func (c *compactor) settleLost(live func(p string) (uint64, bool, error)) error {
+	return c.eachTag('z', func(key, _ []byte) error {
+		rest := key[1:]
+		i := bytes.IndexByte(rest, 0)
+		if i < 0 || len(rest)-i-1 != 8 {
+			return kvtab.ErrTampered
+		}
+		ver, ok, err := live(string(rest[:i]))
+		if err != nil {
+			return err
+		}
+		if ok && ver == binary.BigEndian.Uint64(rest[i+1:]) {
+			return nil
+		}
+		return c.tab.Put(append([]byte{'w'}, rest...), nil)
+	})
+}
+
 // pruneReport counts the lost set and the group impact.
 func (c *compactor) pruneReport() (PruneReport, error) {
 	var r PruneReport
@@ -288,6 +323,10 @@ func (c *compactor) pruneReport() (PruneReport, error) {
 	if err := c.eachTag('z', func([]byte, []byte) error { r.LostVersions++; return nil }); err != nil {
 		return r, err
 	}
+	if err := c.eachTag('w', func([]byte, []byte) error { r.SupersededVersions++; return nil }); err != nil {
+		return r, err
+	}
+	r.LostVersions -= r.SupersededVersions
 	if err := c.eachTag('G', func(k, v []byte) error {
 		if len(k) != 5 || len(v) != 9 {
 			return kvtab.ErrTampered
@@ -339,12 +378,16 @@ func (c *compactor) writePruneRecord(fsys vfs.FS, r *PruneReport, from, to uint6
 				st := k.Seal(seal.HealthDomain, nil, nonce, b, healthAAD(h.ArchiveID, to, lines))
 				b, _ = json.Marshal(map[string]string{"sealed": hex.EncodeToString(st)})
 			}
+			if len(b)+1 > maxHealthLine {
+				// before the switch: a record a reader refuses is never written
+				return fmt.Errorf("%w: a health record line would be %d bytes, over the %d a reader accepts", ErrPruneRefused, len(b)+1, maxHealthLine)
+			}
 			lines++
 			_, err = w.Write(append(b, '\n'))
 			return err
 		}
 		if err := emit(pruneHeader{Version: 1, Event: "EMERGENCY_PRUNE", From: from, To: to, Encrypted: k != nil,
-			LostExtents: r.LostExtents, LostVersions: r.LostVersions, UnrecoverableGroups: r.UnrecoverableGroups,
+			LostExtents: r.LostExtents, LostVersions: r.LostVersions, SupersededVersions: r.SupersededVersions, UnrecoverableGroups: r.UnrecoverableGroups,
 			RebuiltGroups: r.RebuiltGroups, RegroupedMembers: r.RegroupedMembers, UnavailableBlobs: r.UnavailableBlobs}, false); err != nil {
 			return err
 		}
@@ -371,7 +414,13 @@ func (c *compactor) writePruneRecord(fsys vfs.FS, r *PruneReport, from, to uint6
 			if i < 0 || len(rest)-i-1 != 8 {
 				return kvtab.ErrTampered
 			}
-			return emit(PruneDetail{Kind: "object", Path: string(rest[:i]), FileVer: binary.BigEndian.Uint64(rest[i+1:]), Status: "UNRECOVERABLE"}, true)
+			st := "UNRECOVERABLE"
+			if _, sup, err := c.tab.Get(append([]byte{'w'}, rest...)); err != nil {
+				return err
+			} else if sup {
+				st = "SUPERSEDED"
+			}
+			return emit(PruneDetail{Kind: "object", Path: string(rest[:i]), FileVer: binary.BigEndian.Uint64(rest[i+1:]), Status: st}, true)
 		}); err != nil {
 			return err
 		}
@@ -528,7 +577,7 @@ func readLine(br *bufio.Reader) ([]byte, error) {
 	for {
 		b, err := br.ReadSlice('\n')
 		out = append(out, b...)
-		if len(out) > 1<<20 {
+		if len(out) > maxHealthLine {
 			return nil, fmt.Errorf("%w: health record line over 1 MiB", wire.ErrCorrupt)
 		}
 		if err == bufio.ErrBufferFull {
@@ -595,7 +644,7 @@ func (v *view) PruneRecords() ([]PruneRecord, []string, error) {
 		}
 		rec.From, rec.To = h.From, h.To
 		rec.Record = HealthDir + "/" + e.Name()
-		rec.LostExtents, rec.LostVersions = h.LostExtents, h.LostVersions
+		rec.LostExtents, rec.LostVersions, rec.SupersededVersions = h.LostExtents, h.LostVersions, h.SupersededVersions
 		rec.UnrecoverableGroups, rec.RebuiltGroups, rec.RegroupedMembers = h.UnrecoverableGroups, h.RebuiltGroups, h.RegroupedMembers
 		rec.UnavailableBlobs = h.UnavailableBlobs
 		out = append(out, rec)
