@@ -51,6 +51,12 @@ type view struct {
 	pool  *bufpool.Pool
 	env   *index.Env  // memory budget, page cache, scratch space
 	blobs []*blobView // nil entry: blob unavailable
+	// hints holds locator hints of extents whose frame_hash is shared
+	// (the manifest state of the generation; nil: none)
+	hints    hintStore
+	learning sync.Map // learnKey → chan struct{}: a group being learned
+	// hinted and learned count reads through a hint and groups learned
+	hinted, learned atomic.Uint64
 	// unavailable records why a blob could not be opened (readers of a
 	// parity archive continue without it, §7.4).
 	unavailable map[uint8]error
@@ -154,8 +160,36 @@ func (v *view) fetch(p string, ver *manifest.Version, l manifest.Loc) (*blob.Ref
 		return ok
 	}
 	if bv := v.blobs[l.Blob]; bv != nil {
+		ref, err := v.fetchHinted(bv, p, ver, l, accept)
+		if ref == nil && err == nil {
+			// another reader is learning this group: wait for its hints
+			if ch, ok := v.learning.Load(learnKey{l.Blob, l.Hash}); ok {
+				<-ch.(chan struct{})
+				ref, err = v.fetchHinted(bv, p, ver, l, accept)
+			}
+		}
+		if ref != nil || err != nil {
+			if err != nil {
+				return nil, err
+			}
+			if err := ref.Decode(); err != nil {
+				ref.Release()
+				return nil, fmt.Errorf("%w: %s v%d extent at %d: %v", ErrMissingData, p, ver.FileVer, l.Offset, err)
+			}
+			slicePacked(ref, p, ver.FileVer, l)
+			return ref, nil
+		}
 		// the index is safe for concurrent lookups: no blob lock across I/O
+		rejected := false
+		accept := func(ref *blob.Ref) bool {
+			ok := accept(ref)
+			rejected = rejected || !ok
+			return ok
+		}
 		ref, how, err := bv.idx.Find(bv.r, l.Hash, accept)
+		if rejected && how == index.ViaIndex && err == nil {
+			v.learn(l.Blob, bv, l.Hash, p, ver.FileVer, l.Offset)
+		}
 		if how == index.ViaScan {
 			bv.mu.Lock()
 			bv.defective = true
@@ -190,6 +224,78 @@ func (v *view) fetch(p string, ver *manifest.Version, l manifest.Loc) (*blob.Ref
 	}
 	slicePacked(ref, p, ver.FileVer, l)
 	return ref, nil
+}
+
+// hintStore keeps locator hints (manifest.State).
+type hintStore interface {
+	Hint(path string, fileVer, offset uint64) (uint8, uint64, bool, error)
+	SetHint(path string, fileVer, offset uint64, blob uint8, phys uint64) error
+}
+
+// fetchHinted reads an extent through its locator hint: one index check
+// and one frame read instead of a walk over every frame sharing its hash.
+// A missing, stale or unreadable hint is a miss (nil, nil), never an
+// error: hints are not authoritative.
+func (v *view) fetchHinted(bv *blobView, p string, ver *manifest.Version, l manifest.Loc, accept func(*blob.Ref) bool) (*blob.Ref, error) {
+	if v.hints == nil {
+		return nil, nil
+	}
+	b, phys, ok, err := v.hints.Hint(p, ver.FileVer, l.Offset)
+	if err != nil || !ok || b != l.Blob {
+		return nil, nil
+	}
+	ref, err := bv.idx.FindAt(bv.r, l.Hash, phys, accept)
+	if ref != nil {
+		v.hinted.Add(1)
+	}
+	return ref, err
+}
+
+// learn records a hint for every extent stored in a frame with this hash,
+// read by Prefix and tail only. It runs when Find had to reject a
+// candidate, so a group of payload-identical frames is read once, not once
+// per object (a read that missed while another learned the group skips
+// it). Failures only mean fewer hints.
+func (v *view) learn(b uint8, bv *blobView, hash [wire.HashSize]byte, p string, fileVer, offset uint64) {
+	if v.hints == nil {
+		return
+	}
+	k := learnKey{b, hash}
+	done := make(chan struct{})
+	if _, busy := v.learning.LoadOrStore(k, done); busy {
+		return
+	}
+	if _, _, ok, _ := v.hints.Hint(p, fileVer, offset); ok {
+		// learned by a concurrent read since this one missed
+		v.learning.Delete(k)
+		close(done)
+		return
+	}
+	defer func() {
+		v.learning.Delete(k)
+		close(done)
+	}()
+	v.learned.Add(1)
+	bv.idx.EachCandidate(hash, func(rec wire.IndexRecord) bool {
+		hf, ok, err := bv.r.TailAt(int64(rec.PhysicalOffset))
+		if err != nil {
+			return false
+		}
+		if !ok || hf.Trailer.HashPayload != hash {
+			return true
+		}
+		for _, e := range hf.Entries {
+			if v.hints.SetHint(e.Path, e.FileVer, e.Offset, b, rec.PhysicalOffset) != nil {
+				return false
+			}
+		}
+		return true
+	})
+}
+
+type learnKey struct {
+	blob uint8
+	hash [wire.HashSize]byte
 }
 
 // packedEntry finds the payload range of extent l of (p, fileVer) in a
@@ -573,7 +679,7 @@ func openReaderAt(fsys vfs.FS, pool *bufpool.Pool, root wire.Root, limit int64, 
 			return nil, err
 		}
 	}
-	r := &Reader{view: view{fsys: fsys, gen: gen, h: h, pool: pool, k: k, env: env}, st: st, memClose: cleanup, stEnv: senv}
+	r := &Reader{view: view{fsys: fsys, gen: gen, h: h, pool: pool, k: k, env: env, hints: st}, st: st, memClose: cleanup, stEnv: senv}
 	if _, err := r.openBlobs(false, h.ParityScheme != wire.ParityNone); err != nil {
 		r.close()
 		st.Close()

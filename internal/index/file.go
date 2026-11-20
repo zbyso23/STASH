@@ -234,6 +234,40 @@ func (c *PageCache) lowerBound(f *idxFile, h *[wire.HashSize]byte) (uint64, erro
 	return lo, nil
 }
 
+// lowerBoundAt returns the first record index whose (hash, offset) is >=
+// (h, off): the global order of §10.5.1 is hash, then physical offset. One
+// binary search between the fence entries around h, however many records
+// share h.
+func (c *PageCache) lowerBoundAt(f *idxFile, h *[wire.HashSize]byte, off uint64) (uint64, error) {
+	// fence[j-1].hash < h, fence[k].hash > h: the records of h lie between
+	j := sort.Search(len(f.fence), func(j int) bool { return bytes.Compare(f.fence[j].hash[:], h[:]) >= 0 })
+	k := j + sort.Search(len(f.fence)-j, func(i int) bool { return bytes.Compare(f.fence[j+i].hash[:], h[:]) > 0 })
+	lo, hi := uint64(0), f.n
+	if j > 0 {
+		lo = f.fence[j-1].rec + 1
+	}
+	if k < len(f.fence) {
+		hi = f.fence[k].rec
+	}
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		r, err := c.raw(f, mid)
+		if err != nil {
+			return 0, err
+		}
+		less := bytes.Compare(r[:wire.HashSize], h[:])
+		if less == 0 && binary.LittleEndian.Uint64(r[32:40]) < off {
+			less = -1
+		}
+		if less < 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo, nil
+}
+
 // fileCursor walks the records of one hash in a file, in offset order.
 type fileCursor struct {
 	c    *PageCache

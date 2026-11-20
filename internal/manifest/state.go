@@ -809,3 +809,40 @@ func (r refSet) Has(k blob.FrameKey) (bool, error) {
 }
 
 var errClosed = errors.New("manifest: state closed")
+
+// Locator hints (implementation-defined, never normative): the physical
+// offset of the frame holding extent (path, file_ver, offset), learned by
+// the read path where a frame_hash is shared by several frames (§10.5:
+// index candidates of one hash are only told apart by reading their
+// Pre-Trailers). A hint lives in the scratch table with the rest of the
+// state and is rebuilt by use in every session; it is only ever a guess
+// that the reader checks against the validated index and the frame.
+
+func hintKey(path string, fileVer, offset uint64) []byte {
+	k := make([]byte, 0, 1+len(path)+17)
+	k = append(k, 'H')
+	k = append(k, path...)
+	k = append(k, 0)
+	k = binary.BigEndian.AppendUint64(k, fileVer)
+	return binary.BigEndian.AppendUint64(k, offset)
+}
+
+// Hint returns the learned blob and physical offset of an extent.
+func (s *State) Hint(path string, fileVer, offset uint64) (uint8, uint64, bool, error) {
+	v, ok, err := s.tab.Get(hintKey(path, fileVer, offset))
+	if err != nil || !ok {
+		return 0, 0, false, err
+	}
+	if len(v) != 9 {
+		return 0, 0, false, kvtab.ErrTampered
+	}
+	return v[0], binary.BigEndian.Uint64(v[1:]), true, nil
+}
+
+// SetHint records where the frame of an extent was found.
+func (s *State) SetHint(path string, fileVer, offset uint64, blob uint8, phys uint64) error {
+	var v [9]byte
+	v[0] = blob
+	binary.BigEndian.PutUint64(v[1:], phys)
+	return s.tab.Put(hintKey(path, fileVer, offset), v[:])
+}

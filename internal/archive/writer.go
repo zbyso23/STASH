@@ -278,6 +278,7 @@ func (w *Writer) openGeneration(gen string, h *wire.ArchiveHeader) (err error) {
 		return err
 	}
 	w.journal = j
+	w.view.hints = st
 	if w.hard.anchor != nil {
 		// cold-start ADD_ABORTs and adopted records are anchored now
 		if err := w.advanceCommit(context.Background()); err != nil {

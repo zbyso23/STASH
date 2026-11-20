@@ -80,6 +80,22 @@ func TestPagedEquivalence(t *testing.T) {
 			if !slices.Equal(a, b) {
 				t.Fatalf("%s: hash %d: %d candidates, want %d", stage, k, len(b), len(a))
 			}
+			// the hinted lookup finds exactly the records of this hash
+			at := map[uint64]wire.IndexRecord{}
+			for _, r := range a {
+				at[r.PhysicalOffset] = r
+			}
+			for _, r := range a {
+				for _, off := range []uint64{r.PhysicalOffset, r.PhysicalOffset + 4096, r.PhysicalOffset - 4096} {
+					want, in := at[off]
+					x.mu.RLock()
+					got, ok, err := x.recordAt(hh, off)
+					x.mu.RUnlock()
+					if err != nil || ok != in || got != want {
+						t.Fatalf("%s: hash %d recordAt(%d) = %v %v %v", stage, k, off, ok, err, got)
+					}
+				}
+			}
 		}
 		if x.End() != ref.End() || x.Len() != ref.Len() {
 			t.Fatalf("%s: end %d/%d len %d/%d", stage, x.End(), ref.End(), x.Len(), ref.Len())

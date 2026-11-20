@@ -130,3 +130,16 @@ func tailAt(f vfs.File, h *wire.ArchiveHeader, k *seal.Keys, off, size int64, bu
 	}
 	return hf, true, nil
 }
+
+// TailAt reads the frame starting at off by Prefix and tail, without the
+// payload (no payload hash is checked). ok is false when no plausible
+// frame starts there. The result is a hint at best: anything taken from it
+// must be validated by ReadFrame before use.
+func (r *Reader) TailAt(off int64) (HopFrame, bool, error) {
+	size, err := r.f.Size()
+	if err != nil {
+		return HopFrame{}, false, err
+	}
+	var buf []byte
+	return tailAt(r.f, r.h, r.k, off, size, &buf)
+}

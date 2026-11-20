@@ -1,6 +1,10 @@
 package index
 
 import (
+	"encoding/binary"
+	"fmt"
+	"slices"
+
 	"stash/internal/blob"
 	"stash/internal/bufpool"
 	"stash/internal/frame"
@@ -126,4 +130,93 @@ func (x *Index) findIndexed(r *blob.Reader, hash [wire.HashSize]byte, accept fun
 		ref.Release()
 	}
 	return nil, nil
+}
+
+// FindAt tries the single frame at off, which must be an index candidate
+// of hash: a locator hint is checked against the validated index before
+// the frame is read, and the frame is validated like any candidate. nil
+// means the hint did not hold; the caller then uses Find.
+func (x *Index) FindAt(r *blob.Reader, hash [wire.HashSize]byte, off uint64, accept func(*blob.Ref) bool) (*blob.Ref, error) {
+	x.mu.RLock()
+	defer x.mu.RUnlock()
+	if x.closed {
+		return nil, nil
+	}
+	rec, found, err := x.recordAt(hash, off)
+	if err != nil || !found {
+		return nil, nil // an unreadable index is a miss here, as in Find
+	}
+	ref, err := r.ReadFrame(int64(off))
+	if err != nil {
+		if wire.IsFormatError(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	t := &ref.Trailer
+	if t.HashPayload == hash && t.FrameQuanta == rec.FrameQuanta && t.BlockType == rec.BlockType &&
+		t.FrameOrdinal == rec.FrameOrdinal && (accept == nil || accept(ref)) {
+		return ref, nil
+	}
+	ref.Release()
+	return nil, nil
+}
+
+// recordAt finds the record (hash, off) by binary search in every source,
+// so a hinted lookup costs O(log) record reads however many frames share
+// the hash. x.mu is held.
+func (x *Index) recordAt(hash [wire.HashSize]byte, off uint64) (wire.IndexRecord, bool, error) {
+	cache := x.env.cache()
+	files := x.runs
+	if x.base != nil {
+		files = append([]*idxFile{x.base}, x.runs...)
+	}
+	for _, f := range files {
+		i, err := cache.lowerBoundAt(f, &hash, off)
+		if err != nil {
+			return wire.IndexRecord{}, false, err
+		}
+		if i >= f.n {
+			continue
+		}
+		raw, err := cache.raw(f, i)
+		if err != nil {
+			return wire.IndexRecord{}, false, err
+		}
+		if [wire.HashSize]byte(raw[:wire.HashSize]) != hash || binary.LittleEndian.Uint64(raw[32:40]) != off {
+			continue
+		}
+		r, err := wire.DecodeIndexRecord(raw, x.h)
+		if err != nil {
+			return wire.IndexRecord{}, false, fmt.Errorf("%w: %w", ErrDiscard, err)
+		}
+		return r, true, nil
+	}
+	want := wire.IndexRecord{FrameHash: hash, PhysicalOffset: off}
+	if i, ok := slices.BinarySearchFunc(x.recs, want, func(a, b wire.IndexRecord) int { return less(&a, &b) }); ok {
+		return x.recs[i], true, nil
+	}
+	for _, r := range x.pending {
+		if r.FrameHash == hash && r.PhysicalOffset == off {
+			return r, true, nil
+		}
+	}
+	return wire.IndexRecord{}, false, nil
+}
+
+// EachCandidate streams the index records of hash in offset order until
+// fn returns false.
+func (x *Index) EachCandidate(hash [wire.HashSize]byte, fn func(wire.IndexRecord) bool) error {
+	x.mu.RLock()
+	defer x.mu.RUnlock()
+	if x.closed {
+		return nil
+	}
+	c := x.candidates(hash)
+	for c.next() {
+		if !fn(c.rec) {
+			break
+		}
+	}
+	return c.err
 }

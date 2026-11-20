@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"stash/internal/memprobe"
 	"stash/internal/vfs"
@@ -27,6 +28,7 @@ import (
 //	STASH_PHASE  build | writer | reader | read (concurrent Gets)
 //	STASH_READERS goroutines for the read phase (default 16)
 //	STASH_SAME    non-empty: objects share most frame content (duplicate frame hashes)
+//	STASH_NOHINT  non-empty: read without locator hints (comparison)
 //	STASH_GETS    Gets per reader goroutine (default 2000)
 //
 // Each phase prints one RESULT line: retained heap per unit (frame or
@@ -128,6 +130,9 @@ func TestZZMemory(t *testing.T) {
 		}
 		retained := memprobe.Retained() - base
 		cache := cacheBytes(r.env, r.stEnv)
+		if os.Getenv("STASH_NOHINT") != "" {
+			r.view.hints = nil // the candidate walk alone, for comparison
+		}
 		g, _ := strconv.Atoi(os.Getenv("STASH_READERS"))
 		if g <= 0 {
 			g = 16
@@ -138,6 +143,7 @@ func TestZZMemory(t *testing.T) {
 		}
 		var wg sync.WaitGroup
 		errs := make(chan error, g)
+		start := time.Now()
 		for i := 0; i < g; i++ {
 			wg.Add(1)
 			go func(i int) {
@@ -156,6 +162,8 @@ func TestZZMemory(t *testing.T) {
 		for err := range errs {
 			t.Fatal(err)
 		}
+		el := time.Since(start)
+		t.Logf("RESULT kind=%s phase=get-%d units=%d gets=%d us_per_get=%.1f wall_s=%.2f", kind, g, units, g*gets, float64(el.Microseconds())/float64(g*gets)*float64(g), el.Seconds())
 		report(fmt.Sprintf("read-%d", g), retained, cache)
 		r.Close()
 	default:
