@@ -95,9 +95,9 @@ func extract(t *testing.T, rc *Recovery, v *Version) []byte {
 	return b.Bytes()
 }
 
-func byPath(rc *Recovery) map[string][]*Version {
+func byPath(t testing.TB, rc *Recovery) map[string][]*Version {
 	m := map[string][]*Version{}
-	for _, v := range rc.Versions {
+	for _, v := range mustAll(t, rc) {
 		m[v.Path] = append(m[v.Path], v)
 	}
 	return m
@@ -110,10 +110,10 @@ func TestScanIntact(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer rc.Close()
-	if !rc.Authoritative || !rc.Manifest.Loaded || len(rc.Versions) != len(live)+len(old) {
-		t.Fatalf("%+v %d versions", rc.Manifest, len(rc.Versions))
+	if !rc.Authoritative || !rc.Manifest.Loaded || len(mustAll(t, rc)) != len(live)+len(old) {
+		t.Fatalf("%+v %d versions", rc.Manifest, len(mustAll(t, rc)))
 	}
-	vs := byPath(rc)
+	vs := byPath(t, rc)
 	for p, d := range live {
 		cur := vs[p][len(vs[p])-1]
 		if !cur.Current || !cur.Committed || !cur.Complete || cur.Unverified || !bytes.Equal(extract(t, rc, cur), d) {
@@ -126,7 +126,7 @@ func TestScanIntact(t *testing.T) {
 	if v := vs["gone.bin"][0]; v.Current || !v.Committed || !bytes.Equal(extract(t, rc, v), old["gone.bin"]) {
 		t.Fatalf("deleted %+v", v)
 	}
-	if sel := rc.DefaultSelection(); len(sel) != len(live) {
+	if sel := mustDefault(t, rc); len(sel) != len(live) {
 		t.Fatalf("selection %d", len(sel))
 	}
 }
@@ -145,12 +145,12 @@ func TestScanWithoutManifest(t *testing.T) {
 	if rc.Authoritative || rc.RootErr == nil || rc.Manifest.Loaded || rc.Manifest.Err == nil {
 		t.Fatalf("labels %+v", rc.Report.Manifest)
 	}
-	for _, v := range rc.Versions {
+	for _, v := range mustAll(t, rc) {
 		if v.Committed || v.Current || v.LengthKnown {
 			t.Fatalf("%+v", v)
 		}
 	}
-	sel := rc.DefaultSelection()
+	sel := mustDefault(t, rc)
 	if len(sel) != len(live)+1 {
 		t.Fatalf("selection %d", len(sel))
 	}
@@ -189,7 +189,7 @@ func TestScanDamageNoParity(t *testing.T) {
 		if len(br.Damaged) == 0 || br.Damaged[0].From != off {
 			t.Fatalf("damaged %+v", br)
 		}
-		for _, v := range rc.Versions {
+		for _, v := range mustAll(t, rc) {
 			if v.Path == "obj/f" {
 				if v.Complete || len(v.Gaps) != 1 || v.Gaps[0] != (Range{l.Offset, l.Length}) && withManifest {
 					t.Fatalf("damaged version %+v", v)
@@ -241,7 +241,7 @@ func TestScanParityRebuild(t *testing.T) {
 			t.Fatalf("mode %v: %+v %+v", mode, rc.Blobs[1], rc.Groups)
 		}
 		got := 0
-		for _, v := range rc.Versions {
+		for _, v := range mustAll(t, rc) {
 			if d, ok := live[v.Path]; ok && v.Current {
 				if !bytes.Equal(extract(t, rc, v), d) {
 					t.Fatal(v.Path)
@@ -265,7 +265,7 @@ func TestSalvage(t *testing.T) {
 	}
 	defer rc.Close()
 	dst := vfs.NewCrashFS()
-	res, err := rc.Salvage(context.Background(), dst, rc.DefaultSelection())
+	res, err := rc.Salvage(context.Background(), dst, rc.Default())
 	if err != nil || res.Written != len(live)+1 || len(res.Failed) != 0 {
 		t.Fatalf("%v %+v", err, res)
 	}
@@ -282,4 +282,22 @@ func TestSalvage(t *testing.T) {
 	if r.Header().ParityScheme != plain.ParityScheme || r.Header().ArchiveID == mustHeader(t, c).ArchiveID {
 		t.Fatal("salvage target parameters")
 	}
+}
+
+func mustAll(t testing.TB, rc *Recovery) []*Version {
+	t.Helper()
+	vs, err := rc.Versions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return vs
+}
+
+func mustDefault(t testing.TB, rc *Recovery) []*Version {
+	t.Helper()
+	vs, err := rc.DefaultSelection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return vs
 }

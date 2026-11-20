@@ -48,6 +48,11 @@ type Config struct {
 	// merge readers while reading. Reserved from Budget when it is set.
 	Memory int64
 	Budget *membudget.Budget
+	// Degrade takes whatever part of Memory the budget has free (at least
+	// MinMemory, which is used unreserved when even that is taken) instead
+	// of waiting for all of it. For sorts that run while long-lived
+	// holders (caches, tables) may keep the budget.
+	Degrade bool
 	// FanIn caps the runs merged at once (default 128, lowered to what
 	// Memory allows).
 	FanIn int
@@ -95,9 +100,22 @@ func New(ctx context.Context, cfg Config) (*Sorter, error) {
 	if cfg.Memory < MinMemory {
 		return nil, fmt.Errorf("extsort: memory %d below minimum %d", cfg.Memory, MinMemory)
 	}
-	res, err := cfg.Budget.Reserve(ctx, cfg.Memory)
-	if err != nil {
-		return nil, err
+	var res *membudget.Reservation
+	if cfg.Degrade {
+		// take what is free, down to MinMemory; when not even that is free
+		// (long-lived holders took the budget), run at MinMemory
+		// unreserved rather than wait for memory that may never return
+		if res = cfg.Budget.TryReserve(MinMemory, cfg.Memory); res != nil {
+			cfg.Memory = res.Size()
+		} else {
+			cfg.Memory = MinMemory
+			res, _ = (*membudget.Budget)(nil).Reserve(ctx, 0)
+		}
+	} else {
+		var err error
+		if res, err = cfg.Budget.Reserve(ctx, cfg.Memory); err != nil {
+			return nil, err
+		}
 	}
 	var r [8]byte
 	if _, err := rand.Read(r[:]); err != nil {

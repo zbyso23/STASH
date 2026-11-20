@@ -427,6 +427,9 @@ func validate(env *Env, fsys vfs.FS, name string, h *wire.ArchiveHeader, ordinal
 		Compare: bytes.Compare,
 		Memory:  sortMemory(env, n),
 		Budget:  env.budget(),
+		// parallel opens share what is free; none waits for memory that
+		// long-lived holders keep
+		Degrade: true,
 	})
 	if err != nil {
 		return nil, err

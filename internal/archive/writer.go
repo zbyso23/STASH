@@ -1,7 +1,9 @@
 package archive
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +17,7 @@ import (
 	"stash/internal/blob"
 	"stash/internal/bufpool"
 	"stash/internal/index"
+	"stash/internal/kvtab"
 	"stash/internal/manifest"
 	"stash/internal/parity"
 	"stash/internal/seal"
@@ -226,7 +229,7 @@ func (w *Writer) openGeneration(gen string, h *wire.ArchiveHeader) (err error) {
 			return err
 		}
 	}
-	w.view = &view{fsys: fsys, gen: gen, h: h, pool: opt.Pool, k: w.keys, env: w.env}
+	w.view = &view{fsys: fsys, gen: gen, h: h, pool: opt.Pool, k: w.keys, env: w.env, kv: w.stEnv.Table()}
 	if h.Encrypted() && h.GenerationID > seal.MaxGenerationID {
 		return fmt.Errorf("%w: generation %d", seal.ErrNonceLimit, h.GenerationID)
 	}
@@ -294,13 +297,15 @@ func (w *Writer) openGeneration(gen string, h *wire.ArchiveHeader) (err error) {
 	var maxGroup uint32
 	var groupRef func(uint32) bool
 	tailHold := false
+	var census *groupCensus
 	if w.code != nil {
-		refd, incomplete, err := w.groupCensus(st)
-		if err != nil {
+		var err error
+		if census, err = w.groupCensus(st); err != nil {
 			return err
 		}
-		groupRef = func(g uint32) bool { return refd[g] }
-		tailHold = incomplete
+		defer census.close()
+		groupRef = census.referenced
+		tailHold = census.incomplete
 	}
 	// blobs are scanned in parallel; results are merged in ordinal order
 	type blobOpen struct {
@@ -330,6 +335,19 @@ func (w *Writer) openGeneration(gen string, h *wire.ArchiveHeader) (err error) {
 		}()
 	}
 	wg.Wait()
+	if census != nil {
+		census.mu.Lock()
+		err := census.err
+		census.mu.Unlock()
+		if err != nil {
+			for _, o := range opens {
+				if o.bw != nil {
+					o.bw.Close()
+				}
+			}
+			return fmt.Errorf("parity group census: %w", err)
+		}
+	}
 	var openErr error
 	for b, o := range opens {
 		maxGroup = max(maxGroup, o.br.MaxGroupID)
@@ -400,19 +418,49 @@ func (w *Writer) openGeneration(gen string, h *wire.ArchiveHeader) (err error) {
 	return nil
 }
 
-// groupCensus hops every blob once (Prefix and tail only) and returns,
-// for the torn-tail rules of §10.4.2, the parity groups that a loc
+// groupCensus is what one hop over every blob (Prefix and tail only)
+// found for the torn-tail rules of §10.4.2: the parity groups that a loc
 // references through one of their DATA members, and whether such a
 // committed group lacks a member that no blob holds (E1-22). Members are
 // counted by intact tail; a member whose payload is damaged is useless for
 // reconstruction already, so truncating it loses nothing.
-func (w *Writer) groupCensus(st *manifest.State) (referenced map[uint32]bool, incomplete bool, err error) {
-	referenced = map[uint32]bool{}
-	type info struct {
-		k, m uint8
-		idx  map[uint8]bool
+//
+// The census lives in a scratch table, not in memory:
+//
+//	'M' group_id index → k, m of a member found
+//	'R' group_id       → the group is referenced
+type groupCensus struct {
+	tab        *kvtab.Table
+	incomplete bool
+	mu         sync.Mutex
+	err        error // the first failed lookup (the open fails with it)
+}
+
+func (c *groupCensus) close() { c.tab.Close() }
+
+// referenced reports whether a loc references group g. A failed lookup
+// answers true (keep the frames) and fails the open afterwards.
+func (c *groupCensus) referenced(g uint32) bool {
+	_, ok, err := c.tab.Get(binary.BigEndian.AppendUint32([]byte{'R'}, g))
+	if err != nil {
+		c.mu.Lock()
+		if c.err == nil {
+			c.err = err
+		}
+		c.mu.Unlock()
+		return true
 	}
-	groups := map[uint32]*info{}
+	return ok
+}
+
+func (w *Writer) groupCensus(st *manifest.State) (*groupCensus, error) {
+	c := &groupCensus{tab: kvtab.New(w.stEnv.Table())}
+	ok := false
+	defer func() {
+		if !ok {
+			c.close()
+		}
+	}()
 	for b := 0; b < int(w.h.BlobCount); b++ {
 		refs := st.BlobCommitted(uint8(b), nil).Refs
 		name, _ := blob.Name(uint8(b))
@@ -421,19 +469,17 @@ func (w *Writer) groupCensus(st *manifest.State) (referenced map[uint32]bool, in
 			continue // lost blob: OpenWriter decides
 		}
 		if err != nil {
-			return nil, false, fmt.Errorf("blob %02X: %w", b, err)
+			return nil, fmt.Errorf("blob %02X: %w", b, err)
 		}
 		err = r.Hop(func(f blob.HopFrame) error {
 			g := f.Trailer.GroupID
 			if g == 0 {
 				return nil
 			}
-			gi := groups[g]
-			if gi == nil {
-				gi = &info{k: f.Trailer.GroupK, m: f.Trailer.GroupM, idx: map[uint8]bool{}}
-				groups[g] = gi
+			mk := binary.BigEndian.AppendUint32([]byte{'M'}, g)
+			if err := c.tab.Put(append(mk, f.Trailer.GroupIndex), []byte{f.Trailer.GroupK, f.Trailer.GroupM}); err != nil {
+				return err
 			}
-			gi.idx[f.Trailer.GroupIndex] = true
 			for _, e := range f.Entries {
 				off := e.Offset
 				if f.Trailer.BlockType == wire.BlockPacked {
@@ -444,23 +490,51 @@ func (w *Writer) groupCensus(st *manifest.State) (referenced map[uint32]bool, in
 					return err
 				}
 				if ok {
-					referenced[g] = true
+					return c.tab.Put(binary.BigEndian.AppendUint32([]byte{'R'}, g), nil)
 				}
 			}
 			return nil
 		})
 		r.Close()
 		if err != nil {
-			return nil, false, err
+			return nil, err
 		}
 	}
-	for g := range referenced {
-		gi := groups[g]
-		if len(gi.idx) < int(gi.k)+int(gi.m) {
-			incomplete = true
+	// a referenced group is complete when every index of k+m is present
+	// (k and m are those of the member with the lowest index)
+	it := c.tab.Iter([]byte{'R'})
+	defer it.Close()
+	for it.Next() && !c.incomplete {
+		k := it.Key()
+		if k[0] != 'R' {
+			break
 		}
+		if len(k) != 5 {
+			return nil, kvtab.ErrTampered
+		}
+		pfx := append([]byte{'M'}, k[1:]...)
+		mi := c.tab.Iter(pfx)
+		n, want := 0, -1
+		for mi.Next() && bytes.HasPrefix(mi.Key(), pfx) {
+			if want < 0 {
+				if v := mi.Value(); len(v) == 2 {
+					want = int(v[0]) + int(v[1])
+				}
+			}
+			n++
+		}
+		err := mi.Err()
+		mi.Close()
+		if err != nil {
+			return nil, err
+		}
+		c.incomplete = n < want
 	}
-	return referenced, incomplete, nil
+	if err := it.Err(); err != nil {
+		return nil, err
+	}
+	ok = true
+	return c, nil
 }
 
 // Header returns the archive header.

@@ -76,6 +76,10 @@ type Env struct {
 	SortMemory int64
 }
 
+// Table is the configuration of another scratch table in the same
+// environment (nil: in memory).
+func (e *Env) Table() kvtab.Config { return e.table() }
+
 func (e *Env) table() kvtab.Config {
 	if e == nil {
 		return kvtab.Config{}

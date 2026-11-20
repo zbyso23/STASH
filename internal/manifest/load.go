@@ -50,7 +50,7 @@ func newSorter(env *Env, share int64) (*extsort.Sorter, error) {
 	if env != nil {
 		b = env.Budget
 	}
-	return extsort.New(context.Background(), extsort.Config{Scratch: scratch, Compare: bytes.Compare, Memory: m, Budget: b})
+	return extsort.New(context.Background(), extsort.Config{Scratch: scratch, Compare: bytes.Compare, Memory: m, Budget: b, Degrade: true})
 }
 
 func newLoadSink(env *Env, refs bool) (*loadSink, error) {

@@ -18,19 +18,19 @@ func (rc *Recovery) payloadOf(v *Version, e Extent) ([]byte, error) {
 		return nil, fmt.Errorf("%w: keyless recovery cannot decrypt", archive.ErrKeyRequired)
 	}
 	var ref *blob.Ref
-	if e.fr.off >= 0 {
+	if e.FrameOffset >= 0 {
 		var err error
-		if ref, err = rc.readers[e.fr.blob].ReadFrame(e.fr.off); err != nil {
+		if ref, err = rc.readers[e.Blob].ReadFrame(e.FrameOffset); err != nil {
 			return nil, err
 		}
 	} else {
-		rebuilt, err := rc.rebuild(e.fr.t.GroupID)
+		rebuilt, err := rc.rebuild(e.group)
 		if err != nil {
 			return nil, err
 		}
-		buf := rebuilt[e.fr.t.GroupIndex]
+		buf := rebuilt[e.index]
 		if buf == nil {
-			return nil, fmt.Errorf("%w: group %d member %d no longer rebuilds", archive.ErrMissingData, e.fr.t.GroupID, e.fr.t.GroupIndex)
+			return nil, fmt.Errorf("%w: group %d member %d no longer rebuilds", archive.ErrMissingData, e.group, e.index)
 		}
 		if ref, err = blob.NewRef(append([]byte(nil), buf...), rc.h, rc.pool, rc.k); err != nil {
 			return nil, err
@@ -38,7 +38,7 @@ func (rc *Recovery) payloadOf(v *Version, e Extent) ([]byte, error) {
 	}
 	defer ref.Release()
 	fr := ref.Frame
-	if fr.Trailer.HashPayload != e.fr.t.HashPayload {
+	if fr.Trailer.HashPayload != e.hash {
 		return nil, fmt.Errorf("%w: frame changed since the scan", wire.ErrCorrupt)
 	}
 	entries := fr.Entries
@@ -96,49 +96,53 @@ func (rc *Recovery) ExtractAt(v *Version, w io.WriterAt) ([]Range, error) {
 	return missing, nil
 }
 
-// DefaultSelection picks what Salvage writes: when the whole manifest
-// loaded, the current versions; otherwise, per path, the complete
-// version with the highest file_ver (which may have been deleted or
-// superseded; raw recovery cannot know, §11.2.2).
-func (rc *Recovery) DefaultSelection() []*Version {
-	var out []*Version
+// Default selects what Salvage writes by default: when the whole manifest
+// loaded, the current versions; otherwise, per path, the complete version
+// with the highest file_ver (which may have been deleted or superseded;
+// raw recovery cannot know, §11.2.2). It streams like All.
+func (rc *Recovery) Default() Selection {
+	all := rc.All()
 	if rc.Manifest.Loaded {
-		for _, v := range rc.Versions {
-			if v.Current && v.Complete {
-				out = append(out, v)
+		return func(fn func(*Version) bool) error {
+			return all(func(v *Version) bool { return !(v.Current && v.Complete) || fn(v) })
+		}
+	}
+	return func(fn func(*Version) bool) error {
+		var best *Version // of the current path; versions arrive by file_ver
+		more := true
+		err := all(func(v *Version) bool {
+			if best != nil && best.Path != v.Path {
+				if more = fn(best); !more {
+					return false
+				}
+				best = nil
 			}
+			if v.Complete {
+				best = v
+			}
+			return true
+		})
+		if err == nil && more && best != nil {
+			fn(best)
 		}
-		return out
+		return err
 	}
-	best := map[string]*Version{}
-	var order []string
-	for _, v := range rc.Versions {
-		if !v.Complete {
-			continue
-		}
-		if b, ok := best[v.Path]; !ok {
-			order = append(order, v.Path)
-		} else if b.FileVer > v.FileVer {
-			continue
-		}
-		best[v.Path] = v
-	}
-	for _, p := range order {
-		out = append(out, best[p])
-	}
-	return out
 }
 
 // SalvageResult describes a salvage.
 type SalvageResult struct {
 	Written int
 	Bytes   int64
-	Failed  map[string]error
+	// Failed lists the first maxFailedListed failures; FailedCount counts all.
+	Failed      map[string]error
+	FailedCount int
 }
+
+const maxFailedListed = 1000
 
 // Salvage creates a new archive in dst with the source's parameters and
 // writes the given versions into it as new versions of their paths.
-func (rc *Recovery) Salvage(ctx context.Context, dst vfs.FS, versions []*Version) (SalvageResult, error) {
+func (rc *Recovery) Salvage(ctx context.Context, dst vfs.FS, sel Selection) (SalvageResult, error) {
 	res := SalvageResult{Failed: map[string]error{}}
 	if rc.Keyless {
 		return res, fmt.Errorf("%w: salvage of an encrypted archive", archive.ErrKeyRequired)
@@ -157,20 +161,30 @@ func (rc *Recovery) Salvage(ctx context.Context, dst vfs.FS, versions []*Version
 			w.Close()
 		}
 	}()
-	for _, v := range versions {
-		if err := ctx.Err(); err != nil {
-			return res, err
+	var cerr error
+	if err := sel(func(v *Version) bool {
+		if cerr = ctx.Err(); cerr != nil {
+			return false
 		}
 		pr, pw := io.Pipe()
 		go func() { pw.CloseWithError(rc.Extract(v, pw)) }()
 		_, err := w.PutReader(ctx, v.Path, pr)
 		pr.CloseWithError(err)
 		if err != nil {
-			res.Failed[v.Path] = err
-			continue
+			if len(res.Failed) < maxFailedListed {
+				res.Failed[v.Path] = err
+			}
+			res.FailedCount++
+			return true
 		}
 		res.Written++
 		res.Bytes += int64(v.End)
+		return true
+	}); err != nil {
+		return res, err
+	}
+	if cerr != nil {
+		return res, cerr
 	}
 	err = w.Close()
 	w = nil

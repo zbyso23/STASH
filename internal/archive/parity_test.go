@@ -40,7 +40,14 @@ func groupsOf(t testing.TB, fsys vfs.FS) (map[uint32][]*hopMember, *wire.Archive
 	if err := r.refresh(d); err != nil {
 		t.Fatal(err)
 	}
-	return d.groups, r.h
+	out := map[uint32][]*hopMember{}
+	if err := d.eachGroup(func(g uint32, ms []*hopMember) (bool, error) {
+		out[g] = ms
+		return true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return out, r.h
 }
 
 func blobFile(b int) string { n, _ := blob.Name(uint8(b)); return path.Join(GenDir(0), n) }

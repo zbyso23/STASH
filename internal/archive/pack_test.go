@@ -29,25 +29,14 @@ func frameKinds(t testing.TB, fsys vfs.FS) (map[wire.BlockType]int, []int) {
 	}
 	kinds := map[wire.BlockType]int{}
 	var packed []int
-	seen := map[*hopMember]bool{}
-	for _, ms := range d.groups {
-		for _, m := range ms {
-			if m.t.BlockType == wire.BlockParity {
-				kinds[wire.BlockParity]++
-			}
+	if err := d.each(func(m *hopMember) (bool, error) {
+		kinds[m.t.BlockType]++
+		if m.t.BlockType == wire.BlockPacked {
+			packed = append(packed, len(m.entries))
 		}
-	}
-	for _, ms := range d.byHash {
-		for _, m := range ms {
-			if seen[m] {
-				continue
-			}
-			seen[m] = true
-			kinds[m.t.BlockType]++
-			if m.t.BlockType == wire.BlockPacked {
-				packed = append(packed, len(m.entries))
-			}
-		}
+		return true, nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 	return kinds, packed
 }

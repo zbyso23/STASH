@@ -175,7 +175,11 @@ func New(cfg Config) *Table {
 	if cfg.Scratch != nil {
 		want := cfg.MemLimit
 		if want <= 0 {
+			// several tables live at once: each takes a small share
 			want = defaultMem
+			if l := cfg.Budget.Limit(); l > 0 {
+				want = max(min(defaultMem, l/32), 1<<20)
+			}
 		}
 		t.res = cfg.Budget.TryReserve(min(want, 1<<20), want)
 		t.memMax = min(want, 1<<20)

@@ -5,19 +5,24 @@
 package recovery
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 	"path"
 	"slices"
 	"sort"
-	"strings"
 	"sync"
+	"sync/atomic"
 
 	"stash/internal/archive"
 	"stash/internal/blob"
 	"stash/internal/bufpool"
 	"stash/internal/frame"
+	"stash/internal/kvtab"
 	"stash/internal/manifest"
+	"stash/internal/membudget"
 	"stash/internal/parity"
 	"stash/internal/seal"
 	"stash/internal/vfs"
@@ -40,7 +45,18 @@ type Options struct {
 	// keyless (§15.10): frames are validated structurally, DATA extents
 	// are grouped by their opaque object_id, nothing can be extracted.
 	Key []byte
+	// WorkDir is where the scan keeps its working tables (what it found,
+	// sorted; never inside the archive, which recovery does not write).
+	// A private directory is created below it and removed by Close. Empty
+	// means os.TempDir(). When it cannot be created, Scan fails with
+	// ErrWorkDir.
+	WorkDir string
+	// MemoryLimit bounds the scan's working memory (0: 1 GiB).
+	MemoryLimit int64
 }
+
+// ErrWorkDir reports a work directory that cannot be used.
+var ErrWorkDir = errors.New("recovery: work directory unavailable")
 
 // Source tells where an extent's frame came from.
 type Source int
@@ -65,10 +81,14 @@ type Range struct{ Offset, Length uint64 }
 type Extent struct {
 	Offset, Length uint64
 	Source         Source
-	// Blob and FrameOffset locate the frame (FrameOffset -1 when rebuilt).
+	// Blob and FrameOffset locate the frame (-1 and -1 when rebuilt).
 	Blob        int
 	FrameOffset int64
-	fr          *frameRec
+	// the frame, to read it again
+	hash      [wire.HashSize]byte
+	group     uint32
+	index     uint8
+	candidate bool
 }
 
 // Version is one recovered object version (path, file_ver). Raw recovery
@@ -117,8 +137,12 @@ type BlobReport struct {
 	Frames     int
 	Candidates int
 	Conflicts  int
-	Damaged    []blob.Region
-	Unscanned  []blob.Region
+	// Damaged lists the first blob.MaxRegions damaged regions;
+	// DamagedRegions and DamagedBytes count all.
+	Damaged        []blob.Region
+	DamagedRegions int
+	DamagedBytes   int64
+	Unscanned      []blob.Region
 }
 
 // GroupReport counts parity groups (§11.6, §13.9 classification).
@@ -145,7 +169,8 @@ type ManifestReport struct {
 	Records int
 }
 
-// Report is the result of Scan.
+// Report is the result of Scan. The versions themselves are streamed by
+// Recovery.All and Recovery.Default.
 type Report struct {
 	Header        *wire.ArchiveHeader
 	Generation    uint64
@@ -154,7 +179,8 @@ type Report struct {
 	Blobs         []BlobReport
 	Groups        GroupReport
 	Manifest      ManifestReport
-	Versions      []*Version // by path, then file_ver (opaque ones first)
+	// NVersions counts the versions found.
+	NVersions int
 	// Keyless is set for an encrypted archive scanned without the DEK;
 	// OpaquePacked counts PACKED frames whose objects stay unknown.
 	Keyless      bool
@@ -173,6 +199,15 @@ type frameRec struct {
 }
 
 // Recovery holds an open scan; Extract reads data through it.
+//
+// What the scan found lives in a sorted table in the work directory
+// (kvtab, MAC-protected), not in memory:
+//
+//	'F' blob off         → a frame found by the scan
+//	'G' group_id blob off → a member of a usable parity group
+//	'E' version offset source → an extent (sorted: versions stream in
+//	                       path, file_ver, object_id order)
+//	'C' path 0 file_ver  → length of a version a manifest record commits
 type Recovery struct {
 	Report
 	fsys    vfs.FS
@@ -181,7 +216,10 @@ type Recovery struct {
 	key     []byte
 	pool    *bufpool.Pool
 	readers []*blob.Reader
-	groups  map[uint32][]*frameRec
+	work    string
+	cache   *kvtab.Cache
+	tab     *kvtab.Table
+	st      *manifest.State // the surviving manifest (Current), when loaded
 
 	cacheMu  sync.Mutex
 	cacheG   uint32
@@ -189,7 +227,7 @@ type Recovery struct {
 }
 
 // Scan recovers the versions of one generation.
-func Scan(fsys vfs.FS, opt Options) (*Recovery, error) {
+func Scan(fsys vfs.FS, opt Options) (rc *Recovery, err error) {
 	if opt.Pool == nil {
 		opt.Pool = bufpool.Default
 	}
@@ -207,9 +245,28 @@ func Scan(fsys vfs.FS, opt Options) (*Recovery, error) {
 	if err != nil {
 		return nil, err
 	}
+	work, err := os.MkdirTemp(opt.WorkDir, "stash-recovery-")
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrWorkDir, err)
+	}
+	limit := opt.MemoryLimit
+	if limit <= 0 {
+		limit = 1 << 30
+	}
+	budget := membudget.New(limit)
+	cache := kvtab.NewCache(budget, limit/8)
+	scratch := func() (vfs.FS, string, error) { return vfs.OS{Root: work}, "kv", nil }
+	env := &manifest.Env{Budget: budget, Cache: cache, Scratch: scratch, MemLimit: testKVMem, SortMemory: testKVMem}
 	rep.Header, rep.Generation = h, gen
 	rep.Keyless = h.Encrypted() && k == nil
-	rc := &Recovery{fsys: fsys, h: h, k: k, key: opt.Key, pool: opt.Pool, readers: make([]*blob.Reader, h.BlobCount), groups: map[uint32][]*frameRec{}}
+	rc = &Recovery{fsys: fsys, h: h, k: k, key: opt.Key, pool: opt.Pool, readers: make([]*blob.Reader, h.BlobCount),
+		work: work, cache: cache, tab: kvtab.New(kvtab.Config{Budget: budget, Cache: cache, Scratch: scratch, MemLimit: testKVMem})}
+	defer func() {
+		if err != nil {
+			rc.Close()
+			rc = nil
+		}
+	}()
 	rep.Blobs = make([]BlobReport, h.BlobCount)
 	results := make([]blob.ResyncResult, h.BlobCount)
 	errs := make([]error, h.BlobCount)
@@ -226,13 +283,19 @@ func Scan(fsys vfs.FS, opt Options) (*Recovery, error) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results[b], errs[b] = r.Resync(opt.Budget)
+			// frames go straight into the table, in offset order
+			results[b], errs[b] = r.ResyncEach(opt.Budget, func(f blob.ResyncFrame) error {
+				return rc.putFrame(&frameRec{blob: b, off: f.Offset, quanta: f.Trailer.FrameQuanta, t: f.Trailer,
+					entries: f.Entries, candidate: f.Candidate, conflict: f.Conflict})
+			})
 		}()
 	}
 	wg.Wait()
-	var frames []*frameRec
 	for b, res := range results {
 		if errs[b] != nil {
+			if !wire.IsFormatError(errs[b]) && errors.Is(errs[b], kvtab.ErrTampered) {
+				return nil, errs[b]
+			}
 			rep.Blobs[b].Err = errs[b]
 			continue
 		}
@@ -240,17 +303,19 @@ func Scan(fsys vfs.FS, opt Options) (*Recovery, error) {
 			continue
 		}
 		br := &rep.Blobs[b]
-		br.Size, br.Frames, br.Candidates, br.Conflicts = res.Size, len(res.Frames), res.Candidates, res.Conflicts
-		br.Damaged, br.Unscanned = res.Damaged, res.Unscanned
-		for _, f := range res.Frames {
-			frames = append(frames, &frameRec{blob: b, off: f.Offset, quanta: f.Trailer.FrameQuanta, t: f.Trailer,
-				entries: f.Entries, candidate: f.Candidate, conflict: f.Conflict})
-		}
+		br.Size, br.Frames, br.Candidates, br.Conflicts = res.Size, res.NFrames, res.Candidates, res.Conflicts
+		br.Damaged, br.DamagedRegions, br.DamagedBytes, br.Unscanned = res.Damaged, res.DamagedRegions, res.DamagedBytes, res.Unscanned
 	}
 	rc.Report = rep
-	frames = append(frames, rc.rebuildGroups(frames)...)
-	committed, current := rc.readManifest(genDir, opt)
-	rc.Versions, rc.OpaquePacked = assemble(frames, committed, current, rep.Keyless)
+	if err := rc.rebuildGroups(); err != nil {
+		return nil, err
+	}
+	if err := rc.readManifest(genDir, opt, env); err != nil {
+		return nil, err
+	}
+	if err := rc.assemble(); err != nil {
+		return nil, err
+	}
 	return rc, nil
 }
 
@@ -275,14 +340,154 @@ func pickGeneration(fsys vfs.FS, opt Options, rep *Report) (uint64, error) {
 	return slices.Max(gens), nil
 }
 
-// Close releases the blob files.
+// Close releases the blob files and removes the work directory.
 func (rc *Recovery) Close() error {
 	for _, r := range rc.readers {
 		if r != nil {
 			r.Close()
 		}
 	}
+	if rc.st != nil {
+		rc.st.Close()
+		rc.st = nil
+	}
+	if rc.tab != nil {
+		rc.tab.Close()
+		rc.cache.Close()
+		rc.tab = nil
+	}
+	if rc.work != "" {
+		err := os.RemoveAll(rc.work)
+		rc.work = ""
+		return err
+	}
 	return nil
+}
+
+// testKVMem overrides the in-memory table delta (tests force spills).
+var testKVMem int64
+
+// ---- the frame table
+
+func frameKey(b int, off int64) []byte {
+	return binary.BigEndian.AppendUint64([]byte{'F', byte(b)}, uint64(off))
+}
+
+func encodeFrame(f *frameRec) ([]byte, error) {
+	v := binary.BigEndian.AppendUint32(nil, f.quanta)
+	v, err := f.t.AppendBinary(v)
+	if err != nil {
+		return nil, err
+	}
+	var flags byte
+	if f.candidate {
+		flags |= 1
+	}
+	if f.conflict {
+		flags |= 2
+	}
+	if f.entries != nil {
+		flags |= 4
+	}
+	v = append(v, flags)
+	if f.entries != nil {
+		if v, err = wire.AppendEntries(v, f.entries); err != nil {
+			return nil, err
+		}
+	}
+	return v, nil
+}
+
+func decodeFrame(b int, off int64, v []byte) (*frameRec, error) {
+	if len(v) < 4+wire.MasterTrailerSize+1 {
+		return nil, kvtab.ErrTampered
+	}
+	f := &frameRec{blob: b, off: off, quanta: binary.BigEndian.Uint32(v)}
+	var err error
+	if f.t, err = wire.DecodeMasterTrailer(v[4 : 4+wire.MasterTrailerSize]); err != nil {
+		return nil, kvtab.ErrTampered
+	}
+	flags := v[4+wire.MasterTrailerSize]
+	f.candidate, f.conflict = flags&1 != 0, flags&2 != 0
+	if flags&4 != 0 {
+		if f.entries, err = wire.DecodeEntries(v[5+wire.MasterTrailerSize:]); err != nil {
+			return nil, kvtab.ErrTampered
+		}
+	}
+	return f, nil
+}
+
+// putFrame records a frame found by the scan. A PACKED frame's entry list
+// can exceed what one table value holds; it is then read again from the
+// blob when needed (flag 8, no entries stored).
+func (rc *Recovery) putFrame(f *frameRec) error {
+	v, err := encodeFrame(f)
+	if err != nil {
+		return err
+	}
+	if len(v) > kvtab.MaxValue {
+		g := *f
+		g.entries = nil
+		if v, err = encodeFrame(&g); err != nil {
+			return err
+		}
+		v[4+wire.MasterTrailerSize] |= 8
+	}
+	if err := rc.tab.Put(frameKey(f.blob, f.off), v); err != nil {
+		return err
+	}
+	if g := f.t.GroupID; g != 0 && !f.conflict {
+		k := binary.BigEndian.AppendUint32([]byte{'G'}, g)
+		k = append(k, byte(f.blob))
+		return rc.tab.Put(binary.BigEndian.AppendUint64(k, uint64(f.off)), nil)
+	}
+	return nil
+}
+
+func (rc *Recovery) frame(b int, off int64) (*frameRec, error) {
+	v, ok, err := rc.tab.Get(frameKey(b, off))
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, kvtab.ErrTampered
+	}
+	f, err := decodeFrame(b, off, v)
+	if err != nil {
+		return nil, err
+	}
+	if v[4+wire.MasterTrailerSize]&8 != 0 {
+		ref, err := rc.readers[b].ReadFrame(off)
+		if err != nil {
+			return nil, err
+		}
+		f.entries = append([]wire.Entry(nil), ref.Entries...)
+		ref.Release()
+	}
+	return f, nil
+}
+
+// group returns the members of group g (at most 257: more repeat an index).
+func (rc *Recovery) group(g uint32) ([]*frameRec, error) {
+	pfx := binary.BigEndian.AppendUint32([]byte{'G'}, g)
+	it := rc.tab.Iter(pfx)
+	defer it.Close()
+	var ms []*frameRec
+	for it.Next() && len(ms) < 257 {
+		k := it.Key()
+		if !bytes.HasPrefix(k, pfx) {
+			break
+		}
+		if len(k) != len(pfx)+9 {
+			return nil, kvtab.ErrTampered
+		}
+		f, err := rc.frame(int(k[5]), int64(binary.BigEndian.Uint64(k[6:])))
+		if err != nil {
+			return nil, err
+		}
+		ms = append(ms, f)
+	}
+	return ms, it.Err()
 }
 
 // usable applies §7: equal group_k, group_m and frame_quanta, no repeated
@@ -298,71 +503,136 @@ func usable(ms []*frameRec) bool {
 	return true
 }
 
-// rebuildGroups groups frames by frame-local metadata (§11.6) and
-// reconstructs missing DATA/PACKED members; it returns the rebuilt frames.
-func (rc *Recovery) rebuildGroups(frames []*frameRec) []*frameRec {
-	for _, f := range frames {
-		if f.t.GroupID != 0 && !f.conflict {
-			rc.groups[f.t.GroupID] = append(rc.groups[f.t.GroupID], f)
-		}
-	}
+// rebuildGroups classifies the groups by frame-local metadata (§11.6) and
+// reconstructs missing DATA/PACKED members; the rebuilt frames' extents
+// join the others. Groups are visited in id order, one at a time.
+func (rc *Recovery) rebuildGroups() error {
 	gr := &rc.Groups
-	var out []*frameRec
-	ids := make([]uint32, 0, len(rc.groups))
-	for g := range rc.groups {
-		ids = append(ids, g)
+	var ids []uint32
+	flush := func() error {
+		for _, g := range ids {
+			if err := rc.classify(g, gr); err != nil {
+				return err
+			}
+		}
+		ids = ids[:0]
+		return nil
 	}
-	slices.Sort(ids)
-	for _, g := range ids {
-		ms := rc.groups[g]
-		gr.Total++
-		if !usable(ms) {
-			gr.Conflicting++
-			delete(rc.groups, g)
-			continue
-		}
-		k, m := int(ms[0].t.GroupK), int(ms[0].t.GroupM)
-		if len(ms) == k+m {
-			gr.Intact++
-			continue
-		}
-		rebuilt, err := rc.rebuild(g)
-		if err != nil || rebuilt == nil {
-			missingData := false
-			have := map[uint8]bool{}
-			for _, f := range ms {
-				have[f.t.GroupIndex] = true
+	// collect ids in batches (the group table is read while extents are
+	// added to the same table, so the iteration is not held across it)
+	last, started := uint32(0), false
+	for {
+		start := []byte{'G'}
+		if started {
+			start = binary.BigEndian.AppendUint32([]byte{'G'}, last+1)
+			if last == ^uint32(0) {
+				return nil
 			}
-			for i := 0; i < k; i++ {
-				missingData = missingData || !have[uint8(i)]
-			}
-			if missingData {
-				gr.Unrecoverable++
-			} else {
-				gr.Degraded++
-			}
-			continue
 		}
-		gr.Degraded++
-		cand := false
+		it := rc.tab.Iter(start)
+		for it.Next() && len(ids) < 4096 {
+			k := it.Key()
+			if k[0] != 'G' {
+				break
+			}
+			if len(k) != 14 {
+				it.Close()
+				return kvtab.ErrTampered
+			}
+			g := binary.BigEndian.Uint32(k[1:])
+			if len(ids) == 0 || ids[len(ids)-1] != g {
+				ids = append(ids, g)
+			}
+		}
+		err := it.Err()
+		it.Close()
+		if err != nil {
+			return err
+		}
+		if len(ids) == 0 {
+			return nil
+		}
+		last, started = ids[len(ids)-1], true
+		if err := flush(); err != nil {
+			return err
+		}
+	}
+}
+
+func (rc *Recovery) classify(g uint32, gr *GroupReport) error {
+	ms, err := rc.group(g)
+	if err != nil {
+		return err
+	}
+	gr.Total++
+	if !usable(ms) {
+		gr.Conflicting++
+		return rc.dropGroup(g)
+	}
+	k, m := int(ms[0].t.GroupK), int(ms[0].t.GroupM)
+	if len(ms) == k+m {
+		gr.Intact++
+		return nil
+	}
+	rebuilt, err := rc.rebuildFrom(g, ms)
+	if err != nil || rebuilt == nil {
+		missingData := false
+		have := map[uint8]bool{}
 		for _, f := range ms {
-			cand = cand || f.candidate
+			have[f.t.GroupIndex] = true
 		}
-		for i, buf := range rebuilt {
-			fr, err := frame.ParseKeyed(buf, rc.h, rc.k)
-			if err != nil {
-				continue
-			}
-			rec := &frameRec{blob: -1, off: -1, quanta: fr.Prefix.FrameQuanta, t: fr.Trailer, candidate: cand,
-				entries: append([]wire.Entry(nil), fr.Entries...)}
-			if rec.t.GroupID != g || rec.t.GroupIndex != i {
-				continue
-			}
-			out = append(out, rec)
-			gr.RebuiltFrames++
+		for i := 0; i < k; i++ {
+			missingData = missingData || !have[uint8(i)]
+		}
+		if missingData {
+			gr.Unrecoverable++
+		} else {
+			gr.Degraded++
+		}
+		return nil
+	}
+	gr.Degraded++
+	cand := false
+	for _, f := range ms {
+		cand = cand || f.candidate
+	}
+	for i := 0; i < k; i++ {
+		buf := rebuilt[uint8(i)]
+		if buf == nil {
+			continue
+		}
+		fr, err := frame.ParseKeyed(buf, rc.h, rc.k)
+		if err != nil {
+			continue
+		}
+		rec := &frameRec{blob: -1, off: -1, quanta: fr.Prefix.FrameQuanta, t: fr.Trailer, candidate: cand, entries: fr.Entries}
+		if rec.t.GroupID != g || int(rec.t.GroupIndex) != i {
+			continue
+		}
+		if err := rc.addExtents(rec); err != nil {
+			return err
+		}
+		gr.RebuiltFrames++
+	}
+	return nil
+}
+
+// dropGroup removes a conflicting group's membership (its frames stay).
+func (rc *Recovery) dropGroup(g uint32) error {
+	pfx := binary.BigEndian.AppendUint32([]byte{'G'}, g)
+	var keys [][]byte
+	it := rc.tab.Iter(pfx)
+	for it.Next() && bytes.HasPrefix(it.Key(), pfx) {
+		keys = append(keys, bytes.Clone(it.Key()))
+	}
+	err := it.Err()
+	it.Close()
+	for _, k := range keys {
+		if err == nil {
+			err = rc.tab.Delete(k)
 		}
 	}
-	return out
+	return err
 }
 
 // rebuild reconstructs the missing DATA/PACKED members of group g and
@@ -370,12 +640,19 @@ func (rc *Recovery) rebuildGroups(frames []*frameRec) []*frameRec {
 // when nothing is missing or too few members survive. Results of the last
 // group are cached for Extract.
 func (rc *Recovery) rebuild(g uint32) (map[uint8][]byte, error) {
+	ms, err := rc.group(g)
+	if err != nil || len(ms) == 0 || !usable(ms) {
+		return nil, err
+	}
+	return rc.rebuildFrom(g, ms)
+}
+
+func (rc *Recovery) rebuildFrom(g uint32, ms []*frameRec) (map[uint8][]byte, error) {
 	rc.cacheMu.Lock()
 	defer rc.cacheMu.Unlock()
 	if rc.cacheBuf != nil && rc.cacheG == g {
 		return rc.cacheBuf, nil
 	}
-	ms := rc.groups[g]
 	if len(ms) == 0 {
 		return nil, nil
 	}
@@ -430,33 +707,38 @@ func (rc *Recovery) rebuild(g uint32) (map[uint8][]byte, error) {
 	return out, nil
 }
 
-type verKey struct {
-	path string
-	ver  uint64
-	oid  [16]byte // keyless encrypted recovery only
+// ---- manifest labels
+
+func committedKey(p string, ver uint64) []byte {
+	k := append([]byte{'C'}, p...)
+	k = append(k, 0)
+	return binary.BigEndian.AppendUint64(k, ver)
 }
 
-// readManifest collects the versions that surviving records reference and
-// their lengths, and the live versions when the whole graph loads.
-func (rc *Recovery) readManifest(genDir string, opt Options) (map[verKey]uint64, map[verKey]bool) {
-	committed := map[verKey]uint64{}
+// readManifest records the versions that surviving records reference with
+// their lengths ('C'), and keeps the loaded state for the live versions
+// when the whole graph loads. Open transactions are tracked in the table
+// too ('T'), so nothing per record stays in memory.
+func (rc *Recovery) readManifest(genDir string, opt Options, env *manifest.Env) error {
 	if opt.NoManifest {
-		return committed, nil
+		return nil
 	}
 	if rc.h.Encrypted() && rc.k == nil {
 		rc.Manifest.Err = archive.ErrKeyRequired
-		return committed, nil
+		return nil
 	}
-	type txInfo struct {
-		k   verKey
-		len uint64
-	}
-	txs := map[manifest.TxID]*txInfo{}
 	var crypto *manifest.Crypto
 	if rc.k != nil {
 		crypto = &manifest.Crypto{Keys: rc.k, GenerationID: rc.h.GenerationID}
 	}
-	st, _, err := manifest.LoadWith(rc.fsys, genDir, rc.h, manifest.LoadOptions{Crypto: crypto}, func(r *manifest.Record, _ int) {
+	var terr error
+	put := func(k, v []byte) {
+		if terr == nil {
+			terr = rc.tab.Put(k, v)
+		}
+	}
+	txKey := func(id manifest.TxID) []byte { return append([]byte{'T'}, id[:]...) }
+	st, _, err := manifest.LoadWith(rc.fsys, genDir, rc.h, manifest.LoadOptions{Crypto: crypto, Env: env}, func(r *manifest.Record, _ int) {
 		rc.Manifest.Records++
 		switch r.Op {
 		case manifest.OpAdd:
@@ -464,121 +746,293 @@ func (rc *Recovery) readManifest(genDir string, opt Options) (map[verKey]uint64,
 			for _, l := range r.Loc {
 				n += l.Length
 			}
-			committed[verKey{path: r.Path, ver: r.FileVer}] = n
+			put(committedKey(r.Path, r.FileVer), binary.BigEndian.AppendUint64(nil, n))
 		case manifest.OpAddBegin:
-			txs[r.TxID] = &txInfo{k: verKey{path: r.Path, ver: r.FileVer}}
+			put(txKey(r.TxID), binary.BigEndian.AppendUint64(committedKey(r.Path, r.FileVer), 0))
 		case manifest.OpAddExtent:
-			if t := txs[r.TxID]; t != nil {
+			if v, ok, err := rc.tab.Get(txKey(r.TxID)); err != nil {
+				terr = err
+			} else if ok && len(v) >= 8 {
+				n := binary.BigEndian.Uint64(v[len(v)-8:])
 				for _, l := range r.Loc {
-					t.len += l.Length
+					n += l.Length
 				}
+				put(txKey(r.TxID), binary.BigEndian.AppendUint64(v[:len(v)-8], n))
 			}
 		case manifest.OpAddCommit:
-			if t := txs[r.TxID]; t != nil {
-				committed[t.k] = t.len
+			if v, ok, err := rc.tab.Get(txKey(r.TxID)); err != nil {
+				terr = err
+			} else if ok && len(v) >= 8 {
+				put(v[:len(v)-8], v[len(v)-8:])
 			}
 		}
 	})
+	if terr != nil {
+		if st != nil {
+			st.Close()
+		}
+		return terr
+	}
 	if err != nil {
 		rc.Manifest.Err = err
-		return committed, nil
+		return nil
 	}
 	rc.Manifest.Loaded = true
-	defer st.Close()
-	current := map[verKey]bool{}
-	if err := st.Walk("", "", func(p string, v *manifest.Version) bool {
-		current[verKey{path: p, ver: v.FileVer}] = true
-		return true
-	}); err != nil {
-		rc.Manifest.Loaded, rc.Manifest.Err = false, err
-		return committed, nil
-	}
-	return committed, current
+	rc.st = st
+	return nil
 }
 
-// assemble builds versions from frame entries (§11.4, §11.5).
-func assemble(frames []*frameRec, committed map[verKey]uint64, current map[verKey]bool, keyless bool) ([]*Version, int) {
-	vs := map[verKey]*Version{}
-	get := func(k verKey) *Version {
-		v := vs[k]
-		if v == nil {
-			v = &Version{Path: k.path, FileVer: k.ver, ObjectID: k.oid}
-			vs[k] = v
-		}
-		return v
+// ---- versions
+
+// extent record key: path 0 file_ver object_id | offset source; the value
+// locates the frame and carries its flags
+func versionPrefix(p string, ver uint64, oid [16]byte) []byte {
+	k := append([]byte{'E'}, p...)
+	k = append(k, 0)
+	k = binary.BigEndian.AppendUint64(k, ver)
+	return append(k, oid[:]...)
+}
+
+const (
+	extConflict = 1 << iota // the version has a conflicting frame (no extent)
+	extPacked
+	extData
+	extOpaque
+	extCandidate
+)
+
+var extSeq uint64 // distinguishes equal (offset, source) records
+
+func (rc *Recovery) putExtent(p string, ver uint64, oid [16]byte, off uint64, src Source, flags byte, length uint64, f *frameRec) error {
+	k := versionPrefix(p, ver, oid)
+	k = binary.BigEndian.AppendUint64(k, off)
+	k = append(k, byte(src))
+	k = binary.BigEndian.AppendUint64(k, atomicAdd(&extSeq))
+	v := []byte{flags}
+	v = binary.BigEndian.AppendUint64(v, length)
+	v = append(v, byte(f.blob+1))
+	v = binary.BigEndian.AppendUint64(v, uint64(f.off))
+	v = append(v, f.t.HashPayload[:]...)
+	v = binary.BigEndian.AppendUint32(v, f.t.GroupID)
+	return rc.tab.Put(k, append(v, f.t.GroupIndex))
+}
+
+// addExtents records the extents a frame contributes (§11.4, §11.5).
+func (rc *Recovery) addExtents(f *frameRec) error {
+	keyless := rc.Keyless
+	if keyless && f.t.BlockType == wire.BlockPacked {
+		rc.OpaquePacked++
+		return nil
 	}
-	opaquePacked := 0
-	for _, f := range frames {
-		if keyless && f.t.BlockType == wire.BlockPacked {
-			opaquePacked++
-			continue
+	src := Scanned
+	switch {
+	case f.off < 0:
+		src = Rebuilt
+	case f.candidate:
+		src = Resynced
+	}
+	var cand byte
+	if f.candidate {
+		cand = extCandidate
+	}
+	if keyless && f.t.BlockType == wire.BlockData {
+		// the object_id is an opaque grouping key without the key
+		if f.conflict {
+			return rc.putExtent("", 0, f.t.ObjectID, 0, src, extOpaque|extConflict, 0, f)
 		}
-		if keyless && f.t.BlockType == wire.BlockData {
-			// the object_id is an opaque grouping key without the key
-			v := get(verKey{oid: f.t.ObjectID})
-			v.Opaque = true
-			if f.conflict {
-				v.Conflict = true
-				continue
-			}
-			src := Scanned
-			switch {
-			case f.off < 0:
-				src = Rebuilt
-			case f.candidate:
-				src = Resynced
-			}
-			v.Extents = append(v.Extents, Extent{Offset: f.t.LogicalOffset, Length: f.t.LogicalLength, Source: src, Blob: f.blob, FrameOffset: f.off, fr: f})
-			continue
-		}
-		src := Scanned
+		return rc.putExtent("", 0, f.t.ObjectID, f.t.LogicalOffset, src, extOpaque|extData|cand, f.t.LogicalLength, f)
+	}
+	for _, e := range f.entries {
 		switch {
-		case f.off < 0:
-			src = Rebuilt
-		case f.candidate:
-			src = Resynced
+		case f.conflict:
+			if err := rc.putExtent(e.Path, e.FileVer, [16]byte{}, 0, src, extConflict, 0, f); err != nil {
+				return err
+			}
+		case f.t.BlockType == wire.BlockPacked:
+			if err := rc.putExtent(e.Path, e.FileVer, [16]byte{}, 0, src, extPacked|cand, e.Length, f); err != nil {
+				return err
+			}
+		case f.t.BlockType == wire.BlockData:
+			if err := rc.putExtent(e.Path, e.FileVer, [16]byte{}, e.Offset, src, extData|cand, e.Length, f); err != nil {
+				return err
+			}
 		}
-		for _, e := range f.entries {
-			v := get(verKey{path: e.Path, ver: e.FileVer})
-			if f.conflict {
+	}
+	return nil
+}
+
+// assemble turns every scanned frame into extent records and counts the
+// versions.
+func (rc *Recovery) assemble() error {
+	it := rc.tab.Iter([]byte{'F'})
+	var batch []*frameRec
+	flush := func() error {
+		for _, f := range batch {
+			if err := rc.addExtents(f); err != nil {
+				return err
+			}
+		}
+		batch = batch[:0]
+		return nil
+	}
+	// frames are read in batches, then their extents written (writing
+	// while iterating the same table is allowed, but batches keep the
+	// iterator short-lived)
+	var next []byte
+	for {
+		if next != nil {
+			it = rc.tab.Iter(next)
+		}
+		for it.Next() && len(batch) < 1024 {
+			k := it.Key()
+			if k[0] != 'F' {
+				break
+			}
+			if len(k) != 10 {
+				it.Close()
+				return kvtab.ErrTampered
+			}
+			f, err := rc.frame(int(k[1]), int64(binary.BigEndian.Uint64(k[2:])))
+			if err != nil {
+				it.Close()
+				return err
+			}
+			batch = append(batch, f)
+			next = append(bytes.Clone(k), 0)
+		}
+		err := it.Err()
+		it.Close()
+		if err != nil {
+			return err
+		}
+		if len(batch) == 0 {
+			break
+		}
+		if err := flush(); err != nil {
+			return err
+		}
+	}
+	return rc.All()(func(*Version) bool { rc.NVersions++; return true })
+}
+
+// Selection streams versions to fn until it returns false.
+type Selection func(fn func(*Version) bool) error
+
+// Select is a selection of the given versions.
+func Select(vs ...*Version) Selection {
+	return func(fn func(*Version) bool) error {
+		for _, v := range vs {
+			if !fn(v) {
+				break
+			}
+		}
+		return nil
+	}
+}
+
+// All streams every version found, by path, then file_ver (opaque ones
+// first, by object_id). Only the version being visited is in memory.
+func (rc *Recovery) All() Selection {
+	return func(fn func(*Version) bool) error {
+		it := rc.tab.Iter([]byte{'E'})
+		defer it.Close()
+		var cur []byte
+		var v *Version
+		emit := func() (bool, error) {
+			if v == nil {
+				return true, nil
+			}
+			if err := rc.label(v); err != nil {
+				return false, err
+			}
+			finish(v)
+			more := fn(v)
+			v = nil
+			return more, nil
+		}
+		for it.Next() {
+			k, val := it.Key(), it.Value()
+			if k[0] != 'E' {
+				break
+			}
+			i := bytes.IndexByte(k, 0)
+			if i < 0 || len(k) != i+1+8+16+8+1+8 || len(val) != 1+8+1+8+32+4+1 {
+				return kvtab.ErrTampered
+			}
+			vk := k[:i+1+8+16]
+			if v == nil || !bytes.Equal(vk, cur) {
+				if more, err := emit(); err != nil || !more {
+					return err
+				}
+				cur = append(cur[:0], vk...)
+				v = &Version{Path: string(k[1:i]), FileVer: binary.BigEndian.Uint64(k[i+1:]), ObjectID: [16]byte(k[i+9 : i+25])}
+			}
+			flags := val[0]
+			if flags&extOpaque != 0 {
+				v.Opaque = true
+			}
+			if flags&extConflict != 0 {
 				v.Conflict = true
 				continue
 			}
-			ext := Extent{Offset: e.Offset, Length: e.Length, Source: src, Blob: f.blob, FrameOffset: f.off, fr: f}
-			switch f.t.BlockType {
-			case wire.BlockPacked:
+			rest := k[i+25:]
+			e := Extent{Offset: binary.BigEndian.Uint64(rest), Source: Source(rest[8]), Length: binary.BigEndian.Uint64(val[1:]),
+				Blob: int(val[9]) - 1, FrameOffset: int64(binary.BigEndian.Uint64(val[10:])), hash: [32]byte(val[18:50]),
+				group: binary.BigEndian.Uint32(val[50:]), index: val[54], candidate: flags&extCandidate != 0}
+			switch {
+			case flags&extPacked != 0:
 				if len(v.Extents) > 0 && !v.Packed {
 					v.Conflict = true
 				}
 				v.Packed = true
-				ext.Offset = 0
-			case wire.BlockData:
+			case flags&extData != 0 && !v.Opaque:
 				if v.Packed {
 					v.Conflict = true
 				}
 			}
-			v.Extents = append(v.Extents, ext)
+			v.Extents = append(v.Extents, e)
 		}
+		if err := it.Err(); err != nil {
+			return err
+		}
+		_, err := emit()
+		return err
 	}
-	out := make([]*Version, 0, len(vs))
-	for k, v := range vs {
-		if n, ok := committed[k]; ok {
-			v.Committed, v.LengthKnown, v.Length = true, true, n
-		}
-		v.Current = current[k]
-		finish(v)
-		out = append(out, v)
+}
+
+// label adds what the manifest says about a version.
+func (rc *Recovery) label(v *Version) error {
+	if v.Opaque {
+		return nil
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if c := strings.Compare(out[i].Path, out[j].Path); c != 0 {
-			return c < 0
+	b, ok, err := rc.tab.Get(committedKey(v.Path, v.FileVer))
+	if err != nil {
+		return err
+	}
+	if ok && len(b) == 8 {
+		v.Committed, v.LengthKnown, v.Length = true, true, binary.BigEndian.Uint64(b)
+	}
+	if rc.st != nil {
+		live, ok, err := rc.st.Lookup(v.Path)
+		if err != nil {
+			return err
 		}
-		if out[i].FileVer != out[j].FileVer {
-			return out[i].FileVer < out[j].FileVer
-		}
-		return string(out[i].ObjectID[:]) < string(out[j].ObjectID[:])
-	})
-	return out, opaquePacked
+		v.Current = ok && live.FileVer == v.FileVer
+	}
+	return nil
+}
+
+// Versions collects every version (memory grows with the result; All
+// streams them).
+func (rc *Recovery) Versions() ([]*Version, error) { return collect(rc.All()) }
+
+// DefaultSelection collects Default().
+func (rc *Recovery) DefaultSelection() ([]*Version, error) { return collect(rc.Default()) }
+
+func collect(s Selection) ([]*Version, error) {
+	var out []*Version
+	err := s(func(v *Version) bool { out = append(out, v); return true })
+	return out, err
 }
 
 // finish sorts extents, drops duplicates (preferring scanned over resynced
@@ -613,7 +1067,7 @@ func finish(v *Version) {
 			v.Gaps = append(v.Gaps, Range{at, e.Offset - at})
 		}
 		at = max(at, e.Offset+e.Length)
-		if e.Source != Scanned && (e.Source == Resynced || e.fr.candidate) && !v.Committed {
+		if e.Source != Scanned && (e.Source == Resynced || e.candidate) && !v.Committed {
 			v.Unverified = true
 		}
 	}
@@ -630,3 +1084,5 @@ func finish(v *Version) {
 // ErrIncompleteVersion reports an Extract of a version with gaps or
 // conflicts.
 var ErrIncompleteVersion = errors.New("version is not completely recoverable")
+
+func atomicAdd(p *uint64) uint64 { return atomic.AddUint64(p, 1) }

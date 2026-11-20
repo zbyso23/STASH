@@ -1,7 +1,9 @@
 package archive
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +15,7 @@ import (
 	"stash/internal/blob"
 	"stash/internal/frame"
 	"stash/internal/index"
+	"stash/internal/kvtab"
 	"stash/internal/manifest"
 	"stash/internal/parity"
 	"stash/internal/vfs"
@@ -73,11 +76,18 @@ type compactor struct {
 	groupFloor uint64
 	res        *CompactResult
 
+	// tab is the compaction's working table in scratch space (kvtab):
+	//
+	//	'S' path              → file_ver at the Mark (the snapshot)
+	//	'X' path / 'Y' path   → file_ver of a path changed / removed after it
+	//	'L' blob frame key    → an extent wanted and not yet copied
+	//	'D' path 0 ver off    → its destination loc
+	//	'd' blob off, 'g' gid → frames and groups handled
+	//	'q' gid               → groups holding a wanted entry
+	tab *kvtab.Table
+
 	mu         sync.Mutex
-	live       map[liveKey]bool // wanted and not yet copied
-	locs       map[verKey][]manifest.Loc
-	doneFrames map[[2]int64]bool
-	doneGroups map[uint32]bool
+	nlive      int // 'L' keys
 	maxOrd     []uint64
 	hasOrd     []bool
 	maxGroup   uint64
@@ -103,8 +113,16 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 	// Mark (§13.1): the live state at one point
 	w.genMu.RLock()
 	src := w.view
+	c := &compactor{src: src, res: &res, tab: kvtab.New(src.kv),
+		maxOrd: make([]uint64, src.h.BlobCount), hasOrd: make([]bool, src.h.BlobCount), regroup: map[uint32][]*frame.Spec{}}
+	defer c.tab.Close()
 	w.stateMu.RLock()
-	snap, err := liveOf(w.journal.State())
+	err = w.journal.State().Walk("", "", func(p string, v *manifest.Version) bool {
+		if err = c.tab.Put(append([]byte{'S'}, p...), binary.BigEndian.AppendUint64(nil, v.FileVer)); err == nil {
+			err = c.want(p, v)
+		}
+		return err == nil
+	})
 	w.stateMu.RUnlock()
 	if err != nil {
 		w.genMu.RUnlock()
@@ -153,78 +171,121 @@ func (w *Writer) Compact(ctx context.Context, opt CompactOptions) (res CompactRe
 			return res, err
 		}
 	}
-	c := &compactor{src: src, d: d, groupFloor: floor, res: &res,
-		live: map[liveKey]bool{}, locs: map[verKey][]manifest.Loc{}, doneFrames: map[[2]int64]bool{}, doneGroups: map[uint32]bool{},
-		maxOrd: make([]uint64, dh.BlobCount), hasOrd: make([]bool, dh.BlobCount), regroup: map[uint32][]*frame.Spec{}}
+	c.d, c.groupFloor = d, floor
 
 	// Sweep (§13.2): concurrent with writes to the source
-	if err := c.copyVersions(ctx, snap); err != nil {
+	if err := c.copyVersions(ctx); err != nil {
 		return res, err
 	}
-	paths := make([]string, 0, len(snap))
-	for p := range snap {
-		paths = append(paths, p)
-	}
-	slices.Sort(paths) // §13.2.1: one record per live path in bytewise order
-	for _, p := range paths {
-		if err := d.journal.Add(p, snap[p].FileVer, c.sortedLocs(p, snap[p])); err != nil {
-			return res, fmt.Errorf("destination record %s: %w", p, err)
+	// §13.2.1: one record per live path in bytewise order
+	if err := c.eachPath('S', func(p string, ver uint64) error {
+		locs, err := c.sortedLocs(p, ver)
+		if err == nil {
+			err = d.journal.Add(p, ver, locs)
 		}
+		if err != nil {
+			return fmt.Errorf("destination record %s: %w", p, err)
+		}
+		return nil
+	}); err != nil {
+		return res, err
 	}
 	if err := c.durable(); err != nil {
 		return res, err
 	}
-	if err := c.verify(ctx, paths, true); err != nil {
+	if err := c.verify(ctx, 'S', true); err != nil {
 		return res, err
 	}
 
 	// Freeze/Merge (§13.5): no commit against the old root from here on
 	w.genMu.Lock()
 	defer w.genMu.Unlock()
+	// the delta: a merge of the final state with the snapshot, both in
+	// path order
+	ndelta, ngone := 0, 0
+	snapIt := c.tab.Iter([]byte{'S'})
+	snapNext := func() (string, uint64, bool, error) {
+		if !snapIt.Next() {
+			return "", 0, false, snapIt.Err()
+		}
+		k := snapIt.Key()
+		if k[0] != 'S' {
+			return "", 0, false, nil
+		}
+		if len(snapIt.Value()) != 8 {
+			return "", 0, false, kvtab.ErrTampered
+		}
+		return string(k[1:]), binary.BigEndian.Uint64(snapIt.Value()), true, nil
+	}
+	sp, sver, sok, err := snapNext()
+	gone := func(p string, ver uint64) error {
+		ngone++
+		return c.tab.Put(append([]byte{'Y'}, p...), binary.BigEndian.AppendUint64(nil, ver))
+	}
 	w.stateMu.RLock()
-	final, err := liveOf(w.journal.State())
+	if err == nil {
+		err = w.journal.State().Walk("", "", func(p string, v *manifest.Version) bool {
+			res.Versions++
+			for err == nil && sok && sp < p {
+				if err = gone(sp, sver); err == nil {
+					sp, sver, sok, err = snapNext()
+				}
+			}
+			if err != nil {
+				return false
+			}
+			same := sok && sp == p && sver == v.FileVer
+			if sok && sp == p {
+				if sp, sver, sok, err = snapNext(); err != nil {
+					return false
+				}
+			}
+			if !same {
+				ndelta++
+				if err = c.tab.Put(append([]byte{'X'}, p...), binary.BigEndian.AppendUint64(nil, v.FileVer)); err == nil {
+					err = c.want(p, v)
+				}
+			}
+			return err == nil
+		})
+	}
+	for err == nil && sok {
+		if err = gone(sp, sver); err == nil {
+			sp, sver, sok, err = snapNext()
+		}
+	}
 	w.stateMu.RUnlock()
+	snapIt.Close()
 	if err != nil {
 		return res, err
 	}
-	delta := map[string]*manifest.Version{}
-	var deltaPaths, gone []string
-	for p, v := range final {
-		if s, ok := snap[p]; !ok || s.FileVer != v.FileVer {
-			delta[p] = v
-			deltaPaths = append(deltaPaths, p)
-		}
-	}
-	for p := range snap {
-		if _, ok := final[p]; !ok {
-			gone = append(gone, p)
-		}
-	}
-	slices.Sort(deltaPaths)
-	slices.Sort(gone)
-	res.Delta = len(deltaPaths) + len(gone)
-	if len(delta) > 0 {
-		if err := c.copyVersions(ctx, delta); err != nil {
+	res.Delta = ndelta + ngone
+	if ndelta > 0 {
+		if err := c.copyVersions(ctx); err != nil {
 			return res, err
 		}
 	}
-	for _, p := range gone {
-		if err := d.journal.Del(p, snap[p].FileVer); err != nil {
-			return res, err
-		}
+	if err := c.eachPath('Y', func(p string, ver uint64) error { return d.journal.Del(p, ver) }); err != nil {
+		return res, err
 	}
-	for _, p := range deltaPaths {
-		if err := d.journal.Add(p, delta[p].FileVer, c.sortedLocs(p, delta[p])); err != nil {
-			return res, fmt.Errorf("destination record %s: %w", p, err)
+	if err := c.eachPath('X', func(p string, ver uint64) error {
+		locs, err := c.sortedLocs(p, ver)
+		if err == nil {
+			err = d.journal.Add(p, ver, locs)
 		}
+		if err != nil {
+			return fmt.Errorf("destination record %s: %w", p, err)
+		}
+		return nil
+	}); err != nil {
+		return res, err
 	}
 	if err := c.durable(); err != nil {
 		return res, err
 	}
-	if err := c.verify(ctx, deltaPaths, false); err != nil {
+	if err := c.verify(ctx, 'X', false); err != nil {
 		return res, err
 	}
-	res.Versions = len(final)
 	res.SourceBytes, res.DestBytes = blobBytes(src), blobBytes(d.view)
 
 	// Switch (§13.6): HARDENED advances the anchor first (§13.6.1 steps
@@ -309,70 +370,108 @@ func keyOf(b uint8, hash [wire.HashSize]byte, e wire.Entry, bt wire.BlockType) l
 	return liveKey{b, blob.FrameKey{Hash: hash, Path: e.Path, FileVer: e.FileVer, Offset: off}}
 }
 
-// copyVersions copies the frames of vers into the destination.
-func (c *compactor) copyVersions(ctx context.Context, vers map[string]*manifest.Version) error {
+func liveKeyBytes(k liveKey) []byte {
+	b := append([]byte{'L', k.blob}, k.k.Hash[:]...)
+	b = append(b, k.k.Path...)
+	b = append(b, 0)
+	b = binary.BigEndian.AppendUint64(b, k.k.FileVer)
+	return binary.BigEndian.AppendUint64(b, k.k.Offset)
+}
+
+func parseLiveKey(b []byte) (liveKey, bool) {
+	if len(b) < 2+32+1+16 || b[0] != 'L' {
+		return liveKey{}, false
+	}
+	k := liveKey{blob: b[1]}
+	k.k.Hash = [32]byte(b[2:34])
+	rest := b[34:]
+	i := bytes.IndexByte(rest, 0)
+	if i < 0 || len(rest)-i-1 != 16 {
+		return liveKey{}, false
+	}
+	k.k.Path = string(rest[:i])
+	k.k.FileVer = binary.BigEndian.Uint64(rest[i+1:])
+	k.k.Offset = binary.BigEndian.Uint64(rest[i+9:])
+	return k, true
+}
+
+func frameKeyBytes(tag byte, b uint8, off int64) []byte {
+	return binary.BigEndian.AppendUint64([]byte{tag, b}, uint64(off))
+}
+
+// want marks the extents of a version as wanted.
+func (c *compactor) want(p string, v *manifest.Version) error {
 	c.mu.Lock()
-	for p, v := range vers {
-		for _, l := range v.Loc {
-			c.live[liveKey{l.Blob, blob.FrameKey{Hash: l.Hash, Path: p, FileVer: v.FileVer, Offset: l.Offset}}] = true
+	defer c.mu.Unlock()
+	for _, l := range v.Loc {
+		k := liveKeyBytes(liveKey{l.Blob, blob.FrameKey{Hash: l.Hash, Path: p, FileVer: v.FileVer, Offset: l.Offset}})
+		_, had, err := c.tab.Get(k)
+		if err != nil {
+			return err
+		}
+		if !had {
+			if err := c.tab.Put(k, nil); err != nil {
+				return err
+			}
+			c.nlive++
 		}
 	}
-	c.mu.Unlock()
+	return nil
+}
+
+// eachPath visits the paths under tag ('S', 'X', 'Y') in order.
+func (c *compactor) eachPath(tag byte, fn func(p string, ver uint64) error) error {
+	it := c.tab.Iter([]byte{tag})
+	defer it.Close()
+	for it.Next() {
+		k := it.Key()
+		if k[0] != tag {
+			break
+		}
+		if len(it.Value()) != 8 {
+			return kvtab.ErrTampered
+		}
+		if err := fn(string(k[1:]), binary.BigEndian.Uint64(it.Value())); err != nil {
+			return err
+		}
+	}
+	return it.Err()
+}
+
+func (c *compactor) has(k []byte) (bool, error) {
+	_, ok, err := c.tab.Get(k)
+	return ok, err
+}
+
+// copyVersions copies the frames holding wanted extents into the
+// destination: frames come from the repair directory in blob and offset
+// order and are handed to workers as they are found, so nothing per frame
+// is collected in memory.
+func (c *compactor) copyVersions(ctx context.Context) error {
 	fd := c.src.dir()
 	fd.mu.Lock()
 	err := c.src.refresh(fd)
-	all := append([]*hopMember(nil), fd.all...)
-	groups := make(map[uint32][]*hopMember, len(fd.groups))
-	for g, ms := range fd.groups {
-		groups[g] = append([]*hopMember(nil), ms...)
-	}
 	fd.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	// units: ungrouped frames and groups holding a wanted entry
-	var singles []*hopMember
-	var gids []uint32
-	seenG := map[uint32]bool{}
-	c.mu.Lock()
-	for _, m := range all {
-		if c.doneFrames[[2]int64{int64(m.blob), m.off}] {
-			continue
-		}
-		wanted := false
-		for _, e := range m.entries {
-			wanted = wanted || c.live[keyOf(m.blob, m.t.HashPayload, e, m.t.BlockType)]
-		}
-		if !wanted {
-			continue
-		}
-		if g := m.t.GroupID; g != 0 {
-			if !c.doneGroups[g] && !seenG[g] {
-				seenG[g] = true
-				gids = append(gids, g)
-			}
-		} else {
-			singles = append(singles, m)
-		}
-	}
-	c.mu.Unlock()
-	run := func(n int, fn func(i int) error) error {
+	run := func(feed func(send func(fn func() error) bool) error) error {
 		var mu sync.Mutex
 		var first error
-		next := make(chan int)
+		next := make(chan func() error)
 		var wg sync.WaitGroup
 		for w := 0; w < max(1, runtime.GOMAXPROCS(0)); w++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				for i := range next {
+				for fn := range next {
 					mu.Lock()
 					stop := first != nil
 					mu.Unlock()
 					if stop {
 						continue
 					}
-					if err := fn(i); err != nil {
+					if err := fn(); err != nil {
 						mu.Lock()
 						if first == nil {
 							first = err
@@ -382,67 +481,179 @@ func (c *compactor) copyVersions(ctx context.Context, vers map[string]*manifest.
 				}
 			}()
 		}
-		for i := 0; i < n; i++ {
+		ferr := feed(func(fn func() error) bool {
 			if ctx.Err() != nil {
-				break
+				return false
 			}
-			next <- i
-		}
+			mu.Lock()
+			stop := first != nil
+			mu.Unlock()
+			if stop {
+				return false
+			}
+			next <- fn
+			return true
+		})
 		close(next)
 		wg.Wait()
+		if first == nil {
+			first = ferr
+		}
 		if first == nil {
 			first = ctx.Err()
 		}
 		return first
 	}
-	if err := run(len(singles), func(i int) error { return c.single(singles[i]) }); err != nil {
+	// ungrouped frames holding a wanted entry are copied as they are
+	// found; groups holding one are queued ('q') and handled after
+	if err := run(func(send func(func() error) bool) error {
+		return fd.each(func(m *hopMember) (bool, error) {
+			if done, err := c.has(frameKeyBytes('d', m.blob, m.off)); err != nil || done {
+				return err == nil, err
+			}
+			wanted := false
+			for _, e := range m.entries {
+				ok, err := c.has(liveKeyBytes(keyOf(m.blob, m.t.HashPayload, e, m.t.BlockType)))
+				if err != nil {
+					return false, err
+				}
+				if wanted = ok; wanted {
+					break
+				}
+			}
+			if !wanted {
+				return true, nil
+			}
+			if g := m.t.GroupID; g != 0 {
+				q := binary.BigEndian.AppendUint32([]byte{'q'}, g)
+				done, err := c.has(binary.BigEndian.AppendUint32([]byte{'g'}, g))
+				if err == nil && !done {
+					err = c.tab.Put(q, nil)
+				}
+				return err == nil, err
+			}
+			return send(func() error { return c.single(m) }), nil
+		})
+	}); err != nil {
 		return err
 	}
-	if err := run(len(gids), func(i int) error { return c.group(gids[i], groups[gids[i]]) }); err != nil {
+	groupsUnder := func(tag byte, send func(func() error) bool) error {
+		it := c.tab.Iter([]byte{tag})
+		defer it.Close()
+		for it.Next() {
+			k := it.Key()
+			if k[0] != tag {
+				break
+			}
+			if len(k) != 5 {
+				return kvtab.ErrTampered
+			}
+			g := binary.BigEndian.Uint32(k[1:])
+			if !send(func() error {
+				ms, err := fd.group(g)
+				if err != nil {
+					return err
+				}
+				return c.group(g, ms)
+			}) {
+				break
+			}
+		}
+		return it.Err()
+	}
+	if err := run(func(send func(func() error) bool) error { return groupsUnder('q', send) }); err != nil {
+		return err
+	}
+	if err := c.clear('q'); err != nil {
 		return err
 	}
 	// wanted entries not found intact: they can only sit in members that
 	// are lost; rebuild the incomplete groups (§7.3)
 	c.mu.Lock()
-	missing := len(c.live) > 0
-	var incomplete []uint32
-	if missing {
-		for g, ms := range groups {
-			if !c.doneGroups[g] && len(ms) < int(ms[0].t.GroupK)+int(ms[0].t.GroupM) {
-				incomplete = append(incomplete, g)
-			}
-		}
-	}
+	missing := c.nlive > 0
 	c.mu.Unlock()
-	slices.Sort(incomplete)
-	if err := run(len(incomplete), func(i int) error { return c.group(incomplete[i], groups[incomplete[i]]) }); err != nil {
-		return err
+	if missing {
+		if err := run(func(send func(func() error) bool) error {
+			return fd.eachGroup(func(g uint32, ms []*hopMember) (bool, error) {
+				if len(ms) >= int(ms[0].t.GroupK)+int(ms[0].t.GroupM) {
+					return true, nil
+				}
+				done, err := c.has(binary.BigEndian.AppendUint32([]byte{'g'}, g))
+				if err != nil || done {
+					return err == nil, err
+				}
+				return send(func() error { return c.group(g, ms) }), nil
+			})
+		}); err != nil {
+			return err
+		}
 	}
 	if err := c.flush(true); err != nil {
 		return err
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if n := len(c.live); n > 0 {
-		for k := range c.live {
-			return fmt.Errorf("%w: %d committed extents cannot be found or rebuilt, e.g. %s v%d at %d (blob %02X); the generation is GC-blocked (§13.8)",
-				ErrMissingData, n, k.k.Path, k.k.FileVer, k.k.Offset, k.blob)
+	n := c.nlive
+	c.mu.Unlock()
+	if n > 0 {
+		it := c.tab.Iter([]byte{'L'})
+		defer it.Close()
+		if it.Next() {
+			if k, ok := parseLiveKey(it.Key()); ok {
+				return fmt.Errorf("%w: %d committed extents cannot be found or rebuilt, e.g. %s v%d at %d (blob %02X); the generation is GC-blocked (§13.8)",
+					ErrMissingData, n, k.k.Path, k.k.FileVer, k.k.Offset, k.blob)
+			}
 		}
+		if err := it.Err(); err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: %d committed extents cannot be found or rebuilt; the generation is GC-blocked (§13.8)", ErrMissingData, n)
 	}
 	return nil
 }
 
+// clear deletes the keys under tag.
+func (c *compactor) clear(tag byte) error {
+	var keys [][]byte
+	for {
+		it := c.tab.Iter([]byte{tag})
+		for it.Next() && it.Key()[0] == tag && len(keys) < 4096 {
+			keys = append(keys, bytes.Clone(it.Key()))
+		}
+		err := it.Err()
+		it.Close()
+		if err != nil {
+			return err
+		}
+		if len(keys) == 0 {
+			return nil
+		}
+		for _, k := range keys {
+			if err := c.tab.Delete(k); err != nil {
+				return err
+			}
+		}
+		keys = keys[:0]
+	}
+}
+
 // take claims the wanted entries of a frame of source blob b. full is true
 // when every entry is wanted. c.mu is held.
-func (c *compactor) takeLocked(b uint8, t *wire.MasterTrailer, entries []wire.Entry) (live []wire.Entry, full bool) {
+func (c *compactor) takeLocked(b uint8, t *wire.MasterTrailer, entries []wire.Entry) (live []wire.Entry, full bool, err error) {
 	for _, e := range entries {
-		k := keyOf(b, t.HashPayload, e, t.BlockType)
-		if c.live[k] {
-			delete(c.live, k)
+		k := liveKeyBytes(keyOf(b, t.HashPayload, e, t.BlockType))
+		ok, err := c.has(k)
+		if err != nil {
+			return nil, false, err
+		}
+		if ok {
+			if err := c.tab.Delete(k); err != nil {
+				return nil, false, err
+			}
+			c.nlive--
 			live = append(live, e)
 		}
 	}
-	return live, len(live) == len(entries) && len(entries) > 0
+	return live, len(live) == len(entries) && len(entries) > 0, nil
 }
 
 // copyTo appends an encoded frame byte for byte to destination blob b.
@@ -463,33 +674,50 @@ func (c *compactor) copyTo(b int, fr []byte) (wire.IndexRecord, error) {
 }
 
 // assign records the destination locs of live entries of a frame.
-func (c *compactor) assign(b int, hash [wire.HashSize]byte, bt wire.BlockType, es []wire.Entry) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (c *compactor) assign(b int, hash [wire.HashSize]byte, bt wire.BlockType, es []wire.Entry) error {
 	for _, e := range es {
 		l := manifest.Loc{Blob: uint8(b), Hash: hash, Offset: e.Offset, Length: e.Length}
 		if bt == wire.BlockPacked {
 			l.Offset = 0
 		}
-		k := verKey{e.Path, e.FileVer}
-		c.locs[k] = append(c.locs[k], l)
+		if err := c.putLoc(e.Path, e.FileVer, l); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
-func (c *compactor) sortedLocs(p string, v *manifest.Version) []manifest.Loc {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	ls := c.locs[verKey{p, v.FileVer}]
-	slices.SortFunc(ls, func(a, b manifest.Loc) int {
-		switch {
-		case a.Offset < b.Offset:
-			return -1
-		case a.Offset > b.Offset:
-			return 1
+func destPrefix(p string, ver uint64) []byte {
+	k := append([]byte{'D'}, p...)
+	k = append(k, 0)
+	return binary.BigEndian.AppendUint64(k, ver)
+}
+
+func (c *compactor) putLoc(p string, ver uint64, l manifest.Loc) error {
+	k := binary.BigEndian.AppendUint64(destPrefix(p, ver), l.Offset)
+	v := append([]byte{l.Blob}, l.Hash[:]...)
+	return c.tab.Put(k, binary.BigEndian.AppendUint64(v, l.Length))
+}
+
+// sortedLocs returns the destination locs of a version in offset order.
+// It holds the version's locs (the manifest record needs them at once).
+func (c *compactor) sortedLocs(p string, ver uint64) ([]manifest.Loc, error) {
+	pfx := destPrefix(p, ver)
+	it := c.tab.Iter(pfx)
+	defer it.Close()
+	var ls []manifest.Loc
+	for it.Next() {
+		k, v := it.Key(), it.Value()
+		if !bytes.HasPrefix(k, pfx) {
+			break
 		}
-		return 0
-	})
-	return ls
+		if len(k) != len(pfx)+8 || len(v) != 1+32+8 {
+			return nil, kvtab.ErrTampered
+		}
+		ls = append(ls, manifest.Loc{Blob: v[0], Hash: [32]byte(v[1:33]), Offset: binary.BigEndian.Uint64(k[len(pfx):]),
+			Length: binary.BigEndian.Uint64(v[33:])})
+	}
+	return ls, it.Err()
 }
 
 // single handles an ungrouped frame.
@@ -508,17 +736,23 @@ func (c *compactor) single(m *hopMember) error {
 		return nil
 	}
 	c.mu.Lock()
-	c.doneFrames[[2]int64{int64(m.blob), m.off}] = true
-	live, full := c.takeLocked(m.blob, t, ref.Entries)
+	err = c.tab.Put(frameKeyBytes('d', m.blob, m.off), nil)
+	var live []wire.Entry
+	var full bool
+	if err == nil {
+		live, full, err = c.takeLocked(m.blob, t, ref.Entries)
+	}
 	c.mu.Unlock()
-	if len(live) == 0 {
-		return nil
+	if err != nil || len(live) == 0 {
+		return err
 	}
 	if t.BlockType == wire.BlockData || full {
 		if _, err := c.copyTo(int(m.blob), ref.Bytes()); err != nil {
 			return err
 		}
-		c.assign(int(m.blob), t.HashPayload, t.BlockType, live)
+		if err := c.assign(int(m.blob), t.HashPayload, t.BlockType, live); err != nil {
+			return err
+		}
 		c.count(func(r *CompactResult) { r.CopiedFrames++ })
 		return nil
 	}
@@ -539,13 +773,16 @@ func (c *compactor) count(fn func(*CompactResult)) {
 // all live is copied whole with its id (lost PARITY frames recomputed,
 // §7.3.1); otherwise its live members are regrouped or repacked (§13.7.1).
 func (c *compactor) group(g uint32, ms []*hopMember) error {
+	gk := binary.BigEndian.AppendUint32([]byte{'g'}, g)
 	c.mu.Lock()
-	if c.doneGroups[g] {
-		c.mu.Unlock()
-		return nil
+	done, err := c.has(gk)
+	if err == nil && !done {
+		err = c.tab.Put(gk, nil)
 	}
-	c.doneGroups[g] = true
 	c.mu.Unlock()
+	if err != nil || done {
+		return err
+	}
 	if !groupUsable(ms) {
 		return nil // conflicting group_id: unused (§7)
 	}
@@ -581,8 +818,11 @@ func (c *compactor) group(g uint32, ms []*hopMember) error {
 		}
 		refs[i] = ref
 		c.mu.Lock()
-		c.doneFrames[[2]int64{int64(mem.blob), mem.off}] = true
+		err = c.tab.Put(frameKeyBytes('d', mem.blob, mem.off), nil)
 		c.mu.Unlock()
+		if err != nil {
+			return err
+		}
 	}
 	rebuilt := make([]bool, n)
 	if err := c.rebuildMissing(g, refs, rebuilt, k, m, q); err != nil {
@@ -593,16 +833,17 @@ func (c *compactor) group(g uint32, ms []*hopMember) error {
 	full := make([]bool, k)
 	any := false
 	c.mu.Lock()
-	for i := 0; i < k; i++ {
+	for i := 0; i < k && err == nil; i++ {
 		if refs[i] != nil {
 			b := uint8(max(srcBlob[i], 0))
-			live[i], full[i] = c.takeLocked(b, &refs[i].Trailer, refs[i].Entries)
+			live[i], full[i], err = c.takeLocked(b, &refs[i].Trailer, refs[i].Entries)
 			if srcBlob[i] < 0 {
 				// a member lost with its blob: its loc names the blob it
 				// was written to, which only the manifest knows; match any
 				// blob of the archive
-				for bb := 0; bb < int(h.BlobCount) && len(live[i]) < len(refs[i].Entries); bb++ {
-					more, _ := c.takeLocked(uint8(bb), &refs[i].Trailer, refs[i].Entries)
+				for bb := 0; bb < int(h.BlobCount) && len(live[i]) < len(refs[i].Entries) && err == nil; bb++ {
+					var more []wire.Entry
+					more, _, err = c.takeLocked(uint8(bb), &refs[i].Trailer, refs[i].Entries)
 					live[i] = append(live[i], more...)
 				}
 				full[i] = len(live[i]) == len(refs[i].Entries)
@@ -611,6 +852,9 @@ func (c *compactor) group(g uint32, ms []*hopMember) error {
 		}
 	}
 	c.mu.Unlock()
+	if err != nil {
+		return err
+	}
 	if !any {
 		return nil
 	}
@@ -675,7 +919,9 @@ func (c *compactor) group(g uint32, ms []*hopMember) error {
 		if _, err := c.copyTo(b, refs[i].Bytes()); err != nil {
 			return err
 		}
-		c.assign(b, refs[i].Trailer.HashPayload, refs[i].Trailer.BlockType, live[i])
+		if err := c.assign(b, refs[i].Trailer.HashPayload, refs[i].Trailer.BlockType, live[i]); err != nil {
+			return err
+		}
 		if rebuilt[i] {
 			c.count(func(r *CompactResult) { r.RebuiltFrames++ })
 		} else {
@@ -823,7 +1069,9 @@ func (c *compactor) writeRegroup(specs []*frame.Spec, q uint32) error {
 		return err
 	}
 	for i, pl := range placed {
-		c.assign(pl.blob, pl.rec.FrameHash, specs[i].BlockType, specs[i].Entries)
+		if err := c.assign(pl.blob, pl.rec.FrameHash, specs[i].BlockType, specs[i].Entries); err != nil {
+			return err
+		}
 	}
 	c.count(func(r *CompactResult) { r.RewrittenFrames += len(specs) })
 	return nil
@@ -865,11 +1113,12 @@ func (c *compactor) flush(all bool) error {
 			if r.err != nil {
 				return r.err
 			}
-			c.mu.Lock()
-			k := verKey{r.path, r.fileVer}
-			c.locs[k] = append(c.locs[k], r.locs...)
-			c.res.RepackedObjects++
-			c.mu.Unlock()
+			for _, l := range r.locs {
+				if err := c.putLoc(r.path, r.fileVer, l); err != nil {
+					return err
+				}
+			}
+			c.count(func(r *CompactResult) { r.RepackedObjects++ })
 		}
 	}
 	qs := make([]uint32, 0, len(rg))
@@ -940,11 +1189,11 @@ func (c *compactor) durable() error {
 // verify reads the given destination paths completely and checks the
 // parity groups (§13.5 step 4, §13.6, §13.8): with full every group's
 // parity is recomputed, otherwise every group must have all members.
-func (c *compactor) verify(ctx context.Context, paths []string, full bool) error {
+func (c *compactor) verify(ctx context.Context, tag byte, full bool) error {
 	d := c.d
 	st := d.journal.State()
 	before := d.view.Repairs()
-	for _, p := range paths {
+	if err := c.eachPath(tag, func(p string, _ uint64) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -961,6 +1210,9 @@ func (c *compactor) verify(ctx context.Context, paths []string, full bool) error
 		if err != nil {
 			return fmt.Errorf("destination verification of %s: %w", p, err)
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	if after := d.view.Repairs(); after != before {
 		return fmt.Errorf("%w: destination needed repairs while verifying (%+v)", wire.ErrCorrupt, after)
@@ -980,14 +1232,15 @@ func (c *compactor) verify(ctx context.Context, paths []string, full bool) error
 	}
 	fd := d.view.dir()
 	fd.mu.Lock()
-	defer fd.mu.Unlock()
-	if err := d.view.refresh(fd); err != nil {
+	err := d.view.refresh(fd)
+	fd.mu.Unlock()
+	if err != nil {
 		return err
 	}
-	for g, ms := range fd.groups {
+	return fd.eachGroup(func(g uint32, ms []*hopMember) (bool, error) {
 		if !groupUsable(ms) || len(ms) != int(ms[0].t.GroupK)+int(ms[0].t.GroupM) {
-			return fmt.Errorf("%w: destination group %d incomplete", wire.ErrCorrupt, g)
+			return false, fmt.Errorf("%w: destination group %d incomplete", wire.ErrCorrupt, g)
 		}
-	}
-	return nil
+		return true, nil
+	})
 }

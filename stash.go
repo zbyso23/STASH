@@ -597,7 +597,25 @@ type RecoverOptions struct {
 	// keyless: frames, parity and opaque object_id groups are checked and
 	// reported, nothing can be extracted (SPEC §15.10).
 	Key []byte
+	// WorkDir is where the scan keeps its working tables, outside the
+	// archive (recovery never writes there). A private directory is
+	// created below it and removed by Close. Empty: os.TempDir(). When it
+	// cannot be used, Recover fails with ErrRecoveryWorkDir.
+	WorkDir string
+	// MemoryLimit bounds the scan's memory (0: 1 GiB); what does not fit
+	// spills to WorkDir.
+	MemoryLimit int64
 }
+
+// ErrRecoveryWorkDir reports an unusable RecoverOptions.WorkDir.
+var ErrRecoveryWorkDir = recovery.ErrWorkDir
+
+// RecoverySelection streams recovered versions (Recovery.All,
+// Recovery.Default, or SelectVersions of a list).
+type RecoverySelection = recovery.Selection
+
+// SelectVersions is a selection of the given versions.
+func SelectVersions(vs ...*RecoveredVersion) RecoverySelection { return recovery.Select(vs...) }
 
 // Recovery is a raw recovery scan (SPEC §11): object versions rebuilt from
 // the blob files alone, labeled with what a surviving manifest says.
@@ -617,18 +635,19 @@ type SalvageResult = recovery.SalvageResult
 // the live state), with gaps, provenance and manifest labels. Extract
 // reads one version; Salvage writes a selection into a new archive.
 func Recover(dir string, o RecoverOptions) (*Recovery, error) {
-	return recovery.Scan(vfs.OS{Root: dir}, recovery.Options{Generation: o.Generation, NoManifest: o.NoManifest, Budget: o.ResyncBudget, Key: o.Key})
+	return recovery.Scan(vfs.OS{Root: dir}, recovery.Options{Generation: o.Generation, NoManifest: o.NoManifest, Budget: o.ResyncBudget, Key: o.Key,
+		WorkDir: o.WorkDir, MemoryLimit: o.MemoryLimit})
 }
 
 // Salvage creates a new archive in dir (empty or absent) with the
-// recovered archive's parameters and writes the given versions into it
-// (rc.DefaultSelection() picks the current versions, or the newest
-// complete version per path when the manifest is gone).
-func Salvage(ctx context.Context, rc *Recovery, dir string, versions []*RecoveredVersion) (SalvageResult, error) {
+// recovered archive's parameters and writes the selected versions into it
+// (rc.Default() selects the current versions, or the newest complete
+// version per path when the manifest is gone; SelectVersions a list).
+func Salvage(ctx context.Context, rc *Recovery, dir string, sel RecoverySelection) (SalvageResult, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return SalvageResult{}, err
 	}
-	return rc.Salvage(ctx, vfs.OS{Root: dir}, versions)
+	return rc.Salvage(ctx, vfs.OS{Root: dir}, sel)
 }
 
 // Anchor is a Generation Anchor provider (SPEC §2.1.2): monotonic

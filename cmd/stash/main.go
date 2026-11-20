@@ -829,12 +829,16 @@ var (
 	rNoManifest bool
 	rGeneration string
 	rAll        bool
+	rWorkDir    string
+	rMemory     int64
 )
 
 func recoverFlags(fl *flag.FlagSet) {
 	fl.BoolVar(&rNoManifest, "no-manifest", false, "ignore the manifest")
 	fl.StringVar(&rGeneration, "generation", "", "generation id to scan (default: root.current, else the newest)")
 	fl.BoolVar(&rAll, "all", false, "recover: list every version found, not only the default selection")
+	fl.StringVar(&rWorkDir, "work-dir", "", "directory for the scan's working tables, outside the archive (default: the system temp directory)")
+	fl.Int64Var(&rMemory, "memory-mib", 0, "memory limit of the scan in MiB (default 1024)")
 }
 
 func scan(dir string) (*stash.Recovery, error) {
@@ -842,7 +846,7 @@ func scan(dir string) (*stash.Recovery, error) {
 	if err != nil {
 		return nil, err
 	}
-	o := stash.RecoverOptions{Key: key, NoManifest: rNoManifest}
+	o := stash.RecoverOptions{Key: key, NoManifest: rNoManifest, WorkDir: rWorkDir, MemoryLimit: rMemory << 20}
 	if rGeneration != "" {
 		g, err := strconv.ParseUint(rGeneration, 0, 64)
 		if err != nil {
@@ -881,8 +885,8 @@ func cmdRecover(e *env, _ *flag.FlagSet, args []string) error {
 		switch {
 		case b.Err != nil:
 			state, damaged = "unavailable: "+b.Err.Error(), true
-		case len(b.Damaged) > 0:
-			state, damaged = fmt.Sprintf("%d damaged regions, %d resync candidates", len(b.Damaged), b.Candidates), true
+		case b.DamagedRegions > 0:
+			state, damaged = fmt.Sprintf("%d damaged regions (%s), %d resync candidates", b.DamagedRegions, size(b.DamagedBytes), b.Candidates), true
 		}
 		fmt.Fprintf(w, "blob %02X    %d frames, %s\n", b.Ordinal, b.Frames, state)
 	}
@@ -890,13 +894,15 @@ func cmdRecover(e *env, _ *flag.FlagSet, args []string) error {
 		fmt.Fprintf(w, "groups     %d: %d intact, %d degraded, %d unrecoverable; %d frames rebuilt\n", g.Total, g.Intact, g.Degraded, g.Unrecoverable, g.RebuiltFrames)
 		damaged = damaged || g.Degraded+g.Unrecoverable > 0
 	}
-	vs := rc.DefaultSelection()
+	sel := rc.Default()
 	if rAll || rc.Keyless {
-		vs = rc.Versions
+		sel = rc.All()
 	}
 	tw := tabwriter.NewWriter(w, 2, 8, 2, ' ', 0)
 	fmt.Fprintln(tw, "\nVERSION\tSIZE\tSTATE\tPATH")
-	for _, v := range vs {
+	listed := 0
+	if err := sel(func(v *stash.RecoveredVersion) bool {
+		listed++
 		var st []string
 		if v.Complete {
 			st = append(st, "complete")
@@ -926,8 +932,16 @@ func cmdRecover(e *env, _ *flag.FlagSet, args []string) error {
 			n = v.Length
 		}
 		fmt.Fprintf(tw, "v%d\t%d\t%s\t%s\n", v.FileVer, n, strings.Join(st, ", "), name)
+		if listed%4096 == 0 {
+			tw.Flush() // the listing streams
+		}
+		return true
+	}); err != nil {
+		tw.Flush()
+		return err
 	}
 	tw.Flush()
+	fmt.Fprintf(w, "%d of %d versions listed\n", listed, rc.NVersions)
 	if rc.OpaquePacked > 0 {
 		fmt.Fprintf(w, "%d PACKED frames hold small objects that stay unknown without the key\n", rc.OpaquePacked)
 	}
@@ -943,7 +957,7 @@ func cmdSalvage(e *env, _ *flag.FlagSet, args []string) error {
 		return err
 	}
 	defer rc.Close()
-	res, err := stash.Salvage(e.ctx, rc, args[1], rc.DefaultSelection())
+	res, err := stash.Salvage(e.ctx, rc, args[1], rc.Default())
 	if err != nil {
 		return err
 	}
@@ -951,8 +965,11 @@ func cmdSalvage(e *env, _ *flag.FlagSet, args []string) error {
 	for p, err := range res.Failed {
 		fmt.Fprintf(e.stdout, "FAILED %s: %v\n", p, err)
 	}
-	if len(res.Failed) > 0 {
-		return problems{fmt.Sprintf("%d versions could not be salvaged", len(res.Failed))}
+	if res.FailedCount > len(res.Failed) {
+		fmt.Fprintf(e.stdout, "(%d more failures not listed)\n", res.FailedCount-len(res.Failed))
+	}
+	if res.FailedCount > 0 {
+		return problems{fmt.Sprintf("%d versions could not be salvaged", res.FailedCount)}
 	}
 	return nil
 }

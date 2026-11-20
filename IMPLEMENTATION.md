@@ -445,8 +445,33 @@ Tests: 200 objects of six 4 KiB extents with five shared ones are read exactly; 
 
 Measured (`STASH_SAME=1`, 1000 objects of 10 × 4 KiB extents; `STASH_NOHINT=1` for the old path): one reader 34.9 ms → 0.17 ms per Get (random data 0.16 ms); 16 concurrent readers 448 ms → 1.25 ms per Get in steady state (random data 0.93 ms; the rest is contention on the page cache mutex). The memscale gates still pass; the gate now also accepts a growth of at most 1.5 MiB, because the base retains only a few MB and varies by about 1 MB between runs.
 
+## Milestone 19, phase 4 — compaction, verify and recovery without archive-wide maps
+
+No operation holds a map proportional to the archive any more. Everything that used to be collected (frames by hash, parity groups, live versions, versions found by recovery) goes through sorted tables (`kvtab`, phase 3) in the scratch space of the archive or, for recovery, in a work directory outside it.
+
+- **Frame directory (`repair.go`).** The hop scan behind parity repair, verify and compaction writes each frame into a table instead of maps: `F` blob offset → quanta, trailer and the entries (or a flag to read them again from the frame tail when they exceed 64 KiB), `H` hash → frame, `G` group_id → member, `K` frame key → group. A group of more than 257 members repeats an index and is conflicting. Groups are visited one at a time in id order.
+- **Writer parity census.** Which incomplete groups still hold referenced frames is a table (`M` members, `R` referenced groups), not a map; a lookup error is kept and fails the open after the scan instead of being taken as "unreferenced".
+- **Resynchronization streams (`blob.ResyncEach`).** Frames are handed to a callback in offset order; a candidate waits only one frame size to be marked conflicting. `Damaged` lists the first `MaxRegions` (1000) regions, `DamagedRegions` and `DamagedBytes` count all of them (`BlobVerify`, `recovery.BlobReport`), and `NFrames` replaces the frame list.
+- **Verify** walks the live state in path order and reads every version; only failures are kept, the first 1000 in `Failed` and all in `FailedCount`. Groups are checked from the frame directory.
+- **Compaction** works in its own table: `S` the state snapshot at the start, `X`/`Y` paths changed or removed while it ran (a merge join of the final state against the snapshot, no map of either), `L` wanted extents, `D` the new locations, `d`/`g`/`q` frames and groups done or queued. Versions are copied by a worker pool fed while the walk runs; the destination journal and the verification stream from the table.
+- **Recovery (`internal/recovery`).** `Options.WorkDir` (default `os.TempDir()`) holds a private directory created by `os.MkdirTemp` and removed by `Close`; when it cannot be created, `Scan` fails with `ErrWorkDir` (public `stash.ErrRecoveryWorkDir`) and never falls back to memory or to the archive, which recovery still never writes. `Options.MemoryLimit` (default 1 GiB) bounds the tables; what does not fit spills to the work directory. Frames found go into `F`/`G`; groups are classified and rebuilt one by one; manifest labels go into `C` (path, file_ver → committed length) and open transactions into `T`; the live versions come from the loaded state by lookup. Each frame's extents become `E` records keyed by (path, file_ver, object_id, offset, source), so versions come out of one ordered iteration and only the version being visited is assembled. Extents keep the frame's location, hash, group and index instead of a pointer to it.
+- **Streaming API.** `type Selection func(func(*Version) bool) error`; `rc.All()` streams every version, `rc.Default()` the default salvage selection (current versions, or the newest complete one per path without a manifest), `Select(vs...)` a list. `Salvage` takes a selection; `SalvageResult.FailedCount` counts failures beyond the first 1000 listed. `rc.Versions()` and `rc.DefaultSelection()` remain as collecting conveniences, `Report.NVersions` counts the versions. The CLI `recover` streams its listing and has `-work-dir` and `-memory-mib`.
+
+**Deadlock found and fixed.** At a 64 MiB limit, compaction waited forever: the destination journal load inside `Compact`, and index validation in a reader, reserved sort memory from a budget already held by long-lived caches and tables. Short-lived sorts now degrade (`extsort.Config.Degrade`: try to reserve between 1 MiB and the wanted memory, else run at 1 MiB unreserved), and the default table delta is min(16 MiB, limit/32), at least 1 MiB. The phase 3b build hangs on the same workload.
+
+Tests: compaction and verify at an 8 MiB limit (with crash cases), resynchronization with more damaged regions than are listed, a recovery whose tables spill (1-byte delta, 8 MiB limit) on an archive with lost frames rebuilt from parity, with and without the manifest, gives exactly the versions, groups and extracted bytes of an in-memory scan; an unusable work directory (a file, below a file, missing) is `ErrWorkDir`; `Close` removes the work directory. The archive, recovery and manifest suites also pass with `STASH_TEST_DELTA=3` under `-race`.
+
+Measured (one fresh process per phase, peak live heap / RSS high-water; phase 3b build in parentheses, run without a limit because at 64 MiB its compaction hangs):
+
+| workload | verify, 64 MiB | compact, 64 MiB | recovery, 64 MiB |
+|---|---|---|---|
+| 200,000 small objects | 35 MB / 42 MB (142 / 158) | 50 MB / 58 MB (429 / 449) | 62 MB / 71 MB (183 / 202) |
+| 20,000 objects of 10 × 4 KiB extents | 40 MB / 50 MB (93 / 103) | 62 MB / 74 MB (387 / 408) | 40 MB / 48 MB (139 / 153) |
+
+At 20,000 small objects (a tenth) the same phases peak at 13, 35 and 28 MB. The recovery peak follows the limit (200,000 small objects: 27 MB at 16 MiB, 109 MB at 256 MiB). The price is time: compaction of 200,000 small objects 11 s → 21 s, of 200,000 extents 13 s → 37 s; recovery scan 1.4 s → 2.6 s and 1.1 s → 2.9 s; verify is unchanged (8.5 s → 8.1 s, 6.3 s → 7.0 s).
+
 ## Next milestones
 
-19. Bounded-memory metadata (audit finding 7), remaining phases. Phase 4: compaction, verify and recovery without archive-wide maps; recovery with an operator-supplied work directory and a controlled error when it is unavailable. Phase 5: 10^7 frames, 10^7 small objects, a 10^8-record synthetic index, crashes during merges, rebuilds from destroyed caches; RSS, concurrency and peaks measured, latency claims only after measurement.
+19. Bounded-memory metadata (audit finding 7), remaining phases. Phase 5: 10^7 frames, 10^7 small objects, a 10^8-record synthetic index, crashes during merges, rebuilds from destroyed caches; RSS, concurrency and peaks measured, latency claims only after measurement.
 20. Emergency Pruning (§13.9).
 21. Optionally a writable FUSE mount (new versions on close), if wanted.

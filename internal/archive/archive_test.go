@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"os"
 	"path"
+	"strings"
 	"sync"
 	"testing"
 
@@ -178,14 +179,38 @@ func (s *snapFS) OpenFile(n string, fl int, p os.FileMode) (vfs.File, error) {
 	if err != nil {
 		return nil, err
 	}
+	if inScratch(n) {
+		return f, nil // scratch space is discarded at every open
+	}
 	if fl&os.O_CREATE != 0 {
 		s.snap()
 	}
 	return snapFile{f, s}, nil
 }
-func (s *snapFS) Rename(a, b string) error { err := s.CrashFS.Rename(a, b); s.snap(); return err }
-func (s *snapFS) SyncDir(d string) error   { err := s.CrashFS.SyncDir(d); s.snap(); return err }
-func (s *snapFS) Remove(n string) error    { err := s.CrashFS.Remove(n); s.snap(); return err }
+
+func inScratch(n string) bool { return strings.HasPrefix(n, ScratchDir+"/") || n == ScratchDir }
+
+func (s *snapFS) Rename(a, b string) error {
+	err := s.CrashFS.Rename(a, b)
+	if !inScratch(a) {
+		s.snap()
+	}
+	return err
+}
+func (s *snapFS) SyncDir(d string) error {
+	err := s.CrashFS.SyncDir(d)
+	if !inScratch(d) {
+		s.snap()
+	}
+	return err
+}
+func (s *snapFS) Remove(n string) error {
+	err := s.CrashFS.Remove(n)
+	if !inScratch(n) {
+		s.snap()
+	}
+	return err
+}
 
 // A crash at any step of Create leaves either a complete empty archive or
 // ErrIncomplete / no archive; never a partially valid archive.

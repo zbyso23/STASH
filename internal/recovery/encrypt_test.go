@@ -64,7 +64,7 @@ func TestEncryptedRecovery(t *testing.T) {
 				t.Fatal(err)
 			}
 			got := map[string]bool{}
-			for _, v := range rc.DefaultSelection() {
+			for _, v := range mustDefault(t, rc) {
 				if d, ok := live[v.Path]; ok {
 					if !bytes.Equal(extract(t, rc, v), d) {
 						t.Fatalf("%s differs (noManifest %v)", v.Path, noManifest)
@@ -85,7 +85,7 @@ func TestEncryptedRecovery(t *testing.T) {
 			t.Fatalf("keyless report %+v", rc.Manifest)
 		}
 		opaque := 0
-		for _, v := range rc.Versions {
+		for _, v := range mustAll(t, rc) {
 			if !v.Opaque || v.Path != "" {
 				t.Fatalf("keyless version names %q", v.Path)
 			}
@@ -112,7 +112,7 @@ func TestEncryptedRecovery(t *testing.T) {
 			t.Fatal(err)
 		}
 		n := 0
-		for _, v := range rc.DefaultSelection() {
+		for _, v := range mustDefault(t, rc) {
 			if d, ok := live[v.Path]; ok && bytes.Equal(extract(t, rc, v), d) {
 				n++
 			}
@@ -152,7 +152,7 @@ func TestRecoverCompressedExtents(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			sel := rc.DefaultSelection()
+			sel := mustDefault(t, rc)
 			if len(sel) != 1 || !bytes.Equal(extract(t, rc, sel[0]), d) {
 				t.Fatalf("recovery (noManifest %v)", noManifest)
 			}

@@ -1,6 +1,7 @@
 package archive
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"os"
@@ -25,7 +26,8 @@ import (
 //	STASH_MEMLIMIT  memory limit of writer and reader in MiB (0: default);
 //	             the caches fill up to their share of it
 //	STASH_HEAPPROF  write a heap profile at the measurement
-//	STASH_PHASE  build | writer | reader | read (concurrent Gets)
+//	STASH_PHASE  build | writer | reader | read (concurrent Gets) | verify |
+//	             compact (rewrites the archive into a new generation)
 //	STASH_READERS goroutines for the read phase (default 16)
 //	STASH_SAME    non-empty: objects share most frame content (duplicate frame hashes)
 //	STASH_NOHINT  non-empty: read without locator hints (comparison)
@@ -116,6 +118,40 @@ func TestZZMemory(t *testing.T) {
 		}
 		report("writer", memprobe.Retained()-base, cacheBytes(w.env, w.stEnv))
 		w.Close()
+	case "verify":
+		r, err := OpenReaderWith(fsys, ReaderOptions{MemoryLimit: memLimit()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		rep, err := r.Verify(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !rep.OK() || rep.Versions != n {
+			t.Fatalf("verify: ok %v, %d versions", rep.OK(), rep.Versions)
+		}
+		t.Logf("RESULT kind=%s phase=verify-time units=%d wall_s=%.2f", kind, units, time.Since(start).Seconds())
+		report("verify", 0, 0)
+		r.Close()
+	case "compact":
+		w, err := OpenWriter(fsys, Options{MaxExtent: 4096, MemoryLimit: memLimit()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		res, err := w.Compact(context.Background(), CompactOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Versions != n {
+			t.Fatalf("compact: %d versions", res.Versions)
+		}
+		t.Logf("RESULT kind=%s phase=compact-time units=%d wall_s=%.2f", kind, units, time.Since(start).Seconds())
+		report("compact", 0, 0)
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
 	case "reader":
 		r, err := OpenReaderWith(fsys, ReaderOptions{MemoryLimit: memLimit()})
 		if err != nil {

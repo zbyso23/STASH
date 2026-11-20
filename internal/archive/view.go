@@ -20,6 +20,7 @@ import (
 	"stash/internal/bufpool"
 	"stash/internal/canonpath"
 	"stash/internal/index"
+	"stash/internal/kvtab"
 	"stash/internal/manifest"
 	"stash/internal/seal"
 	"stash/internal/vfs"
@@ -49,8 +50,9 @@ type view struct {
 	h     *wire.ArchiveHeader
 	k     *seal.Keys // encrypted archive
 	pool  *bufpool.Pool
-	env   *index.Env  // memory budget, page cache, scratch space
-	blobs []*blobView // nil entry: blob unavailable
+	env   *index.Env   // memory budget, page cache, scratch space
+	kv    kvtab.Config // tables of the repair directory and of compaction
+	blobs []*blobView  // nil entry: blob unavailable
 	// hints holds locator hints of extents whose frame_hash is shared
 	// (the manifest state of the generation; nil: none)
 	hints    hintStore
@@ -136,6 +138,7 @@ func (v *view) openBlobs(writeIndexes, tolerate bool) (statuses []index.Status, 
 
 func (v *view) close() {
 	v.closeOnce.Do(func() {
+		v.fdir.close()
 		for _, b := range v.blobs {
 			if b != nil {
 				b.idx.Close()
@@ -679,7 +682,7 @@ func openReaderAt(fsys vfs.FS, pool *bufpool.Pool, root wire.Root, limit int64, 
 			return nil, err
 		}
 	}
-	r := &Reader{view: view{fsys: fsys, gen: gen, h: h, pool: pool, k: k, env: env, hints: st}, st: st, memClose: cleanup, stEnv: senv}
+	r := &Reader{view: view{fsys: fsys, gen: gen, h: h, pool: pool, k: k, env: env, kv: senv.Table(), hints: st}, st: st, memClose: cleanup, stEnv: senv}
 	if _, err := r.openBlobs(false, h.ParityScheme != wire.ParityNone); err != nil {
 		r.close()
 		st.Close()

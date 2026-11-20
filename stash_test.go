@@ -486,12 +486,12 @@ func TestPublicCompactVerifyRecover(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer rc.Close()
-	sel := rc.DefaultSelection()
-	if len(sel) != len(want) {
+	sel, err := rc.DefaultSelection()
+	if err != nil || len(sel) != len(want) {
 		t.Fatalf("selection %d of %d", len(sel), len(want))
 	}
 	out := filepath.Join(t.TempDir(), "salvaged")
-	if sr, err := stash.Salvage(ctx, rc, out, sel); err != nil || sr.Written != len(want) {
+	if sr, err := stash.Salvage(ctx, rc, out, stash.SelectVersions(sel...)); err != nil || sr.Written != len(want) {
 		t.Fatalf("%v %+v", err, sr)
 	}
 	s, err := stash.OpenReadOnlyWith(out, stash.ReadOptions{NoPin: true})
@@ -542,7 +542,7 @@ func BenchmarkRecover64M(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		rc, err := stash.Recover(dir, stash.RecoverOptions{})
-		if err != nil || len(rc.Versions) != 64 {
+		if err != nil || rc.NVersions != 64 {
 			b.Fatal(err)
 		}
 		rc.Close()
@@ -678,8 +678,8 @@ func TestPublicProfiles(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if n := len(rc.DefaultSelection()); n != len(files) {
-				t.Fatalf("recovered %d", n)
+			if sel, err := rc.DefaultSelection(); err != nil || len(sel) != len(files) {
+				t.Fatalf("recovered %d, %v", len(sel), err)
 			}
 			rc.Close()
 			if tc.key != nil {

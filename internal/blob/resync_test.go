@@ -87,3 +87,39 @@ func TestResyncBudget(t *testing.T) {
 		t.Fatalf("unscanned reported as damaged %+v", res.Damaged)
 	}
 }
+
+// ResyncEach streams frames in offset order and keeps only a bounded list
+// of damaged regions, while counting all of them exactly.
+func TestResyncEachBounded(t *testing.T) {
+	h := header(wire.ModeVariable, 1)
+	n := 2*MaxRegions + 10
+	fs := make([][]byte, n)
+	for i := range fs {
+		fs[i] = build(t, h, spec(i, 100))
+	}
+	c, offs := blobWith(t, h, fs...)
+	for i := 1; i < n; i += 2 {
+		damage(t, c, offs[i]+50)
+	}
+	r, _ := Open(c, "frames/blob-00.stash", h, nil)
+	defer r.Close()
+	var got []int64
+	res, err := r.ResyncEach(0, func(f ResyncFrame) error {
+		got = append(got, f.Offset)
+		return nil
+	})
+	if err != nil || res.Frames != nil {
+		t.Fatal(err)
+	}
+	if len(got) != n/2 || res.NFrames != n/2 || got[1] != offs[2] {
+		t.Fatalf("%d frames streamed (%d counted)", len(got), res.NFrames)
+	}
+	for i := 1; i < len(got); i++ {
+		if got[i] <= got[i-1] {
+			t.Fatal("not in offset order")
+		}
+	}
+	if len(res.Damaged) != MaxRegions || res.DamagedRegions != n/2 || res.DamagedBytes != int64(n/2)*(offs[1]-offs[0]) {
+		t.Fatalf("%d listed, %d regions, %d bytes", len(res.Damaged), res.DamagedRegions, res.DamagedBytes)
+	}
+}

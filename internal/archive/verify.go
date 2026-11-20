@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"slices"
 	"sync"
 
 	"stash/internal/blob"
@@ -22,9 +21,12 @@ type BlobVerify struct {
 	Frames  int
 	// Damaged regions and frames found only by resynchronization
 	// (§11.2.1); both mean the blob is damaged.
-	Damaged    []blob.Region
+	Damaged    []blob.Region // the first blob.MaxRegions
 	Unscanned  []blob.Region
 	Candidates int
+	// DamagedRegions and DamagedBytes count all damaged regions.
+	DamagedRegions int
+	DamagedBytes   int64
 }
 
 // GroupVerify classifies parity groups (§13.9 terms).
@@ -50,9 +52,11 @@ type VerifyReport struct {
 	Blobs    []BlobVerify
 	Versions int
 	Bytes    int64
-	// Failed lists live paths that could not be read completely.
-	Failed map[string]error
-	Groups GroupVerify
+	// Failed lists live paths that could not be read completely (the
+	// first maxFailedListed); FailedCount counts all of them.
+	Failed      map[string]error
+	FailedCount int
+	Groups      GroupVerify
 	// Repairs made while reading (hop-and-read and parity rebuilds).
 	Repairs RepairStats
 }
@@ -65,14 +69,14 @@ func (r *VerifyReport) OK() bool {
 		}
 	}
 	g := r.Groups
-	return len(r.Failed) == 0 && g.Degraded+g.Unrecoverable+g.Conflicting+g.Inconsistent == 0
+	return r.FailedCount == 0 && g.Degraded+g.Unrecoverable+g.Conflicting+g.Inconsistent == 0
 }
 
 // verify runs a full verification (§11): every blob scanned with
 // resynchronization, every live version read completely (validating every
 // frame, repairing through parity where needed), and every parity group
 // checked for completeness and parity consistency.
-func (v *view) verify(ctx context.Context, live func() (map[string]*manifest.Version, error)) (*VerifyReport, error) {
+func (v *view) verify(ctx context.Context, walk func(func(string, *manifest.Version) bool) error) (*VerifyReport, error) {
 	rep := &VerifyReport{Failed: map[string]error{}, Blobs: make([]BlobVerify, v.h.BlobCount)}
 	before := v.Repairs()
 	var wg sync.WaitGroup
@@ -90,13 +94,14 @@ func (v *view) verify(ctx context.Context, live func() (map[string]*manifest.Ver
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			res, err := bv.r.Resync(0)
+			res, err := bv.r.ResyncEach(0, func(blob.ResyncFrame) error { return nil })
 			if err != nil {
 				errs[b] = err
 				return
 			}
 			bvr := &rep.Blobs[b]
-			bvr.Frames, bvr.Damaged, bvr.Unscanned, bvr.Candidates = len(res.Frames), res.Damaged, res.Unscanned, res.Candidates
+			bvr.Frames, bvr.Damaged, bvr.Unscanned, bvr.Candidates = res.NFrames, res.Damaged, res.Unscanned, res.Candidates
+			bvr.DamagedRegions, bvr.DamagedBytes = res.DamagedRegions, res.DamagedBytes
 		}()
 	}
 	wg.Wait()
@@ -105,28 +110,30 @@ func (v *view) verify(ctx context.Context, live func() (map[string]*manifest.Ver
 			return nil, err
 		}
 	}
-	paths, err := live()
-	if err != nil {
-		return nil, err
-	}
-	names := make([]string, 0, len(paths))
-	for p := range paths {
-		names = append(names, p)
-	}
-	slices.Sort(names)
-	for _, p := range names {
-		if err := ctx.Err(); err != nil {
-			return nil, err
+	// the live versions stream in path order; nothing per path is kept
+	// but the failures (the first maxFailedListed of them)
+	var cerr error
+	if err := walk(func(p string, ver *manifest.Version) bool {
+		if cerr = ctx.Err(); cerr != nil {
+			return false
 		}
-		ver := paths[p]
 		o := v.object(p, ver)
 		n, err := io.Copy(io.Discard, o)
 		o.Close()
 		rep.Versions++
 		rep.Bytes += n
 		if err != nil {
-			rep.Failed[p] = err
+			if len(rep.Failed) < maxFailedListed {
+				rep.Failed[p] = err
+			}
+			rep.FailedCount++
 		}
+		return true
+	}); err != nil {
+		return nil, err
+	}
+	if cerr != nil {
+		return nil, cerr
 	}
 	if v.h.ParityScheme != wire.ParityNone {
 		if err := v.verifyGroups(ctx, &rep.Groups); err != nil {
@@ -145,25 +152,22 @@ func (v *view) verifyGroups(ctx context.Context, gv *GroupVerify) error {
 		d.mu.Unlock()
 		return err
 	}
-	groups := make(map[uint32][]*hopMember, len(d.groups))
-	for g, ms := range d.groups {
-		groups[g] = append([]*hopMember(nil), ms...)
-	}
 	d.mu.Unlock()
-	ids := make([]uint32, 0, len(groups))
-	for g := range groups {
-		ids = append(ids, g)
-	}
-	slices.Sort(ids)
-	for _, g := range ids {
+	return d.eachGroup(func(g uint32, ms []*hopMember) (bool, error) {
 		if err := ctx.Err(); err != nil {
-			return err
+			return false, err
 		}
-		ms := groups[g]
+		return true, v.verifyGroup(g, ms, gv)
+	})
+}
+
+// verifyGroup classifies one group.
+func (v *view) verifyGroup(g uint32, ms []*hopMember, gv *GroupVerify) error {
+	{
 		gv.Total++
 		if !groupUsable(ms) {
 			gv.Conflicting++
-			continue
+			return nil
 		}
 		k, m, q := int(ms[0].t.GroupK), int(ms[0].t.GroupM), ms[0].quanta
 		shards := make([][]byte, k+m)
@@ -199,12 +203,12 @@ func (v *view) verifyGroups(ctx context.Context, gv *GroupVerify) error {
 			} else {
 				gv.Degraded++
 			}
-			continue
+			return nil
 		}
 		code, err := parity.New(v.h.ParityScheme, k, m)
 		if err != nil {
 			gv.Conflicting++
-			continue
+			return nil
 		}
 		want := make([][]byte, m)
 		for j := range want {
@@ -226,21 +230,12 @@ func (v *view) verifyGroups(ctx context.Context, gv *GroupVerify) error {
 	return nil
 }
 
-// liveOf collects the live versions. It holds every version in memory
-// (compaction and verify until phase 4 of M19 streams them); a state read
-// error is returned rather than hidden.
-func liveOf(st *manifest.State) (map[string]*manifest.Version, error) {
-	out := map[string]*manifest.Version{}
-	err := st.Walk("", "", func(p string, v *manifest.Version) bool {
-		out[p] = v
-		return true
-	})
-	return out, err
-}
+// maxFailedListed bounds VerifyReport.Failed.
+const maxFailedListed = 1000
 
 // Verify verifies the snapshot completely (see VerifyReport).
 func (r *Reader) Verify(ctx context.Context) (*VerifyReport, error) {
-	return r.verify(ctx, func() (map[string]*manifest.Version, error) { return liveOf(r.st) })
+	return r.verify(ctx, func(fn func(string, *manifest.Version) bool) error { return r.st.Walk("", "", fn) })
 }
 
 // Verify verifies the current generation completely. Writes wait until it
@@ -248,9 +243,10 @@ func (r *Reader) Verify(ctx context.Context) (*VerifyReport, error) {
 func (w *Writer) Verify(ctx context.Context) (*VerifyReport, error) {
 	w.genMu.Lock() // quiesce writes: in-flight appends would look like damage
 	defer w.genMu.Unlock()
-	return w.verify(ctx, func() (map[string]*manifest.Version, error) {
+	return w.verify(ctx, func(fn func(string, *manifest.Version) bool) error {
+		// writes wait (genMu); the read lock keeps the state still anyway
 		w.stateMu.RLock()
 		defer w.stateMu.RUnlock()
-		return liveOf(w.journal.State())
+		return w.journal.State().Walk("", "", fn)
 	})
 }
